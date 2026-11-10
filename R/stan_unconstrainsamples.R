@@ -17,7 +17,7 @@
 #' datalong <- cbind(id, time, sunspots)
 #' 
 #' #setup model
-#' ssmodel <- ctModel(type='stanct', n.latent=2, n.manifest=1, 
+#' ssmodel <- ctModel(type='ct', n.latent=2, n.manifest=1, 
 #'   manifestNames='sunspots', 
 #'   latentNames=c('ss_level', 'ss_velocity'),
 #'   LAMBDA=matrix(c( 1, 'ma1| log(1+(exp(param)))' ), nrow=1, ncol=2),
@@ -28,8 +28,9 @@
 #'   DIFFUSION=matrix(c(0, 0, 0, "diffusion"), ncol=2, nrow=2))
 #' 
 #' #fit
-#' ssfit <- ctStanFit(datalong, ssmodel, 
-#'   iter=200, chains=2,optimize=FALSE, nopriors=FALSE,control=list(max_treedepth=4))
+#' ssfit <- ctFit(datalong, ssmodel,
+#'   optimize=FALSE, priors=TRUE,
+#'   sampleControl=list(iter=200, chains=2, max_treedepth=4), backend='stan')
 #' umat <- stan_unconstrainsamples(ssfit$stanfit$stanfit)
 #' }
 stan_unconstrainsamples <- function(fit, standata=NA){

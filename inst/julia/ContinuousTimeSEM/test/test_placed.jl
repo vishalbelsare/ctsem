@@ -1,0 +1,422 @@
+using ForwardDiff, LinearAlgebra, Statistics
+
+# The placed objective (`laplace_placed.jl`): the hybrid with each flagged
+# unit's rule -- product Gauss-Hermite or lattice-t (`point_sets.jl`) -- placed
+# at its mode and curvature at every evaluation, and its exact gradient
+# through the placement.
+#
+# What has to hold, each checked on its own:
+#
+#  1. At the continuation's centre the placed value is the continuation's
+#     placed value, unit by unit: the same rule at the same point.
+#  2. The gradient is the derivative of the value: central differences of the
+#     placed value, at the centre and away from it, on a nonlinear one-level
+#     fixture, a nonlinear two-level one (a leaf's conditional mode chained
+#     through the root's nodes), a linear two-level one, and on lattice
+#     rules: four effects a subject, and a four-effect study over subjects.
+#  3. On a Gaussian integrand the rule is exact wherever it sits, so the
+#     placement terms vanish and the gradient is the frozen rule's.
+#  4. The Hessian, localised to each column's readers, is the plain central
+#     difference of the exact gradient.
+
+isdefined(@__MODULE__, :_LAPLACE_LINEAR_OBJECTIVE) ||
+    include(joinpath(@__DIR__, "laplace_fixtures.jl"))
+
+# Subjects nested in two studies on the nonlinear objective: a T0MEANS effect
+# a subject, whose state-dependent drift makes the integrand non-Gaussian, and
+# a MANIFESTMEANS effect a study. Raw layout: 1-4 the model parameters, 5 the
+# subject scale, 6 the study scale.
+_fresh_placed_nested() = (ctsem_laplace_objective(_LAPLACE_NONLINEAR_OBJECTIVE;
+    re_index=[1, 4], sd_index=[5, 6], cor_index=Int[], sd_scale=[1.0, 1.0],
+    level_nre=[1, 1], group=vcat(1:5, [1, 1, 2, 2, 2]), level_ngroups=[5, 2]),
+    [0.1, 0.4, -0.2, 0.05, -0.25, -0.1])
+
+# Four effects a subject on the nonlinear objective: T0MEANS, the
+# state-dependent drift, DIFFUSION and MANIFESTMEANS. Raw layout: 1-4 the model
+# parameters, 5-8 the scales, 9-14 the correlations.
+_fresh_placed_wide() = (ctsem_laplace_objective(_LAPLACE_NONLINEAR_OBJECTIVE;
+    re_index=[1, 2, 3, 4], sd_index=[5, 6, 7, 8], cor_index=collect(9:14),
+    sd_scale=[1.0, 1.0, 1.0, 1.0]),
+    [0.1, 0.4, -0.2, 0.05, -0.25, -0.6, -0.6, -0.4, 0.1, 0.0, -0.1, 0.05, 0.0, 0.1])
+
+# Every subject's T0MEANS under a study's four effects: each study a root of
+# four effects, on the lattice, over leaves of one, on product rules. Raw
+# layout: 1-4 the model parameters, 5 the subject scale, 6-9 the study scales,
+# 10-15 their correlations.
+_fresh_placed_wide_nested() = (ctsem_laplace_objective(_LAPLACE_NONLINEAR_OBJECTIVE;
+    re_index=[1, 1, 2, 3, 4], sd_index=[5, 6, 7, 8, 9], cor_index=collect(10:15),
+    sd_scale=[1.0, 1.0, 1.0, 1.0, 1.0], level_nre=[1, 4],
+    group=vcat(1:5, [1, 1, 2, 2, 2]), level_ngroups=[5, 2]),
+    [0.1, 0.4, -0.2, 0.05, -0.25, -0.5, -0.6, -0.6, -0.4, 0.1, 0.0, -0.1, 0.05,
+     0.0, 0.1])
+
+# Every unit flagged (a negative tolerance), each on its screened rule
+# (`draws_se` out of reach, so the refine keeps it).
+_placed_from(laplace, theta) = ctsem_laplace_placed(ctsem_laplace_continuation(
+    laplace, theta; tolerance=-1.0, draws_se=1e9))
+
+@testset "the placed value is the continuation's placed value at its centre" begin
+    for (label, fresh) in (("one level", _fresh_nonlinear),
+                           ("nested", _fresh_placed_nested),
+                           ("two levels, linear", _fresh_twolevel),
+                           ("lattice", _fresh_placed_wide),
+                           ("lattice root", _fresh_placed_wide_nested))
+        laplace, values = fresh()
+        theta = collect(Float64, values)
+        o = ctsem_laplace_continuation(laplace, theta; tolerance=-1.0, draws_se=1e9)
+        P = ctsem_laplace_placed(o)
+        @test (label, length(P.placed)) == (label, length(o.flagged))
+        r = ctsem_laplace_placed_evaluate(P, theta; gradient=false)
+        @test (label, isapprox(r.value, o.centre_value; rtol=1e-10)) == (label, true)
+        @test (label, maximum(abs, r.unit_loglik[o.flagged] .-
+            o.centre_quadrature[o.flagged]) < 1e-9) == (label, true)
+    end
+end
+
+@testset "the placed gradient is the derivative of the placed value" begin
+    for (label, fresh) in (("one level", _fresh_nonlinear),
+                           ("nested", _fresh_placed_nested),
+                           ("two levels, linear", _fresh_twolevel),
+                           ("lattice", _fresh_placed_wide),
+                           ("lattice root", _fresh_placed_wide_nested))
+        laplace, values = fresh()
+        theta = collect(Float64, values)
+        P = _placed_from(laplace, theta)
+        lattice = label in ("lattice", "lattice root")
+        @test (label, lattice == any(U -> any(ps -> ps.family === :lattice,
+            P.sets[U]), P.placed)) == (label, true)
+        n = length(theta)
+        for shift in (zeros(n), fill(0.05, n), [0.1 * (-1)^j for j in 1:n])
+            r = ctsem_laplace_placed_check(P, theta .+ shift; step=1e-6)
+            @test (label, all(isfinite, r.gradient)) == (label, true)
+            @test (label, all(isapprox.(r.gradient, r.differences; rtol=1e-5,
+                atol=1e-6))) == (label, true)
+        end
+    end
+end
+
+@testset "a placed rule's points summed over the pool's slots are the serial sum" begin
+    # A unit's points, a nested root's nodes and a frozen unit's draws are
+    # summed in ranges on the pool's free slots (`_placed_ranges`) and merged
+    # in order; at a pool of one they are one range. The two must agree to
+    # rounding, value and gradient, and the split must happen.
+    if Threads.nthreads() > 1
+        held = ContinuousTimeSEM._CTSEM_MAX_CHUNKS[]
+        try
+            for (label, fresh, drawn) in (("lattice", _fresh_placed_wide, false),
+                                          ("lattice root", _fresh_placed_wide_nested, false),
+                                          ("frozen draws", _fresh_nonlinear, true))
+                laplace, values = fresh()
+                theta = collect(Float64, values)
+                P = drawn ? ctsem_laplace_placed(ctsem_laplace_continuation(laplace,
+                    theta; tolerance=-1.0, draws_all=true, draws=256)) :
+                    _placed_from(laplace, theta)
+                drawn && @test (label, !isempty(P.frozen)) == (label, true)
+                at = theta .+ [0.03 * (-1)^j for j in eachindex(theta)]
+                # Once first, so both reads start each unit's solve from its
+                # mode there (an evaluation moves the anchors).
+                ContinuousTimeSEM._CTSEM_MAX_CHUNKS[] = 1
+                ctsem_laplace_placed_evaluate(P, at; gradient=false)
+                one = ctsem_laplace_placed_evaluate(P, at; gradient=true)
+                ContinuousTimeSEM._CTSEM_MAX_CHUNKS[] = min(4, Threads.nthreads())
+                @test (label, length(ContinuousTimeSEM._placed_ranges(256, 256)) > 1) ==
+                    (label, true)
+                many = ctsem_laplace_placed_evaluate(P, at; gradient=true)
+                @test (label, isapprox(many.value, one.value; rtol=1e-12)) == (label, true)
+                @test (label, all(isapprox.(many.gradient, one.gradient; rtol=1e-9,
+                    atol=1e-10))) == (label, true)
+            end
+        finally
+            ContinuousTimeSEM._CTSEM_MAX_CHUNKS[] = held
+        end
+    end
+end
+
+@testset "on a Gaussian integrand the placement terms vanish" begin
+    laplace, values = _fresh_twolevel()
+    theta = collect(Float64, values)
+    o = ctsem_laplace_continuation(laplace, theta; tolerance=-1.0)
+    P = ctsem_laplace_placed(o)
+    placed = ctsem_laplace_placed_evaluate(P, theta; gradient=true).gradient
+    frozen = ctsem_laplace_continuation_evaluate(o, theta; gradient=true).gradient
+    @test all(isapprox.(placed, frozen; rtol=1e-7, atol=1e-8))
+end
+
+@testset "a lattice rule past its target is raised, and the error is read where it sits" begin
+    C = ContinuousTimeSEM
+    laplace, values = _fresh_placed_wide()
+    theta = collect(Float64, values)
+    P = _placed_from(laplace, theta)
+    ctsem_laplace_placed_evaluate(P, theta; gradient=false)
+    U = P.placed[1]
+    # The refine reads a lattice by its count step as well as its spread, so
+    # the first count, with no half count to compare, does not stand alone.
+    start = 2 * C._LATTICE_START
+    @test P.sets[U][1].family === :lattice && P.sets[U][1].count == start
+    before = P.se[U]
+    @test isfinite(before) && before > 0
+    # Under a target the start's spread exceeds, the unit is rough and its
+    # points double until the spread is within it, or the lattice's most.
+    P.cont.draws_se = before / 3
+    @test U in C._placed_rough(P, 1.0)
+    @test C._placed_raise!(P, theta, [U]) == 1
+    @test P.sets[U][1].count > start
+    @test P.cont.unit_rules[U].points == P.sets[U][1].count
+    @test P.se[U] < before
+    @test P.se[U] <= P.cont.draws_se || P.sets[U][1].count == C._LATTICE_MAX
+    # The error at the last evaluation: each lattice unit's spread there, or
+    # its count step where that is larger, the spreads in quadrature and the
+    # count steps summed with the systematic errors.
+    ctsem_laplace_placed_evaluate(P, theta .+ 0.05; gradient=false)
+    e = ctsem_laplace_placed_error(P)
+    lat = [V for V in P.placed if P.sets[V][1].family === :lattice]
+    cs = [isfinite(P.cont.centre_error[V]) ? P.cont.centre_error[V] : 0.0 for V in lat]
+    spread = cs .<= P.se[lat]
+    @test e.centre_error[lat] == max.(P.se[lat], cs)
+    @test isapprox(e.error_draws, sqrt(sum(abs2, P.se[lat][spread]; init=0.0)); rtol=1e-12)
+    @test isapprox(e.error, e.error_draws + e.error_nodes + e.error_residual; rtol=1e-12)
+    # The slope check: the lattice units' gradients on two independent sets
+    # of shifts, through the curvature, in standard errors. Every unit a
+    # bar of zero leaves carrying something, none under an infinite one, and
+    # the other sets are lent and taken back.
+    H = ctsem_laplace_placed_hessian(P, theta)
+    sets = copy(P.sets)
+    loose = C._placed_slope_check(P, theta, H; bar=Inf)
+    @test isfinite(loose.sd) && loose.sd > 0
+    @test isempty(loose.units)
+    tight = C._placed_slope_check(P, theta, H; bar=0.0)
+    @test tight.sd == loose.sd
+    @test !isempty(tight.units) && issubset(tight.units, lat)
+    @test loose.doublings == 0 && 1 <= tight.doublings <= 5
+    @test loose.complete
+    @test all(V -> P.sets[V] === sets[V], P.placed)
+    # Without a curvature there is nothing to carry the error through.
+    @test isempty(C._placed_slope_check(P, theta, zeros(1, 1)).units)
+    # Product units' contributions share a sign and add as vectors; lattice
+    # units' add in quadrature.
+    @test C._placed_slope_measure([1.0 -2.0; 0.5 1.0; 3.0 4.0], [true, true, false],
+        trues(3)) ≈ [1.5 + 3.0, 1.0 + 4.0]
+    @test C._placed_slope_measure([1.0 -2.0; 0.5 1.0; 3.0 4.0], [true, true, false],
+        [true, false, false]) ≈ [1.0, 2.0]
+    # Product units are read by their node step and raised by it, the step's
+    # change standing as the unit's node error.
+    laplace1, values1 = _fresh_nonlinear()
+    theta1 = collect(Float64, values1)
+    R = _placed_from(laplace1, theta1)
+    @test all(V -> R.cont.unit_rules[V].family === :product, R.placed)
+    t1 = C._placed_slope_check(R, theta1, ctsem_laplace_placed_hessian(R, theta1); bar=0.0)
+    @test !isempty(t1.units) && issubset(t1.units, R.placed) && t1.complete
+    V = t1.units[1]
+    n0 = R.cont.unit_rules[V].nodes
+    @test C._placed_raise!(R, theta1, [V]; times=1) == 1
+    @test R.cont.unit_rules[V].nodes == n0 + 2
+    @test R.sets[V][1].count == n0 + 2
+    @test isfinite(R.cont.centre_error[V])
+    # A mixed rule's finer one steps its nodes as well as its points, along
+    # the refine's mixed sequence; at the most of both there is none.
+    @test C._placed_finer(C.CTSEMRuleChoice(:mixed, 5, 16)) ==
+        C.CTSEMRuleChoice(:mixed, 7, 32)
+    @test C._placed_finer(C.CTSEMRuleChoice(:mixed, C._CONTINUATION_NODES_MAX,
+        C._LATTICE_MAX)) === nothing
+    # The choice by the estimate's error: under no bar each unit moves to the
+    # cheapest rule it is measured on, the first lattice (the refine left it
+    # on the second); under any bar every
+    # unit's rule is one of its families' and its sets are that rule's.
+    Q = _placed_from(laplace, theta)
+    @test C._placed_choose!(Q, theta, H; bar=Inf) == length(Q.placed)
+    @test all(V -> Q.cont.unit_rules[V] == C.CTSEMRuleChoice(:lattice, 5, C._LATTICE_START),
+        Q.placed)
+    C._placed_choose!(Q, theta, H; bar=1e-3)
+    for V in Q.placed
+        c = Q.cont.unit_rules[V]
+        @test c.family in (:product, :lattice)
+        @test Q.sets[V][1].family === c.family
+        @test Q.sets[V][1].count == (c.family === :product ? c.nodes : c.points)
+    end
+    @test C._placed_choose!(Q, theta, zeros(1, 1)) == 0
+end
+
+@testset "the localised Hessian is the difference of the exact gradient" begin
+    laplace, values = _fresh_placed_nested()
+    theta = collect(Float64, values)
+    P = _placed_from(laplace, theta)
+    H = ctsem_laplace_placed_hessian(P, theta; step=1e-4)
+    @test all(isfinite, H)
+    @test H == transpose(H)
+    home = deepcopy(P.anchors)
+    n = length(theta)
+    D = zeros(n, n)
+    for t in 1:n
+        h = 1e-4 * max(1.0, abs(theta[t]))
+        xp = copy(theta); xp[t] += h
+        xm = copy(theta); xm[t] -= h
+        P.anchors = deepcopy(home); P.cache = nothing; P.value_cache = nothing
+        gp = ctsem_laplace_placed_evaluate(P, xp; gradient=true).gradient
+        P.anchors = deepcopy(home); P.cache = nothing; P.value_cache = nothing
+        gm = ctsem_laplace_placed_evaluate(P, xm; gradient=true).gradient
+        D[:, t] .= (gp .- gm) ./ (2h)
+    end
+    D = (D .+ transpose(D)) ./ 2
+    @test all(isapprox.(H, D; rtol=1e-6, atol=1e-8))
+end
+
+@testset "within an optimisation the anchors move only at accepted points" begin
+    C = ContinuousTimeSEM
+    laplace, values = _fresh_nonlinear()
+    theta = collect(Float64, values)
+    P = _placed_from(laplace, theta)
+    C._ctsem_anchor_start!(P, theta)
+    @test P.running
+    v0 = ctsem_laplace_placed_evaluate(P, theta; gradient=false).value
+    home = deepcopy(P.anchors)
+    far = theta .+ 0.5
+    # A trial moves no anchor, so the value at the accepted point does not
+    # depend on what was tried after it.
+    ctsem_laplace_placed_evaluate(P, far; gradient=false)
+    @test P.anchors == home
+    P.cache = nothing; P.value_cache = nothing
+    @test ctsem_laplace_placed_evaluate(P, theta; gradient=false).value ≈ v0 atol=1e-12
+    # An accepted step does.
+    ctsem_laplace_placed_evaluate(P, far; gradient=false)
+    C._ctsem_anchor_here!(P)
+    @test P.anchors != home
+    C.ctsem_laplace_clear_anchors!(P)
+    @test !P.running
+    # Outside a run every evaluation moves them.
+    ctsem_laplace_placed_evaluate(P, theta; gradient=false)
+    @test maximum(maximum(abs, P.anchors[U] .- home[U]) for U in P.placed) < 1e-8
+end
+
+# A loading whose sign the data cannot fix (test-julia-laplace-modes.R's
+# fixture): y = lambda eta with eta centred, so each subject's likelihood
+# depends on lambda^2 and its integrand in the loading's effect has a maximum
+# either side of minus the population mean over its sd. Raw layout: 1 the
+# loading's mean, 2 its population scale.
+function _build_placed_sign_objective(; nsubjects=6)
+    df = _laplace_test_dataframe(
+        drift=[-0.5;;], jax=[-0.5;;], cint=[0.0;;], diffusion=[0.8;;],
+        lambda=[0.0;;], jy=[0.0;;], manifestmeans=[0.0;;], manifestvar=[0.3;;],
+        t0var=[1.0;;], t0means=[0.0;;],
+        free=Dict((:LAMBDA, 1, 1) => (1, "param[1]"), (:Jy, 1, 1) => (1, "param[1]")))
+    sp = ekf_from_data_frame(df)
+    subject_starts, times, data = _laplace_test_data(nsubjects, 1; seed=7)
+    return ctsem_objective(sp, subject_starts, times, 4 .* data)
+end
+const _PLACED_SIGN_OBJECTIVE = _build_placed_sign_objective()
+_fresh_placed_sign() = ctsem_laplace_objective(_PLACED_SIGN_OBJECTIVE, [1], [2], Int[],
+    [1.0])
+
+@testset "a unit's maxima share its term by rank" begin
+    C = ContinuousTimeSEM
+    # The best at full weight takes the whole term, whatever lies below it.
+    s = C._laplace_mode_shares([1.0, 1.0, 0.4], [0.0, -1.17, -3.0])
+    @test s.pi == [1.0, 0.0, 0.0]
+    # A faded one hands the rest down the ranking, and where the values ranked
+    # are the values combined, a tie in the ranking moves nothing.
+    combine(f, t, a) = sum(C._laplace_mode_shares(f, t).pi .* a)
+    f = [0.3, 0.6, 0.8]
+    up = [1.0 + 1e-9, 1.0, -2.0]
+    down = [1.0 - 1e-9, 1.0, -2.0]
+    @test combine(f, up, up) ≈ combine(f, down, down) atol=1e-8
+    # The fades' coefficients are `f_k dA/df_k`, the combination's derivative
+    # in each fade on its own scale.
+    rng = Random.Xoshiro(3)
+    worst = 0.0
+    for trial in 1:200
+        K = rand(rng, 2:5)
+        t = randn(rng, K)
+        a = randn(rng, K)
+        f = rand(rng, K)
+        rand(rng) < 0.3 && (f[rand(rng, 1:K)] = 1.0)
+        A = combine(f, t, a)
+        c = C._laplace_mode_fade_coefficients(C._laplace_mode_shares(f, t), f, a, A)
+        for k in 1:K
+            0 < f[k] < 1 || continue
+            fp = copy(f); fp[k] += 1e-6
+            fm = copy(f); fm[k] -= 1e-6
+            d = (combine(fp, t, a) - combine(fm, t, a)) / 2e-6
+            worst = max(worst, abs(f[k] * d - c[k]))
+        end
+    end
+    @test worst < 1e-8
+end
+
+@testset "a valley between two maxima is the segment's minimum" begin
+    C = ContinuousTimeSEM
+    # Read off the lowest of seven points, the valley was a minimum of seven
+    # smooth functions and bent where two crossed: as the minimum moves from
+    # 3/4 towards 7/8 the lowest point switches at 13/16, and a maximum's fade
+    # and share bent there (the affect pilot's certification stalled on one).
+    # Refined between the lowest point's neighbours, it is the segment's
+    # minimum wherever that lies.
+    for m in (0.70, 0.8124, 0.8126, 0.86)
+        h = t -> -1 + 3 * (t - m)^2 - (t - m)^3
+        lo, i0 = findmin([h(i / 8) for i in 1:7])
+        r = C._laplace_segment_min(h, (i0 - 1) / 8, i0 / 8, (i0 + 1) / 8, lo)
+        @test abs(r.t - m) < 1e-7
+        @test r.value ≈ -1 atol=1e-13
+    end
+    # Two dips, the shallower on a point and the deeper midway between two:
+    # the lowest point is in the shallower, and refined there alone the
+    # valley would jump to the deeper's minimum once one of its points went
+    # lower. Every dip is refined, and the valley is the deeper's minimum.
+    dips = t -> -0.05 * exp(-(t - 0.3125)^2 / 0.0072) - 0.035 * exp(-(t - 0.75)^2 / 0.0072)
+    @test argmin([dips(i / 8) for i in 1:7]) == 6
+    v = C._laplace_segment_valley(dips, dips(0.0), dips(1.0))
+    @test v.value ≈ -0.05 atol=1e-9
+    @test abs(v.t - 0.3125) < 1e-3
+end
+
+@testset "a unit with two maxima is scored by the better one's rule" begin
+    C = ContinuousTimeSEM
+    # Mirror images at a population mean of zero: the two rules are one rule
+    # reflected, and either is the term. Both are placed, for the ranking.
+    theta = [0.0, 0.3]
+    P = _placed_from(_fresh_placed_sign(), theta)
+    @test all(U -> length(P.alt_anchors[U]) == 1, P.placed)
+    both = ctsem_laplace_placed_evaluate(P, theta; gradient=false)
+    @test all(U -> length(P.alt_modes[U]) == 1 && P.live[U] == 1, P.placed)
+    previous = C.ctsem_set_mode_sum!(false)
+    one = try
+        ctsem_laplace_placed_evaluate(_placed_from(_fresh_placed_sign(), theta), theta;
+            gradient=false)
+    finally
+        C.ctsem_set_mode_sum!(previous)
+    end
+    @test both.unit_loglik[P.placed] ≈ one.unit_loglik[P.placed] atol=1e-8
+    # Away from it the two rules differ, and the better one's is the term;
+    # the gradient is the value's. The far maximum is followed from there, as
+    # an optimisation follows it: a search started out here does not reach it.
+    P = _placed_from(_fresh_placed_sign(), [0.0, 0.3])
+    for (i, m) in enumerate(range(0.1, 1.2; length=12))
+        ctsem_laplace_placed_evaluate(P, [m, 0.3]; gradient=false)
+        i in (4, 12) || continue
+        @test all(U -> length(P.alt_modes[U]) == 1, P.placed)
+        r = ctsem_laplace_placed_check(P, [m, 0.3]; step=1e-6)
+        @test all(isfinite, r.gradient)
+        @test r.gradient ≈ r.differences rtol=1e-5 atol=1e-6
+    end
+    # Along the mean the maximum on the far side falls away and is dropped
+    # (here past `_LAPLACE_MODE_SPAN` below the near one): the term has no
+    # step where it goes, and the gradient is the value's on both sides.
+    # Followed from one point to the next, as an optimisation's accepted
+    # points follow them.
+    P = _placed_from(_fresh_placed_sign(), [0.0, 0.3])
+    grid = collect(range(0.0, 3.0; length=301))
+    h = step(range(0.0, 3.0; length=301))
+    value = Float64[]
+    live = Int[]
+    for m in grid
+        push!(value, ctsem_laplace_placed_evaluate(P, [m, 0.3]; gradient=false).value)
+        push!(live, sum(U -> 1 + length(P.alt_modes[U]), P.placed))
+    end
+    @test live[1] == 2 * length(P.placed)
+    @test live[end] < live[1]
+    d2 = abs.(diff(diff(value)))
+    @test maximum(d2) < 50 * h^2 * (1 + maximum(abs, diff(value)) / h)
+    for m in (grid[findfirst(<(live[1]), live)] - h, grid[findfirst(<(live[1]), live)])
+        Q = _placed_from(_fresh_placed_sign(), [m, 0.3])
+        r = ctsem_laplace_placed_check(Q, [m, 0.3]; step=1e-7)
+        @test r.gradient ≈ r.differences rtol=1e-4 atol=1e-5
+    end
+end

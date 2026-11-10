@@ -1,0 +1,444 @@
+# ctsem News
+
+
+
+## 14/10/2026
+### 4.0.0
+
+A major release: ctsem gains a second estimation engine, written in Julia, which most of what is new below needs. It is now `ctFit()`'s default; use `backend='stan'` for the previous behaviour.
+
+- New `backend='julia'` for `ctFit()`: an extended Kalman filter engine with an exact gradient and Hessian, threaded over subjects. `ctJuliaInstall()` sets up whatever is missing, asking before it downloads anything, and `ctJuliaStatus()`, `ctJuliaSetup()`, `ctJuliaProcesses()` and `ctJuliaKill()` manage its sessions.
+- Random effects on any parameter -- variances, nonlinear dynamics and non-Gaussian indicators included -- are integrated by a Laplace approximation (`intoverpop='laplace'`, the default when optimising), exactly where they shift a mean in a linear Gaussian model, and corrected by adaptive quadrature when fitted. Julia backend only.
+- Nested grouping levels, as `id=c('person','couple')`, with each parameter's `indvarying` naming the levels it varies at and `poprank` set per level. Julia backend only.
+- Ordinal, count and censored indicators, and lower and upper asymptotes for binary ones (`ASYMPTOTES` in `ctModel()`). Julia backend only.
+- Posterior sampling with `ctFit(backend='julia', optimize=FALSE)`, or after an optimised fit with `ctFitUncertainty(fit, 'sample')`, running until target effective sample sizes and R-hat are reached.
+- Smooth effects of time independent predictors, `ctModel(TIpredNames = ~ s(age) + sex)`, with their smoothness estimated from the data; `ctTIpredEffects(fit, whichTIpreds = 'age')` draws them with each person's own values. Julia backend only.
+- Sampling weights, one per subject, with `ctFit(weights=)`: a weighted pseudo-likelihood with robust standard errors, described in the new sampling weights vignette. Julia backend only.
+- `ctFitUncertainty()` is the new name of `ctOptimUncertainty()`, which remains, and adds `'sample'`, `'stored'` to redraw from the covariance a fit carries, and importance sampling against the quadrature or particle filter likelihood (`intoverpop='quadrature'`, `filter='particle'`).
+- New `uncertainty='checked'`: the Hessian's normal approximation, checked, and importance sampled where it is wrong. `uncertainty='surrogate'` is removed; use `'checked'`.
+- On the julia backend, missing values of time independent predictors are imputed when optimising and sampled when sampling, and `nlcontrol$nsubsteps='auto'` sets a nonlinear model's integration steps from its own error.
+- `ctFit(stationary=TRUE)` works again, with `backend='julia'`.
+- Model matrix cells accept a named form, `'mm, indvarying=TRUE, sdscale=0.5'`, as well as `'mm||TRUE|0.5'`; `ctPar()` builds either, and `ctCov()` writes a covariance matrix as cells.
+- Covariance matrices are parameterised by a matrix logarithm, so every positive definite matrix is reachable; `model$covmattransform='rawcorr'` for the previous parameterisation.
+- A parameter named in cells whose default transforms differ, such as a DRIFT diagonal and an off-diagonal, is now refused rather than transformed differently in each.
+- New checks: `ctReport()` runs the reporting and checking functions over a fit and writes a folder; `ctIdentify()` and `ctFitProfile()` for identification, on the julia backend; `ctLaplaceCheck()` and `ctParticleLik()` for the approximations a julia fit makes; `ctTracePlot()` for a julia fit's optimisation or chains.
+- New views of the dynamics: `ctNetwork()` and `ctNetworkPlot()`, `ctPhasePortrait()`, `ctStateDependencePlot()` and `ctVarianceDecomposition()`.
+- Posterior predictive checking is consolidated in `ctPostPredPlots()`, with panels for the mean trajectory and the lagged covariance; `ctFitCovCheck()` is renamed `ctFitCheckCov()`, the old name still available, and splits by group.
+- `ctLOO(method='psis')` cross-validates a Laplace fit without refitting.
+- `coef()`, `vcov()`, `logLik()`, `print()` and `anova()`, a likelihood-ratio test table for nested fits, for fits from either backend; `summary()`, `plot()` and `ctPlotPosterior()` for julia fits.
+- `ctChisqTest()` compares log likelihoods, not log posteriors, for fits made with `priors=TRUE`.
+- `ctGenerate(fromPriors=TRUE)` draws datasets from a model's prior predictive, without a fit or data, and `ctGenerateFromPriors()` is deprecated in its favour; `ctGenerate(backend='julia')` generates random effects at every level, nonlinear dynamics and non-Gaussian indicators, fills in a given design with `datastruct=`, and takes population values on the scales `summary()` reports with `values=`.
+- `ctGenerate()`'s `n.subjects` is now `n`, one count per id level; `n.subjects` still works, with a warning.
+- ACF plots fit a precision weighted spline by default, `method='weighted'`; `method='quantile'` for the previous plot.
+- Functions that run fits or engine loops default to `cores=getOption('mc.cores', 2)`, as `ctFit()` does. For `ctOptimUncertainty()`, `ctFitCovCheck()` and `ctKalmanArray()` that is up from one; `cores=1` for the previous behaviour.
+- When sampling, `ctFit()` uses `getOption('mc.cores', 2)` cores by default rather than one per chain; `cores='maxneeded'` for the previous behaviour.
+- `uncertainty='is'` samples adaptively, finding skewed and curved tails the curvature misses, and warns when the Pareto k of its weights exceeds 0.7; its effective sample target is now 200, `optimcontrol$isESS=100` for the previous.
+- `ctDiscretePars()`, `ctPredictTIP()`, `ctExtract()` and `ctKalmanArray()` take subjects as the ids in the data, as `ctPredict()` does; `realid=FALSE` for the previous behaviour.
+- `ctDiscretePars()`'s `observational` is deprecated in favour of `impulseType`: `'unit'` replaces `observational=FALSE` and `'observed'` replaces `observational=TRUE`.
+- `ctFit()`'s `iter`, `chains` and `control` are deprecated in favour of entries of `sampleControl`, and still honoured with a warning.
+- `ctModelCoverage_check()` is renamed `ctCoverageCheck()`, with camelCase arguments; the old name is defunct.
+- `ctCheckFit()` is defunct; `ctPostPredPlots()` and `ctFitCheckCov()` replace it.
+- `ctFitUpdateModel()` and `ctStanUpdModel()` are defunct; use `ctFitUpdate()`.
+- The `vb` argument of `ctFit()` (Stan's variational inference) is removed.
+- Fixed: standard errors along a direction the data do not identify were set by rounding rather than by the data, and could inflate those of other parameters; such parameters are now reported as unidentified.
+- Fixed: computing quantities over several posterior draws with `cores > 1` could stop with a Stan exception, or return draws out of order, in `ctGenerateFromPriors()`, `ctKalman()`, `ctPredict()` and `plot()`.
+- Fixed: `backend='stan'` with `optimcontrol$estonly=TRUE` failed for models with time independent predictors, which also stopped `ctLOO()`.
+- Fixed: a time independent predictor effect fixed to a value, such as `age=0.5`, was ignored by `backend='stan'`; it is now refused there, and fitted by `backend='julia'`.
+- Fixed: `ctACF()` and `ctACFresiduals()` dropped lag 0 from cross correlations.
+- Fixed: `ctACF()` and `ctACFresiduals()` counted pairs of observations at the wrong time lags unless every time fell on the time step's grid, which could show large spurious correlations; `ctDiscretiseData()` left such times off its grid, and shifted every time by an offset.
+- Fixed: `ctDiscretePars()` given subjects out of ascending order labelled each subject's results with another's id.
+- Fixed: `ctIntervalise()` read columns by position, so wide data with ctsem's column names in another order had values moved to the wrong variable and occasion; such columns are now put in order by name. It also set observations at other occasions to missing where an occasion's time was missing.
+- Fixed: `ctPredictTIP()`'s dynamics panels gave curves each other's labels when two or more moderator values were negative, as for a centred moderator, and with several predictors could show another predictor's curves.
+- Fixed: data values that do not read as numbers were treated as missing; `ctFit()` now stops and names them.
+- Fixed: in a nonlinear model, a cell using `min()` or `max()` of a state was linearised as if it did not depend on that state.
+- Fixed: `ctGenerate()` stopped with an error for a model with a DRIFT diagonal of 0, such as a linear trend.
+
+## 29/6/2026
+### 3.11.0
+
+- Function names have been simplified to remove Stan-specific wording from the main user-facing API. Use `ctFit()` rather than `ctStanFit()`, and the new non-`Stan` helper names such as `ctGenerateFromPriors()`, `ctGenerateFromFit()`, `ctPlotPosterior()`, `ctPostPredict()`, `ctSubjectPars()`, `ctTIpredEffects()`, and `ctSummaryMatrices()`. The old names remain as compatibility aliases for existing code. See the ctsem GitHub repository for further details: <https://github.com/cdriveraus/ctsem>.
+- `ctFit()` now uses `model` as the model argument name. The old `ctstanmodel` argument is deprecated but still accepted for existing scripts.
+- Modern fitting workflows should generally use `ctModel(type='ct')` or `ctModel(type='dt')` followed by `ctFit()`. `ctModel(type='omx')` objects are retained primarily for data generation and legacy workflows; convert them with `ctModelConvertOMX()` before fitting in the modern ctsem format.
+- System matrices can be directly edited in the model object `$matrices` subobject, this will automatically update the data.frame containing full specification under `$pars` and vice-versa. 
+- `ctEmpiricalBayesFit` is a new function that fits single subjects under the specified model, computes an empirical prior from those fits, then re-fits the subjects with that prior. 
+- Optimized-fit uncertainty can be refreshed with `ctOptimUncertainty()`, including Hessian, local surrogate, one-step bootstrap, full refit bootstrap, sandwich, and outer product of gradient approximations.
+
+## 27/6/2025
+### 3.10.4
+
+- Fixed bug in initial optimizer stages for nonlinear models requiring compilation.
+
+## 18/6/2025
+### 3.10.3
+- Major improvements to importance sampling. 
+- Include ctFitCovCheck function for checking empirical vs model implied covariance over time. 
+- Reduce parallel compute init overhead
+- Minor bug fixes to ctKalman
+- refactor stanoptimis, changes to carefulfit logic, remove DEoptim option.
+
+## 9/1/2025
+### 3.10.2
+- Stochastic optimizer improvements
+- Bootstrap uncertainty improvements -- when fitting, use argument optimcontrol=list(uncertainty='bootstrap')
+
+## 12/8/2024
+### 3.10.1
+- Fix bug introduced in 3.10.0 where certain combinations of Gaussian and binary variables cause convergence difficulties and invalid results. 
+- Revert unconstrained correlation change introduced in 3.10.0, it was more difficult to fit in some cases.
+- Detect duplicated T0MEANS parameters and propose alternative approach.
+- Add ctPredictTIP function for examining and plotting differences due to time independent predictors.
+
+
+## 10/05/2024
+### 3.10.0
+- Fix bug when computing Jacobian of certain nonlinear models.
+- Modify unconstrained correlation approach for better optimization / uncertainty quantification and clearer interpretation.
+- Add ctACF function for plotting approximate continuous time auto and cross correlations.
+- Bug fixes to ctKalman plots, were occasionally confused re subject ID.
+- Include experimental / imperfect approach to ordinal data. 
+
+## 30/10/2023
+### 3.9.1
+- Fix bug in ctKalman - was dropping certain subjects resulting in no plots / output.
+- Fix fatal (i.e, erroring out) bug in certain nonlinear parameter specifications.
+- Allow direct references to time dependent predictors in nonlinear specifications - now measurement model can easily depend on time varying covariates.
+- Update array syntax internally to rstan 2.26+ approach -- completely this time...
+
+## 14/9/2023
+### 3.9.0
+- Add progress reports for stochastic optimizer and Hessian.
+- Add small noise to improve sampling performance when `inits='optimize'`.
+- Include ctACF and ctACFresiduafunction for approximate continuous time auto-correlations.
+- Update array syntax internally to rstan 2.26+ approach.
+- Improved stochastic optimizer.
+
+## 20/8/2023
+### 3.8.1
+- Correct bug in nonlinear formulations when the same state is referenced for multiple nonlinearities.
+- Correct unnecessary memory usage when computing Hessian with multiple cores.
+- Improve stochastic subsampling first pass optimizer.
+- Simplify discrete time model computations internally.
+- Performance gains and reduced memory usage via usage of matrix exponential subsets and automatic computation of dynamic error indices.
+
+## 20/6/2023
+### 3.7.6
+- Deprecate `nopriors` argument to `ctStanFit`, allow `priors` argument
+- Allow `inits='optimize'` argument to `ctStanFit`, to speed up sampling approach
+- Allow integer values for `removeObs` argument to `ctKalman`, for N step ahead predictions
+- Allow `sameInitialTimes` argument to `ctStanFit`, to generate empty observations at earliest observation time, ensuring comparability of times at T0MEANS
+
+## 24/3/2023
+### 3.7.6
+- Fix compile error for some higher dimensional non-linear models
+- Fix NaN gradient error for certain non-linear measurement error models
+- Use Rstantools for compile specification to ensure future compatibility
+- Allow standardized error output from `ctKalman`
+
+## 1/7/2022
+### 3.7.0
+- Fix some plotting features, speed up random effects a little
+
+## 9/3/2022
+### 3.6.0
+- Fix: Random effects standard deviations were mis-estimated for time-dependent predictor effects and diffusion parameters when fitting with optimization
+
+## 6/12/2021
+### 3.5.5
+- Some edge case optimizer problems resolved
+- Bug fix in discrete time plots when `observational=TRUE`. Correlations were unnecessarily squared previously
+
+## 22/7/2021
+### 3.5.4
+- Improved automatic imputation of time-independent predictors, fixed bug where too many imputed values were set to zero. Care still recommended if relying on automatic imputation though!
+
+## 16/6/2021
+### 3.5.3
+- Fixed bug in output of `$rawpopcorr` introduced in 3.4.3. Correlations displayed incorrectly, other parameters unaffected
+- Modified correlation approach to ensure monotonicity in high dims
+
+## 31/5/2021
+### 3.5.0
+- Added `ctFitMultiModel` function to simplify processing of multiple models
+- Added `ctChisqTest` function for simplified likelihood ratio tests between models
+- Added subsampling optimization for first pass, faster for larger models/data
+
+## 21/4/2021
+### 3.4.3
+- Changed optimization scheme, first BFGS, then stochastic gradient descent
+- Fixed `ctStanTIpredEffects` function, much faster
+- Altered correlation matrix approach - better optimization/sampling behavior, priors can differ by index though
+
+## 10/2/2021
+### 3.4.2
+- `ctStanDiscretePars` temporal dependence plots work for discrete time also
+- Fix: In certain circumstances with covariate effects on duplicated parameters, the effects may not have been completely applied in the last few releases
+- Other small bug fixes and efficiency improvements
+
+## 4/12/2020
+### 3.4
+- `ctLOO` function for leave one out/k-fold cross-validation
+- `ctCheckFit` function dramatically improved for visual model diagnostics
+- Fixes to a range of edge cases when specifying more complex nonlinearities
+- `ctStanDiscretePars` has improved plotting options
+- `ctStanFitUpdate` function can be used to attempt to update a saved `ctStanFit` object to the current version of ctsem
+- `ctSaturatedCov` function for estimating a form of saturated model as a reference. Still a bit developmental.
+- General robustness / efficiency improvements.
+
+
+## 10/7/2020
+### 3.3.8
+- Stationarity,subject specific parameter output, and linear system estimation removed (uses nonlinear in all cases, a bit slower) to try satisfy CRAN compile time checks.
+
+## 20/6/2020
+### 3.3.2
+- ctLOO function to compute leave k out entropy estimates for model comparison / validation.
+- Optimizer parallelisation for single subject models
+- ctStanFitUpdate function to use saved fit objects created in earlier versions of ctsem.
+- Multiple core memory usage reductions.
+
+## 26/4/2020
+###3.2.1
+- Minor updates to suit rstan 2.2.3
+- Higher dim Hessian really really fixed...
+
+## 18/4/2020
+### 3.2.0
+- Change to defaults of ctStanFit -- optimization without priors is new default.
+- Optimization with binary variables much improved -- specify using: 
+  mymodel$manifesttype <- c(1,0,1) 
+  for 3 manifest variables, 1st and last binary and second continuous.
+- Improved latex output for models and fits using ctModelLatex.
+- Hessian estimation in higher dimensions fixed, again.
+- Experimental automatic covariate (tipred) detection -- set{ mymodel$TIpredAuto <- 1L } to try it.
+- Minor plotting / other fixes
+
+## 10/2/2020
+### 3.1.1
+- Reverted to non sequential measurement update introduced in 3.1.0
+- Further hessian estimation fixes
+- Stochastic optimizer further improved
+
+
+## 21/01/2020
+### 3.1.0
+- Fixed Hessian estimation sensitivity introduced last release.
+- ctStanKalman has option to return subject specific estimates.
+- Various performance improvements -- stochastic optimizer very effective with many parameters.
+- Fix rounding, off by one issue when using timestep argument for nonlinear dynamics.
+
+
+
+## 10/12/2019
+### 3.0.9
+- ctStanGenerate function -- generate from a ctstanmodel and prior distribution.
+- Parallel optimization improvements -- memory usage halved, more cores nearly always useful.
+- Missing time independent predictors single imputed when optimizing.
+- ctModelHigherOrder function to easily add higher order structure to specified model. E.g. slow changing trends / oscillations.
+- various minor output / efficiency / estimation robustness improvements.
+
+## 30/10/2019
+### 3.0.8
+- ctStanFit bug fix: MANIFESTVAR wrongly reported as the sqrt
+- ctFit bug fix: Std errors of covariances were too wide when transformedParams=TRUE
+- TI predictor effects can be specified as the 5th element of parameter string in ctModel -- "drift11 | -exp(param) | FALSE | 1 | age, gender"
+- Nonlinear models: Parameter names in the additional PARS matrix, and latent variables, can be referenced directly in parameters -- "-exp(cognition * drift11)" instead of "-exp(state[2] * PARS[1,1]". PARS matrix must still be specified.
+- Switched plotting to ggplot2, many changes / improvements.
+
+## 11/9/2019
+### 3.0.4
+- Removed some spurious warnings generated by last release.
+- Improved ctKalman function for ctStanFit results (timestep now works).
+- Parallelise optimization over subjects with ctStanFit (cores=xx).
+- Bug fix: time varying diffusion generated errors.
+- Use stochastic optimizer to check for improvements by default
+- Simplify ctModel specification -- vectors interpreted as rowwise matrices, automatic dimension detection.
+
+## 20/8/2019
+### 3.0.1
+- fixed a few minor / error generating bugs introduced in previous release related to random effects optimization.
+
+## 28/7/2019
+### 3.0.0
+- parameter transformations can be specified naturally without recompilation
+- analytic Jacobian's used for extended Kalman filter where possible
+- improved optimizer performance
+- generally improved performance, particularly for nonlinear systems.
+
+## 14/5/2019
+### 2.9.5
+- corrected optimization of random effects using ctStanFit
+- ctModelLatex function to display within subject model equation
+- custom calculations allowed in ctModel for linear and nonlinear approaches
+- Nonlinearity possible for discrete time now also
+- Use stochastic optimizer by default for ctStanFit -- more robust
+
+## 12/4/2019
+### 2.9.0
+- Improved optimizer using stochastic gradient descent.
+- fixed bug introduced re finding start values when binary variables are used.
+- custom calculations can be specified and estimated using both linear and nonlinear dynamics approach.
+- ctStanFit is no longer available for win32 systems.
+- ctStanKalman function extracts system state over time.
+
+## 6/11/2018
+### 2.7.3
+- Updated for rstan 2.18.1 compatibility
+- Non-linear dynamics now handled using mixture of extended and unscented filters for improved speed.
+- Priors for hierarchical variance modified so prior for total variance has consistent shape regardless of dimension.
+- Optimization / importance sampling works well for many cases, see arguments using ?ctStanFit.
+- ctStanPostPredict produces a range of posterior predictive plots.
+- Various small non-critical bug fixes / updates. (see github for details)
+
+## 25/6/2018
+### 2.6.5
+- Fixed bug in ctStanFit introduced in previous release leading to errors in handling of missing data.
+- ctStanTIpredMarginal function for plotting marginal relationships between predictors and parameters.
+
+## 1/6/2018
+### 2.6.0
+- Removed need for compilation of standard models.
+- Unscented Kalman filter for ctStanFit:
+  - Non-linear / time-varying / state dependent specifications now possible. 
+  - Optimization followed by importance sampling can be used instead of sampling via Stan.
+  - Most plotting functions still not working correctly for such models.
+- ctCheckFit function for plotting covariance of data generated from posterior against original.
+- Time independent predictors can now be used independent of random effects.
+- Fix bug in summary preventing display when binary variables were used in fit.
+- Allow data sets to contain both binary and continuous variables.
+- More robust data import, character string id's and jumbled order of rows now manageable.
+- stanWplot no longer requires shiny to be explicitly loaded.
+- Fix bug in ctKalman plotting function preventing interpolation.
+- Fix bug in additional summary matrices introduced in 2.5.0 -- some were transposed.
+- Summary no longer returns errors when partial stationarity is set.
+
+## 27/9/2017
+### 2.5.0
+Fixes: 
+- stanWplot function for trace plots while sampling with stan was not working on non windows platforms.
+- ctStan summary reports population standard deviations more accurately -- improved delta approach.
+- various minor plotting improvements
+
+Additions / Changes:
+- ctStanFit now handles correlation matrices differently -- little substantive impact.
+- ctKalman can now be used to plot individual trajectories from ctFit objects and ctStanFit objects (ctStanKalman function no longer exists).
+- ctStanFit now handles missing data on covariate effects -- time dependent predictors are set to zero, time independent predictors are imputed with a normal(0,10) prior (can adjust via the $tipredsimputedprior subobject of the ctStanModel).
+- ctStanFit default population standard deviation prior now changed to a regularised independence Jeffreys -- previous truncated normal approach still possible because...
+- ctStanFit now accepts custom specifications for the population standard deviation -- see the $rawhypersd , $rawhypersdlowerbound, and $hypersdtransform subobjects of the ctStanModel object. 
+- ctStan: Plotting covariate effects via ctStanTIpredeffects function now easier to use and more versatile -- can plot effects on discrete time matrices, for instance.
+- ctFit and ctMultigroupFit data argument changed to 'dat' instead of 'datawide', and now dataform="long" argument can be used to use long format data (as per ctStan) directly. 
+- additional parameter matrices shown for summary of ctStanFit objects.
+- ctStanParMatrices function to compute continuous time matrices for a given model and vector of free population means.
+
+
+## 16/5/2017
+### 2.4.0
+Fixes:
+- Time dependent predictors generated errors with the frequentist Kalman filter form since 2.2.0
+- With stationary set to NULL (not the default but offered in help file) for ctFit, 
+t0 matrices were mistakenly set to stationary.
+- Duplicated parameter names now allowed in a ctStanFit model.
+
+Features:
+- ctGenerateFromFit generates data based on a model fitted with ctFit.
+- ctPostPredict generates distributions from data based on a model fitted with ctFit
+and plots this against the original data.
+
+
+## 6/4/2017
+### 2.3.1
+Fixes:
+- summary: Standard errors were not reported in some cases
+- ctStanFit: 2.3.0 hierarchical correlation changes were applied too broadly
+- ctFit: discreteTime switch no longer gives errors when traits included
+- ctFit: transformedParams=FALSE argument no longer throwing errors.
+- ctStanKalman: correct handling of missing data for plotting.
+
+## 3/3/2017
+### 2.3.0
+Fixes:
+- TRAITVAR in frequentist ctsem was incorrectly accounting for differing time 
+  intervals since v2.0.0. TRAITVAR is now (again) reported as total between subjects
+  variance.
+- Default quantiles on ctStanDiscretePars adjusted to 95%.
+- Hierarchical correlation probabilities adjusted in ctStanFit for more consistent
+  behaviour with high dimensional processes.
+
+Changes:
+- Default to unstandardised cross effects plots.
+
+## 1/2/2017
+### 2.2.0
+Changes:
+- Time dependent predictors now have instantaneous effect in both frequentist and 
+  Bayesian approaches, and the documentation is updated to reflect this.
+  Previously, no TDpreds affecting first time point in frequentist.
+  Accordingly, wide data structure is changed, with an extra column 
+  per predictor and predictors now sorted by time point as for indicators. 
+  See vignette for example. 
+- Default to 0 covariance between time dependent predictors and initial (T0) 
+  latents / traits / time independent predictors. Specify matrix as 'free' 
+  in ctModel to estimate instead.
+- Default carefulFit = TRUE for multiple groups frequentist models (ctMultigroupFit)
+- Improve optimization approach for ctStanFit - but still not reliable for random effects.
+
+Fixes:
+- Multiple time dependent predictors with multiple processes resulted in inaccurate
+  estimates for TDPREDEFFECT in frequentist approach of previous versions.
+- Prevent ctGenerate from auto-filling matrices to 0 variance.
+- Correct oscillating example for change in tolerance in OpenMx.
+
+
+## 6/1/2017
+### 2.1.1
+Improvements:
+- improved fitting of frequentist models with ctFit and ctRefineTo, due to
+  changes to carefulFit penalisation and refining approach.
+
+Changes:
+- Removed package 'PSM' from suggests field and vignette as requested by CRAN
+
+Fixes:
+- rstan 2.14 caused problems with data import for ctStanFit
+- eliminated spurious warnings for ctStanFit
+
+
+## 20/12/2016
+### 2.1.0
+Features:
+- Empirical Bayes, experimental but can now optimize with hierarchical model 
+  (when using the Kalman filter, as per defaults)
+- Easy extraction and plotting of time independent predictor (covariate) effects,
+  see ctStanTIpredEffects for example.
+- Added stationary argument to ctStanFit - much more efficient than setting 
+  priors on stationarity.
+
+Bugs fixed:
+- incorrect number of cores spawned for parallel sessions.
+- optimize and variational bayes switches for ctStanFit did not work.
+- ctKalman would break if only 1 row of data passed in.
+
+
+## 18/11/2016
+### 2.0.0
+Features:
+- Hierarchical Bayesian modeling using Stan, see ctStanFit function and 
+  the vignette at https://cran.r-project.org/package=ctsem/vignettes/hierarchical.pdf
+
+Changes:
+- Defaults change: Fix CINT to 0 and free MANIFESTMEANS
+- Reintroduce variable effect of TRAITVAR at T0 (more flexible but more 
+    fitting problems - try MANIFESTTRAITVAR instead if problematic, or 
+    use step-wise fitting approach, automated with ctRefineTo)
+
+
+### ctsem 1.1.6
+Features added:
+- now with a change log!
+- ctCompareExpectation plots expected means and covariances against model implied.
+- remove log transform of drift matrix diagonal, positive drift diagonals again possible.
+- ctRefineTo allows easy step wise fitting from simple to complex - faster and more robust fitting in many cases.
+- ctPlot is a new function that allows more customization of plots.
+- ctModel now allows time varying means to be specified.
+
+Bugs fixed:
+- corrected handling of Cholesky inputs for ctGenerate

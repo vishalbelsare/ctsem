@@ -1,0 +1,888 @@
+if (identical(Sys.getenv('NOT_CRAN'), 'true')) {
+
+  library(ctsem)
+  library(testthat)
+
+  # A one-latent model with a DRIFT random effect (mean-affecting, so
+  # identified) and a DIFFUSION random effect (a variance cell, so only its
+  # covariance with the DRIFT effect is identified).
+  poprank_model <- function() {
+    m <- suppressMessages(ctModel(type = 'ct', n.latent = 1, n.manifest = 1,
+      LAMBDA = matrix(1), manifestNames = 'Y1', latentNames = 'eta',
+      DRIFT = matrix('dr11|-log1p_exp(param)'),
+      DIFFUSION = matrix('df11|log1p_exp(param)'),
+      CINT = matrix(0), MANIFESTMEANS = matrix(0),
+      MANIFESTVAR = matrix('mv|log1p_exp(param)'),
+      T0MEANS = matrix(0), T0VAR = matrix(1)))
+    m$pars$indvarying <- FALSE
+    m$pars$indvarying[m$pars$matrix %in% c('DRIFT', 'DIFFUSION')] <- TRUE
+    m
+  }
+
+  # Three latents, three DRIFT and three DIFFUSION random effects: m = 3, v = 3.
+  poprank_model6 <- function() {
+    nl <- 3L
+    DR <- matrix(0, nl, nl); diag(DR) <- paste0('dr', 1:nl, '|-log1p_exp(param)')
+    DF <- matrix(0, nl, nl); diag(DF) <- paste0('df', 1:nl, '|log1p_exp(param)')
+    MV <- matrix(0, nl, nl); diag(MV) <- paste0('mv', 1:nl, '|log1p_exp(param)')
+    m <- suppressMessages(ctModel(type = 'ct', n.latent = nl, n.manifest = nl,
+      LAMBDA = diag(nl), manifestNames = paste0('Y', 1:nl),
+      latentNames = paste0('eta', 1:nl), DRIFT = DR, DIFFUSION = DF,
+      MANIFESTVAR = MV, CINT = matrix(0, nl, 1), MANIFESTMEANS = matrix(0, nl, 1),
+      T0MEANS = matrix(0, nl, 1), T0VAR = diag(1, nl)))
+    m$pars$indvarying <- FALSE
+    m$pars$indvarying[m$pars$matrix %in% c('DRIFT', 'DIFFUSION') &
+        !is.na(m$pars$param)] <- TRUE
+    m
+  }
+
+  prepared_pars <- function(m) {
+    ctsem:::ctModelStatesAndPARS(m$pars, statenames = m$latentNames,
+      tdprednames = m$TDpredNames)
+  }
+
+  poprank_data <- function(nsub = 40L, nt = 8L, seed = 21L) {
+    set.seed(seed)
+    z <- matrix(rnorm(nsub * 2), nsub, 2) %*% chol(matrix(c(1, .7, .7, 1), 2, 2))
+    out <- vector('list', nsub)
+    for (i in seq_len(nsub)) {
+      a <- -log1p(exp(z[i, 1] * .6)); q <- log1p(exp(z[i, 2] * .4))
+      e <- exp(a); eta <- numeric(nt); eta[1] <- rnorm(1)
+      for (t in 2:nt) eta[t] <- e * eta[t - 1] +
+        rnorm(1, 0, sqrt(q^2 / (-2 * a) * (1 - e^2)))
+      out[[i]] <- data.frame(id = i, time = seq_len(nt) - 1,
+        Y1 = eta + rnorm(nt, 0, sqrt(.2)))
+    }
+    do.call(rbind, out)
+  }
+
+  test_that('a DRIFT random effect reaches the observation mean and a DIFFUSION one does not', {
+    roles <- ctsem:::.ctPopEffectRoles(prepared_pars(poprank_model()))
+    expect_equal(sort(roles$param), c('df11', 'dr11'))
+    expect_true(roles$mean[roles$param == 'dr11'])
+    expect_false(roles$mean[roles$param == 'df11'])
+  })
+
+  # This is the case a pattern match over `$pars$matrix` gets wrong, and the
+  # reason the classifier follows PARS references rather than reading the
+  # matrix column: `df11` drives DIFFUSION *and* appears inside the DRIFT
+  # expression, so it does reach the observation mean and is identified, while
+  # having no DRIFT row of its own.
+  test_that('a variance-cell parameter used in a mean expression counts as mean-affecting', {
+    m <- suppressMessages(ctModel(type = 'ct', n.latent = 1, n.manifest = 1,
+      LAMBDA = matrix(1), manifestNames = 'Y1', latentNames = 'eta',
+      PARS = matrix(c('df11', 'dr11'), 2, 1),
+      DRIFT = matrix('-log1p_exp(dr11 + 0.1 * df11)'),
+      DIFFUSION = matrix('log1p_exp(df11)'),
+      CINT = matrix(0), MANIFESTMEANS = matrix(0),
+      MANIFESTVAR = matrix('mv|log1p_exp(param)'),
+      T0MEANS = matrix(0), T0VAR = matrix(1)))
+    m$pars$indvarying <- FALSE
+    m$pars$indvarying[!is.na(m$pars$param) &
+        m$pars$param %in% c('df11', 'dr11')] <- TRUE
+    expect_true(all(ctsem:::.ctPopEffectRoles(prepared_pars(m))$mean))
+
+    # And the same shape without the DRIFT reference is variance-only again,
+    # so the test above is not passing for want of discrimination.
+    m$pars$param[m$pars$matrix %in% 'DRIFT'] <- '-log1p_exp(dr11)'
+    roles <- ctsem:::.ctPopEffectRoles(prepared_pars(m))
+    expect_false(roles$mean[roles$param == 'df11'])
+    expect_true(roles$mean[roles$param == 'dr11'])
+  })
+
+  test_that('poprank resolves to the right basis and parameter count', {
+    pars <- prepared_pars(poprank_model6())
+    expect_null(ctsem:::.ctPopRegressionSpec(pars, NA))
+
+    auto <- ctsem:::.ctPopRegressionSpec(pars, 'auto')
+    expect_equal(auto$rank, 3L)
+    expect_equal(auto$basis, c('dr1', 'dr2', 'dr3'))
+    expect_equal(auto$regressed, c('df1', 'df2', 'df3'))
+    # m(m+1)/2 + v*m against the full-rank k(k+1)/2 = 21
+    expect_equal(auto$npar, 15L)
+    expect_false(auto$approximate)
+
+    expect_equal(ctsem:::.ctPopRegressionSpec(pars, 2L)$npar, 11L)
+    expect_equal(ctsem:::.ctPopRegressionSpec(pars, 1L)$npar, 6L)
+    expect_true(ctsem:::.ctPopRegressionSpec(pars, 2L)$approximate)
+    # An explicit rank at the identified dimension is not an approximation.
+    expect_false(ctsem:::.ctPopRegressionSpec(pars, 3L)$approximate)
+    expect_error(ctsem:::.ctPopRegressionSpec(pars, 7L), 'only 6')
+  })
+
+  # The message is the only thing that tells a user their model lost population
+  # parameters, so what it claims has to be right. An effect regressed because
+  # its spread is unidentified and one regressed to meet a requested rank are
+  # different claims: the first loses nothing, the second is an approximation.
+  # A first version explained every regressed effect with the identification
+  # reason and so asserted that a DRIFT effect "varies only in DIFFUSION /
+  # MANIFESTVAR", which is false.
+  test_that('the poprank message separates unidentified from approximated', {
+    pars <- prepared_pars(poprank_model6())
+
+    auto <- ctsem:::.ctPopRegressionSpec(pars, 'auto')
+    auto$coefficients <- data.frame(param = auto$regressed,
+      stringsAsFactors = FALSE)
+    message_auto <- ctsem:::.ctPopRegressionMessage(auto)
+    expect_match(message_auto, 'rank 3 of 6', fixed = TRUE)
+    expect_match(message_auto, 'df1, df2, df3 vary', fixed = TRUE)
+    expect_match(message_auto, 'cannot see their own spread', fixed = TRUE)
+    # Nothing was approximated, so there is no approximation clause and no
+    # effect is reported as demoted. Not asserted by searching for 'dr1': the
+    # DRIFT effects are the *basis* here, so they are named legitimately in
+    # "a regression on dr1, dr2, dr3".
+    expect_false(grepl('approximation', message_auto, fixed = TRUE))
+    expect_false(grepl('also regressed', message_auto, fixed = TRUE))
+    expect_match(message_auto, 'regression on dr1, dr2, dr3', fixed = TRUE)
+    expect_match(message_auto, 'poprank=NA', fixed = TRUE)
+
+    one <- ctsem:::.ctPopRegressionSpec(pars, 1L)
+    one$coefficients <- data.frame(param = one$regressed,
+      stringsAsFactors = FALSE)
+    message_one <- ctsem:::.ctPopRegressionMessage(one)
+    expect_match(message_one, 'rank 1 of 6', fixed = TRUE)
+    # the variance-cell effects keep the identification reason ...
+    expect_match(message_one, 'df1, df2, df3 vary', fixed = TRUE)
+    # ... and the demoted DRIFT effects are reported as the approximation
+    expect_match(message_one, 'dr2, dr3 are also regressed', fixed = TRUE)
+    expect_match(message_one, 'below the 3 this model identifies', fixed = TRUE)
+    expect_match(message_one, 'approximation', fixed = TRUE)
+  })
+
+  # The same restriction on both routes, reached two different ways, and the
+  # coordinates differ because of it.
+  #
+  # On the augmented route there are carrier states, so a reduced rank rewrites
+  # the model: basis effects move into PARS and the regressed cells reference
+  # them, giving loadings named as the engine names them,
+  # `poploading_<parameter>_dim<j>`.
+  #
+  # Under laplace the restriction is applied where the covariance is built, as
+  # a loading matrix per level, giving `poploading_<parameter>_dim<j>`. That is
+  # what lets it reach a level above the innermost one, which the rewrite
+  # cannot -- and it keeps the levels independent, which the rewrite also
+  # cannot, since a regressed cell written as `(p + beta * b)` inherits every
+  # level's deviation of `b` through the one coefficient.
+  #
+  # Same rank either way, so the parameter count is the same; only the
+  # coordinates change.
+  test_that('poprank restricts the laplace and none routes too, when asked', {
+    dat <- poprank_data()
+    prepared <- function(iop, ...) {
+      suppressWarnings(suppressMessages(ctFit(datalong = dat,
+        model = poprank_model(), backend = 'julia', fit = FALSE,
+        intoverpop = iop, cores = 1L, ...)))
+    }
+    loadings <- list()
+    for (iop in c('laplace', 'none', 'augmented')) {
+      # 'none' is sampling: intoverpop = FALSE with optimize = FALSE.
+      route <- if (identical(iop, 'none')) list(FALSE, optimize = FALSE) else list(iop)
+      full <- do.call(prepared, c(route, poprank = NA))
+      auto <- do.call(prepared, c(route, poprank = 'auto'))
+      expect_equal(ctsem:::.ctBackendNpar(full), 6L, info = iop)
+      expect_equal(ctsem:::.ctBackendNpar(auto), 5L, info = iop)
+      names <- ctsem:::.ctBackendRawParameterNames(list(model_spec = auto),
+        ctsem:::.ctBackendNpar(auto))
+      loadings[[iop]] <- sort(grep('^poploading_', names, value = TRUE))
+      expect_true('poploading_df11_dim1' %in% names, info = iop)
+      # Either way the reduced effect keeps neither a spread of its own nor a
+      # correlation, which is the whole content of the restriction.
+      expect_false(any(c('popsd_df11', 'rawcor_df11__dr11') %in% names))
+    }
+    # One structure under one set of names, whichever route built it.
+    expect_identical(loadings$none, loadings$laplace)
+    expect_identical(loadings$augmented, loadings$laplace)
+  })
+
+  # And it is NOT the default off the augmented route. On the augmented route
+  # 'auto' removes coordinates that cannot be identified, so it costs nothing.
+  # Under laplace those coordinates are identified: measured on a 250 x 50
+  # design the same restriction cost 48 log likelihood units and took the fit to
+  # the boundary, basis sd to zero with the coefficient at -612. A default doing
+  # that to someone who chose laplace *because* it identifies these things would
+  # be indefensible.
+  test_that('the poprank default does not restrict a laplace fit', {
+    dat <- poprank_data()
+    auto <- suppressWarnings(suppressMessages(ctFit(datalong = dat,
+      model = poprank_model(), backend = 'julia', fit = FALSE,
+      intoverpop = 'laplace', cores = 1L)))
+    expect_null(auto$model$popregression)
+    expect_equal(ctsem:::.ctBackendNpar(auto), 6L)
+    # the augmented default does restrict, which is the contrast
+    augmented <- suppressWarnings(suppressMessages(ctFit(datalong = dat,
+      model = poprank_model(), backend = 'julia', fit = FALSE,
+      intoverpop = 'augmented', cores = 1L)))
+    expect_equal(ctsem:::.ctBackendNpar(augmented), 5L)
+  })
+
+  # The message must not carry the augmented route's justification onto a route
+  # where it is false. A first version told a laplace user that df11 "varies
+  # only in DIFFUSION / MANIFESTVAR, where the augmented filter cannot see its
+  # own spread" -- on the one route that does identify it.
+  test_that('the poprank message says which claim it is making', {
+    pars <- prepared_pars(poprank_model())
+    spec <- ctsem:::.ctPopRegressionSpec(pars, 'auto')
+    spec$coefficients <- data.frame(param = spec$regressed,
+      stringsAsFactors = FALSE)
+
+    spec$route <- 'augmented'
+    augmented <- ctsem:::.ctPopRegressionMessage(spec)
+    expect_match(augmented, 'cannot see its own spread', fixed = TRUE)
+    expect_match(augmented, "intoverpop='laplace' identifies it", fixed = TRUE)
+
+    # laplace and 'none' build the rank in the engine and say so in one line
+    # from ctFit(): an approximation there, with no claim about what a filter
+    # cannot see.
+    dat <- poprank_data()
+    said <- function(...) {
+      out <- character(0)
+      withCallingHandlers(suppressWarnings(ctFit(datalong = dat,
+        model = poprank_model(), backend = 'julia', fit = FALSE, cores = 1L,
+        poprank = 'auto', ...)),
+        message = function(m) {
+          out <<- c(out, conditionMessage(m)); invokeRestart('muffleMessage')
+        })
+      paste(out, collapse = '')
+    }
+    for (route in list(list(intoverpop = 'laplace'),
+        list(intoverpop = FALSE, optimize = FALSE))) {
+      text <- do.call(said, route)
+      expect_match(text, 'reduced to rank', fixed = TRUE)
+      expect_match(text, 'an approximation under', fixed = TRUE)
+      expect_false(grepl('cannot see', text, fixed = TRUE))
+    }
+  })
+
+  # The rank may be stated on the model, which is the idiom indvarying already
+  # uses. An argument at the call site wins over it.
+  test_that('poprank can be stated on the model, and the argument wins', {
+    dat <- poprank_data()
+    m <- poprank_model()
+    m$poprank <- 'auto'
+    onmodel <- suppressWarnings(suppressMessages(ctFit(datalong = dat, model = m,
+      backend = 'julia', fit = FALSE, intoverpop = 'augmented', cores = 1L)))
+    expect_equal(ctsem:::.ctBackendNpar(onmodel), 5L)
+
+    overridden <- suppressWarnings(suppressMessages(ctFit(datalong = dat,
+      model = m, backend = 'julia', fit = FALSE, intoverpop = 'augmented',
+      poprank = NA, cores = 1L)))
+    expect_equal(ctsem:::.ctBackendNpar(overridden), 6L)
+  })
+
+  # Stated on the model, a rank was asked for, so it applies on the routes where
+  # only an asked-for rank does. A first version read the model's rank and then
+  # gated laplace and 'none' on the argument alone, so the fit ran at full rank
+  # and said nothing.
+  test_that('a rank stated on the model applies under laplace and none, as passed', {
+    dat <- poprank_data()
+    m <- poprank_model()
+    m$poprank <- 'auto'
+    prepared <- function(model, ...) suppressWarnings(suppressMessages(ctFit(
+      datalong = dat, model = model, backend = 'julia', fit = FALSE,
+      cores = 1L, ...)))
+    routes <- list(laplace = list(intoverpop = 'laplace'),
+      none = list(intoverpop = FALSE, optimize = FALSE))
+    for (route in names(routes)) {
+      onmodel <- do.call(prepared, c(list(model = m), routes[[route]]))
+      passed <- do.call(prepared, c(list(model = poprank_model(),
+        poprank = 'auto'), routes[[route]]))
+      full <- do.call(prepared, c(list(model = poprank_model()), routes[[route]]))
+      expect_equal(ctsem:::.ctBackendNpar(onmodel), ctsem:::.ctBackendNpar(passed),
+        info = route)
+      expect_lt(ctsem:::.ctBackendNpar(onmodel), ctsem:::.ctBackendNpar(full))
+    }
+  })
+
+  # Off laplace the rank restricts the subject level alone, so a name is checked
+  # against the levels rather than dropped: `c(nosuchlevel = 1)` was applied
+  # to the subject level as 1, and two entries died in an `if` of length two.
+  test_that('a named rank off laplace names the subject level or is refused', {
+    dat <- poprank_data()
+    prepared <- function(...) suppressWarnings(suppressMessages(ctFit(
+      datalong = dat, model = poprank_model(), backend = 'julia', fit = FALSE,
+      intoverpop = 'augmented', cores = 1L, ...)))
+    expect_equal(ctsem:::.ctBackendNpar(prepared(poprank = c(id = 1))), 5L)
+    expect_error(prepared(poprank = c(nosuchlevel = 1)), 'no level called')
+    expect_error(prepared(poprank = c(id = 1, x = 2)), 'no level called')
+    expect_error(prepared(poprank = 1.5), 'whole number')
+  })
+
+  # A reduced rank needs the population covariance free, and that is the whole
+  # of the rule: under `Sigma = L L'` nothing below the diagonal is a cell, a
+  # spread is a row norm, and a regressed effect has neither -- so no stated
+  # cell survives, whichever effect it is about and whatever it says. The
+  # cases below are the ones an earlier version sorted into expressible and
+  # not, which is how a stated zero came to be accepted and then dropped.
+  test_that('a reduced rank refuses any stated RAWPOPVAR cell', {
+    m <- poprank_model6()
+    pars <- prepared_pars(m)
+    m$pars <- pars
+    fresh <- function() { out <- m; out[['RAWPOPVAR']] <- ctsem:::.ctModelRawPopVar(pars); out }
+    split <- function(model) ctsem:::.ctPopRegressionSpec(prepared_pars(model),
+      'auto', explicit = TRUE, model = model)
+
+    # An untouched RAWPOPVAR states nothing, so the reduction proceeds. Its own
+    # labels are the default and a default is the absence of a statement --
+    # without this the rule would refuse every model.
+    base <- split(fresh())
+    expect_equal(base$basis, c('dr1', 'dr2', 'dr3'))
+    expect_equal(base$regressed, c('df1', 'df2', 'df3'))
+    expect_length(ctsem:::.ctPopRegressionRawPopVarStated(fresh()), 0L)
+
+    cases <- list(
+      c('dr1', 'dr1', '0.3'),   # a basis sd, the one case that used to pass
+      c('dr2', 'dr1', '0'),     # a zero between basis effects
+      c('dr3', 'dr2', '0.4'),   # a covariance between basis effects
+      c('df1', 'df1', '0.3'),   # a regressed sd
+      c('df1', 'df1', '0'),     # and at zero
+      c('df1', 'dr1', '0'))     # a zero against a regressed effect
+    for (case in cases) {
+      one <- fresh()
+      one[['RAWPOPVAR']][case[1L], case[2L]] <- case[3L]
+      info <- paste(case, collapse = ' ')
+      expect_length(ctsem:::.ctPopRegressionRawPopVarStated(one), 1L)
+      expect_error(split(one), 'poprank needs a free population covariance',
+        info = info)
+      # Defaulted, the statement wins and the rank is not applied -- so a user
+      # who fixes a cell and asks for nothing keeps the full covariance and the
+      # cell with it.
+      expect_null(ctsem:::.ctPopRegressionSpec(prepared_pars(one), 'auto',
+        explicit = FALSE, model = one), info = info)
+    }
+
+    # A relabelling is a statement too: an equality constraint is a
+    # specification, not an estimate.
+    lab <- fresh(); lab[['RAWPOPVAR']]['dr2', 'dr2'] <- 'shared'
+    expect_error(split(lab), 'poprank needs a free population covariance')
+  })
+
+  # What a fixed RAWPOPVAR entry means. Pinned because the documentation in
+  # R/ctModelRawPopVar.R now states these numbers, and a comment is not evidence:
+  # if `constraincorsqrt1()` or the placement changes, this is what notices.
+  #
+  # The diagonal is the population sd it says it is. The off-diagonal is the
+  # coordinate that map consumes, and it is unbounded: the (-1, 1) squash moved
+  # off the parameter and into `constraincorsqrt1`, so one model structure works
+  # under any covmattransform and a correlation near one is reachable here.
+  # Zero is still exact for a two-effect model, which is what this checks; it is
+  # NOT exact in general, and R/ctModelRawPopVar.R says why.
+  test_that('a fixed RAWPOPVAR entry means what R/ctModelRawPopVar.R says it means', {
+    set.seed(4); nsub <- 120L; nt <- 6L
+    o <- vector('list', nsub)
+    for (i in seq_len(nsub)) {
+      eta <- numeric(nt); eta[1] <- rnorm(1)
+      for (t in 2:nt) eta[t] <- exp(-.5) * eta[t - 1] + rnorm(1, 0, .4)
+      o[[i]] <- data.frame(id = i, time = seq_len(nt) - 1,
+        Y1 = eta + rnorm(1, 0, .5) + rnorm(nt, 0, .3),
+        Y2 = eta + rnorm(1, 0, .5) + rnorm(nt, 0, .3))
+    }
+    dat <- do.call(rbind, o)
+    mk <- function() {
+      m <- suppressMessages(ctModel(type = 'ct', n.latent = 1, n.manifest = 2,
+        LAMBDA = matrix(c(1, 1), 2, 1), manifestNames = c('Y1', 'Y2'),
+        latentNames = 'eta', DRIFT = matrix(-0.5), DIFFUSION = matrix(0.4),
+        CINT = matrix(0), T0MEANS = matrix(0), T0VAR = matrix(1),
+        MANIFESTMEANS = matrix(c('mm1|param', 'mm2|param'), 2, 1),
+        MANIFESTVAR = matrix(c('mv1|log1p_exp(param)', 0, 0,
+          'mv2|log1p_exp(param)'), 2, 2)))
+      m$pars$indvarying <- FALSE
+      m$pars$indvarying[m$pars$matrix %in% 'MANIFESTMEANS'] <- TRUE
+      m
+    }
+    withcell <- function(row, col, value) {
+      m <- mk()
+      p <- ctsem:::ctModelStatesAndPARS(m$pars,
+        statenames = 'eta', tdprednames = NULL)
+      m$pars <- p
+      m[['RAWPOPVAR']] <- ctsem:::.ctModelRawPopVar(p)
+      nms <- rownames(m[['RAWPOPVAR']])
+      m[['RAWPOPVAR']][nms[row], nms[col]] <- value
+      set.seed(77)
+      f <- suppressWarnings(suppressMessages(ctFit(datalong = dat, model = m,
+        backend = 'julia', intoverpop = 'augmented', poprank = NA, cores = 1L,
+        verbose = 0L, optimcontrol = list(estonly = TRUE))))
+      ctsem:::.ctBackendRawPopCov(f)[[1L]]$cov
+    }
+    correlation <- function(cov) cov[2, 1] / sqrt(cov[1, 1] * cov[2, 2])
+
+    # the diagonal is the sd, exactly, for these linear transforms
+    expect_equal(sqrt(withcell(1, 1, 0.3)[1, 1]), 0.3, tolerance = 1e-4)
+    expect_equal(sqrt(withcell(1, 1, 0.8)[1, 1]), 0.8, tolerance = 1e-4)
+
+    # zero off the diagonal is uncorrelated, exactly
+    expect_equal(correlation(withcell(2, 1, 0)), 0, tolerance = 1e-6)
+
+    # And a non-zero coordinate is Fisher's z of the correlation, exactly.
+    #
+    # That is the whole point of the 'z' construction and it is worth asserting
+    # as an identity rather than as a table of decimals: `tanh` over the range
+    # says what the specification surface means, and it fails if the default
+    # ever moves back to a construction where the coordinate means something
+    # else. This test previously pinned 0.2846, 0.4522 and -0.4463, which are
+    # `constraincorsqrt1`'s numbers from when that was the default.
+    for (stated in c(0.3, 0.5, 5, -0.5, -2)) {
+      expect_equal(correlation(withcell(2, 1, stated)), tanh(stated),
+        tolerance = 1e-4, info = paste("stated", stated))
+    }
+    # Unbounded, so a correlation near one is reachable through this surface --
+    # it was not while the (-1, 1) map sat on the parameter.
+    expect_gt(correlation(withcell(2, 1, 5)), 0.999)
+    # And symmetric in sign, which `constraincorsqrt1` was not: its row scale
+    # carries an `|s| - s` term, so the same coordinate magnitude gave a
+    # different correlation magnitude either side of zero. `tanh` is odd, so
+    # the surface now reads like a correlation in that respect too.
+    expect_equal(abs(correlation(withcell(2, 1, -0.5))),
+      abs(correlation(withcell(2, 1, 0.5))), tolerance = 1e-6)
+  })
+
+  # ctIdentify checks the model ctFit() would fit with the same arguments,
+  # rank included (decided 2026-10-27; from a277549f until then it checked the
+  # unrestricted covariance whatever ctFit's rank, when augmented was ctFit's
+  # route). On the augmented route the default rank removes the direction the
+  # filter cannot see, so that model is identified; poprank = NA asks for the
+  # full covariance and its flat direction. The rank reaches ctIdentify
+  # through `...`, so it has no argument of its own. At its default three
+  # points: at the origin every loading is zero, so the reduced model's
+  # loadings are flat there alone, which one point would report as flat.
+  test_that('ctIdentify checks the rank ctFit fits, and the full one on request', {
+    dat <- poprank_data(nsub = 60L)
+    check <- function(...) suppressWarnings(suppressMessages(ctIdentify(dat,
+      poprank_model(), cores = 1L, verbose = 0L, intoverpop = 'augmented', ...)))
+    reduced <- check()
+    full <- check(poprank = NA)
+    # three population parameters at full rank, one fewer once the diffusion
+    # effect is a regression on the drift's
+    expect_equal(full$npar, 6L)
+    expect_equal(reduced$npar, 5L)
+    expect_gte(full$nweak, 1L)
+    expect_true('popsd_df11' %in% full$parameters)
+    expect_equal(reduced$nweak, 0L)
+    expect_length(reduced$parameters, 0L)
+    expect_false('poprank' %in% names(formals(ctIdentify)))
+  })
+
+  test_that('poprank refuses a model in which nothing reaches the observation mean', {
+    m <- poprank_model()
+    m$pars$indvarying <- FALSE
+    m$pars$indvarying[m$pars$matrix %in% 'DIFFUSION'] <- TRUE
+    expect_error(ctsem:::.ctPopRegressionSpec(prepared_pars(m), 'auto'),
+      'reaches the observation mean')
+  })
+
+  # Explicitly asking for a rank where it cannot apply is an error; the default
+  # is simply not applied, which is what lets 'auto' be the default at all.
+  # Laplace is no longer among the refusals -- it is supported, just not by
+  # default -- so only the backend is.
+  test_that('an explicitly requested poprank is refused on stan', {
+    dat <- poprank_data()
+    expect_error(suppressWarnings(ctFit(datalong = dat, model = poprank_model(),
+      backend = 'stan', fit = FALSE, intoverpop = 'augmented', poprank = 'auto')),
+      "requires backend='julia'")
+    # Stated on the model is asked for too, rather than accepted and ignored.
+    m <- poprank_model()
+    m$poprank <- 'auto'
+    expect_error(suppressWarnings(ctFit(datalong = dat, model = m,
+      backend = 'stan', fit = FALSE, intoverpop = 'augmented')),
+      "requires backend='julia'")
+  })
+
+  test_that('the default poprank is silently inapplicable where it cannot be used', {
+    dat <- poprank_data()
+    expect_type(suppressWarnings(suppressMessages(ctFit(datalong = dat,
+      model = poprank_model(), backend = 'stan', fit = FALSE,
+      intoverpop = 'augmented'))), 'list')
+    laplace <- suppressWarnings(suppressMessages(ctFit(datalong = dat,
+      model = poprank_model(), backend = 'julia', fit = FALSE,
+      intoverpop = 'laplace', cores = 1L)))
+    expect_null(laplace$model$popregression)
+  })
+
+  # A model where nothing reaches the observation mean has no basis to regress
+  # on. Asked for, that is an error; defaulted, the model is left alone rather
+  # than a call that used to run becoming a failure.
+  test_that('the default poprank leaves a model with no mean-affecting effect alone', {
+    dat <- poprank_data()
+    m <- poprank_model()
+    m$pars$indvarying <- FALSE
+    m$pars$indvarying[m$pars$matrix %in% 'DIFFUSION'] <- TRUE
+    expect_null(ctsem:::.ctPopRegressionSpec(prepared_pars(m), 'auto',
+      explicit = FALSE))
+    expect_error(ctsem:::.ctPopRegressionSpec(prepared_pars(m), 'auto',
+      explicit = TRUE), 'reaches the observation mean')
+    spec <- suppressWarnings(suppressMessages(ctFit(datalong = dat, model = m,
+      backend = 'julia', fit = FALSE, intoverpop = 'augmented', cores = 1L)))
+    expect_null(spec$model$popregression)
+  })
+
+  # 'auto' is the default, so the case where it changes nothing has to be
+  # An individually varying T0MEANS is ctsem's default and no fixture above has
+  # one -- they all fix T0MEANS at zero -- which is how a default-path internal
+  # error survived here. Its carrier state is the latent itself, so there is no
+  # dimension for the loadings to sit on and the rewrite cannot substitute a
+  # predictor into the cell.
+  #
+  # The transform is stated as the identity because the default one is a
+  # parameter-dependent expression the julia engine does not yet take in
+  # T0MEANS, which would refuse this model before poprank was reached and tell
+  # us nothing.
+  t0varying_model <- function() {
+    m <- suppressMessages(ctModel(type = 'ct', n.latent = 1, n.manifest = 1,
+      LAMBDA = matrix(1), manifestNames = 'Y1', latentNames = 'eta',
+      T0MEANS = matrix('t0m|param|TRUE'), T0VAR = matrix(1),
+      DRIFT = matrix('dr11|-log1p_exp(param)'),
+      DIFFUSION = matrix('df11|log1p_exp(param)'),
+      CINT = matrix(0), MANIFESTMEANS = matrix(0),
+      MANIFESTVAR = matrix('mv|log1p_exp(param)')))
+    m$pars$indvarying <- FALSE
+    m$pars$indvarying[m$pars$matrix %in%
+        c('DRIFT', 'DIFFUSION', 'T0MEANS')] <- TRUE
+    m
+  }
+
+  test_that('an individually varying T0MEANS cannot be a loading, and the default says nothing', {
+    skip_without_julia()
+    dat <- poprank_data()
+    m <- t0varying_model()
+
+    # The default. This raised `Internal error: basis cell T0MEANS[1,1] does
+    # not read state[1] as expected` -- the reduction reached a cell it cannot
+    # rewrite -- so the assertion is that it builds at all.
+    auto <- suppressWarnings(suppressMessages(ctFit(datalong = dat, model = m,
+      backend = 'julia', fit = FALSE, intoverpop = 'augmented', cores = 1L)))
+    expect_null(auto$model$popregression)
+    none <- suppressWarnings(suppressMessages(ctFit(datalong = dat, model = m,
+      backend = 'julia', fit = FALSE, intoverpop = 'augmented',
+      poprank = NA, cores = 1L)))
+    expect_equal(ctsem:::.ctBackendNpar(auto), ctsem:::.ctBackendNpar(none))
+
+    # Asked for, it says which effect and what to do instead.
+    expect_error(suppressWarnings(suppressMessages(ctFit(datalong = dat,
+      model = m, backend = 'julia', fit = FALSE, intoverpop = 'augmented',
+      poprank = 2L, cores = 1L))), 'individually varying T0MEANS')
+
+    # A rank that regresses nothing is a no-op: the rewrite returns the model
+    # untouched, no cell is reached, and refusing it would tell a user who
+    # asked for the full rank that they cannot reduce.
+    full <- suppressWarnings(suppressMessages(ctFit(datalong = dat, model = m,
+      backend = 'julia', fit = FALSE, intoverpop = 'augmented',
+      poprank = 3L, cores = 1L)))
+    expect_null(full$model$popregression)
+    expect_equal(ctsem:::.ctBackendNpar(full), ctsem:::.ctBackendNpar(none))
+
+    # And it is the augmented route's restriction, not the reduction's: with no
+    # carrier states there is no cell to rewrite, so the effect is an ordinary
+    # basis member.
+    pars <- prepared_pars(m)
+    expect_error(ctsem:::.ctPopRegressionSpec(pars, 'auto'),
+      'individually varying T0MEANS')
+    # laplace and 'none' build their loadings in the engine, with no carrier
+    # states, so a varying T0MEANS takes a rank there like any other effect.
+    for (route in list(list(intoverpop = 'laplace'),
+        list(intoverpop = FALSE, optimize = FALSE))) {
+      reduced <- do.call(function(...) suppressWarnings(suppressMessages(ctFit(
+        datalong = dat, model = m, backend = 'julia', fit = FALSE, cores = 1L,
+        poprank = 2L, ...))), route)
+      names <- ctsem:::.ctBackendRawParameterNames(list(model_spec = reduced),
+        ctsem:::.ctBackendNpar(reduced))
+      expect_true(any(grepl('^poploading_t0m', names)))
+    }
+  })
+
+  # verified rather than assumed: with both effects mean-affecting the rank is
+  # already full and the model must come out exactly as poprank=NA does.
+  test_that('poprank auto is a no-op when every varying parameter reaches the mean', {
+    dat <- poprank_data()
+    m <- poprank_model()
+    m$pars$indvarying <- FALSE
+    m$pars$indvarying[m$pars$matrix %in% c('DRIFT', 'CINT', 'T0MEANS') &
+        !is.na(m$pars$param)] <- TRUE
+    # only DRIFT is a free parameter here, so k = 1 and nothing is regressed
+    spec <- ctsem:::.ctPopRegressionSpec(prepared_pars(m), 'auto')
+    expect_equal(spec$rank, 1L)
+    expect_length(spec$regressed, 0L)
+    auto <- suppressWarnings(suppressMessages(ctFit(datalong = dat, model = m,
+      backend = 'julia', fit = FALSE, intoverpop = 'augmented', cores = 1L)))
+    none <- suppressWarnings(suppressMessages(ctFit(datalong = dat, model = m,
+      backend = 'julia', fit = FALSE, intoverpop = 'augmented',
+      poprank = NA, cores = 1L)))
+    expect_equal(ctsem:::.ctBackendNpar(auto), ctsem:::.ctBackendNpar(none))
+    expect_null(auto$model$popregression)
+  })
+
+  # The fit-free guard: cheap, and it is what catches a rewrite that dropped a
+  # parameter or left one behind. Full rank has 6 (mv, dr11, df11, two
+  # population sds, one correlation); the regression form replaces the second
+  # sd and the correlation with a single coefficient, and needs one carrier
+  # state rather than two.
+  test_that('poprank removes the unidentified coordinates and one carrier state', {
+    dat <- poprank_data()
+    # poprank defaults to 'auto', so the unrestricted arm has to ask for NA.
+    full <- suppressWarnings(suppressMessages(ctFit(datalong = dat,
+      model = poprank_model(), backend = 'julia', fit = FALSE,
+      intoverpop = 'augmented', poprank = NA, cores = 1L)))
+    auto <- suppressWarnings(suppressMessages(ctFit(datalong = dat,
+      model = poprank_model(), backend = 'julia', fit = FALSE,
+      intoverpop = 'augmented', poprank = 'auto', cores = 1L)))
+
+    nfull <- ctsem:::.ctBackendNpar(full)
+    nauto <- ctsem:::.ctBackendNpar(auto)
+    expect_equal(nfull, 6L)
+    expect_equal(nauto, 5L)
+
+    namesfull <- ctsem:::.ctBackendRawParameterNames(list(model_spec = full), nfull)
+    namesauto <- ctsem:::.ctBackendRawParameterNames(list(model_spec = auto), nauto)
+    expect_true(all(c('popsd_dr11', 'popsd_df11', 'rawcor_df11__dr11') %in% namesfull))
+    expect_true('poploading_df11_dim1' %in% namesauto)
+    # The coordinates the profile likelihood cannot distinguish are gone.
+    expect_false(any(c('popsd_df11', 'rawcor_df11__dr11') %in% namesauto))
+    # And no population sd or correlation coordinate survives at all: the
+    # reduced-rank block is a fixed identity over standardised dimensions, so
+    # the spread lives in the loadings. A basis effect keeps one -- `L_<p>_<j>`
+    # is its loading on dimension j -- and that is the parameter `popsd_dr11`
+    # used to be.
+    expect_false(any(grepl('^popsd_|^rawcor_', namesauto)))
+    expect_true('poploading_dr11_dim1' %in% namesauto)
+    # ... and every effect population mean is still estimated, basis and
+    # regressed alike.
+    expect_true(all(c('dr11', 'df11') %in% namesauto))
+
+    augdim <- function(spec) {
+      table <- as.data.frame(spec$parameter_table)
+      max(table$row[table$matrix == 'T0MEANS'])
+    }
+    expect_equal(augdim(full), 3L)
+    expect_equal(augdim(auto), 2L)
+  })
+
+  # What a reduced-rank fit shows a user. The point of the feature is that the
+  # interesting quantities are the same ones as always -- how much each
+  # parameter varies and how the spreads go together -- so the tables keep their
+  # shape and the *structure* is carried by a note. The regression coefficients
+  # are the mechanism and stay out of the way: not a printed section, and not a
+  # row in the population means beside the model's own parameters.
+  # 100 subjects rather than this file's 40, deliberately. At 40 the rank-1
+  # optimum on this data sits at the boundary -- the basis spread goes to zero
+  # with the coefficient going to infinity, holding their product -- so
+  # `popsd` is legitimately 0 there and an assertion that the spreads are
+  # positive would be asserting something false. Verified that -384.4209 is the
+  # genuine rank-1 optimum and not an optimiser failure: a grid over sensible
+  # (basis sd, coefficient) values, then optimised, reaches only -384.467. Full
+  # rank gets -383.846 on the same data, so at 40 subjects the restriction
+  # costs 0.575 -- it refuses to spend an unidentified parameter on noise, which
+  # is the point, but it is not the "costs nothing" of the well-determined case.
+  # ctsem already reports that fit properly: non-convergence, and the
+  # identifiability warning naming popsd_dr11 and poploading_df11_dim1 as not
+  # estimable with NA widths. No extra warning was added for it.
+  test_that('a poprank fit reports the spreads, not the mechanism', {
+    dat <- poprank_data(nsub = 100L)
+    set.seed(303)
+    f <- suppressWarnings(suppressMessages(ctFit(datalong = dat,
+      model = poprank_model(), backend = 'julia', intoverpop = 'augmented',
+      cores = 1L, verbose = 0L)))
+    s <- suppressWarnings(suppressMessages(summary(f, parmatrices = FALSE,
+      priorcheck = FALSE, residualcov = FALSE)))
+
+    # every varying parameter has a spread, including the regressed one
+    expect_setequal(rownames(s$popsd), c('dr11', 'df11'))
+    expect_true(all(s$popsd[, 'mean'] > 0))
+    # and a correlation between them
+    expect_equal(rownames(s$rawpopcorr), 'df11__dr11')
+
+    # the note says the dimension structure
+    expect_false(is.null(s$popsdNote))
+    expect_match(s$popsdNote, '1 dimension, not 2', fixed = TRUE)
+    expect_match(s$popsdNote, 'no variation independent of dr11', fixed = TRUE)
+    expect_match(s$popsdNote, 'DIFFUSION / MANIFESTVAR', fixed = TRUE)
+
+    # the mechanism is not in the way
+    expect_null(s$popregression)
+    expect_false(any(grepl('^poploading_', rownames(s$popmeans))))
+    # ... while the parameter count still counts it
+    expect_equal(length(f$estimate$raw), 5L)
+    # ... and it is still reachable for anyone who wants it
+    coefficients <- ctsem:::.ctBackendPopRegressionTable(f,
+      ctsem:::.ctBackendSpec(f), ctsem:::.ctBackendRawSamples(f))
+    expect_equal(coefficients$param, 'df11')
+    expect_equal(coefficients$on, 'dr11')
+
+    # the resolved rank is recorded as a number, not as the argument
+    expect_equal(f$args$resolved$poprank, 1L)
+
+    # and a figure says it too, since a figure outlives the fit message
+    tex <- suppressWarnings(suppressMessages(ctModelLatex(f, compile = FALSE,
+      open = FALSE, equationonly = TRUE)))
+    expect_match(paste(tex, collapse = ' '),
+      'Individual differences have 1 dimension of 2', fixed = TRUE)
+  })
+
+  # A regressed effect varies by subject without a carrier state of its own, so
+  # the enumeration ctSubjectPars is built on could not see it and it was
+  # silently absent -- the failure mode that looks identical to "not
+  # applicable" from outside.
+  #
+  # Nothing here compares the two fits' per-subject *values*, and the reason is
+  # worth recording rather than discovering again. Under full rank the position
+  # on the ridge is arbitrary, and it perturbs the per-subject estimates as well
+  # as the population sd -- not only for the variance-cell effect whose carrier
+  # state the filter never updates, but for the identified effect too, because
+  # the two states are correlated and the arbitrary one changes the gain.
+  # Measured on this dataset, at likelihoods agreeing to 1e-10: per-subject
+  # values differing by up to 0.05, with Spearman correlations between the two
+  # fits of 0.93 for `dr11` and 0.89 for `df11`. So neither equality nor a
+  # rank-correlation threshold is an invariant here; picking a threshold that
+  # passes would be a test that discriminates nothing. What is asserted below is
+  # what actually holds: the column exists, it varies by subject, and under
+  # rank 1 the regressed effect is a monotone function of the basis by
+  # construction.
+  test_that('ctSubjectPars carries a regressed effect and it varies by subject', {
+    dat <- poprank_data()
+    fitboth <- function(poprank) {
+      set.seed(303)
+      args <- list(datalong = dat, model = poprank_model(), backend = 'julia',
+        intoverpop = 'augmented', cores = 1L, verbose = 0L)
+      args$poprank <- poprank
+      suppressWarnings(suppressMessages(do.call(ctFit, args)))
+    }
+    auto <- fitboth('auto')
+    full <- fitboth(NA)
+
+    pauto <- suppressWarnings(suppressMessages(ctSubjectPars(auto)))
+    pfull <- suppressWarnings(suppressMessages(ctSubjectPars(full)))
+
+    expect_setequal(dimnames(pauto)$param, c('dr11', 'df11'))
+    expect_setequal(dimnames(pfull)$param, c('dr11', 'df11'))
+    expect_equal(dim(pauto), dim(pfull))
+
+    for (p in c('dr11', 'df11')) {
+      # genuinely per subject, not a constant column, on both routes
+      expect_gt(stats::sd(apply(pauto[, , p, drop = FALSE], 2L, mean)), 0)
+      expect_gt(stats::sd(apply(pfull[, , p, drop = FALSE], 2L, mean)), 0)
+    }
+
+    # And under rank 1 the regressed effect is a monotone function of the basis
+    # effect by construction, which is the structure rather than an estimate.
+    values <- apply(pauto, c(2, 3), mean)
+    expect_equal(abs(stats::cor(values[, 'dr11'], values[, 'df11'],
+      method = 'spearman')), 1)
+  })
+
+  # A TI effect shifts a subject's raw parameter value, which under the
+  # augmented route is the population mean rather than the random deviation.
+  # So a TI effect on a regressed effect follows its mean parameter, and must
+  # not be left on the cell that becomes an expression -- a flag there makes
+  # `.ctJuliaTIEffects()` mint a coefficient with nothing to attach it to.
+  test_that('a TI-predictor effect on a regressed effect follows its mean', {
+    m <- poprank_model()
+    m$pars$TI1_effect <- FALSE
+    m$TIpredNames <- 'TI1'
+    m$n.TIpred <- 1L
+    m$pars$TI1_effect[!is.na(m$pars$param) & m$pars$param %in% 'df11'] <- TRUE
+    pars <- prepared_pars(m)
+    m$pars <- pars
+    spec <- ctsem:::.ctPopRegressionSpec(pars, 'auto')
+    m <- ctsem:::.ctPopRegressionDemote(m, spec)
+    m <- ctsem:::.ctModelIntOverPop(m)
+    m <- ctsem:::.ctPopRegressionRewrite(m, spec)
+
+    mean <- m$pars$matrix %in% 'PARS' & m$pars$param %in% 'df11'
+    expect_true(any(mean))
+    expect_true(all(m$pars$TI1_effect[mean]))
+    # and nowhere on an expression cell
+    expression <- !is.na(m$pars$param) & grepl('[', m$pars$param, fixed = TRUE)
+    expect_false(any(m$pars$TI1_effect[expression]))
+    # the coefficients themselves take no TI effect
+    beta <- m$pars$param %in% 'poploading_df11_dim1'
+    expect_true(any(beta))
+    expect_false(any(m$pars$TI1_effect[beta]))
+  })
+
+  # A parameter the user declared in `PARS` is the only cell carrying its own
+  # label, and that cell looks exactly like the mean row `addpar()` writes:
+  # matrix `PARS`, `param` the label, `transform` 'param'. An exclusion clause
+  # written to skip the latter therefore skipped the former too and the cell
+  # lookup came back empty -- `Internal error: no cell found for regressed
+  # random effect df11`. Nothing added during the loop is in `m$pars` yet, so
+  # the row index bound is the whole of what is needed.
+  poprank_model_pars <- function() {
+    m <- suppressMessages(ctModel(type = 'ct', n.latent = 1, n.manifest = 1,
+      LAMBDA = matrix(1), manifestNames = 'Y1', latentNames = 'eta',
+      PARS = matrix('df11', 1, 1),
+      DRIFT = matrix('dr11|-log1p_exp(param)'),
+      DIFFUSION = matrix('log1p_exp(df11)'),
+      CINT = matrix(0), MANIFESTMEANS = matrix(0),
+      MANIFESTVAR = matrix('mv|log1p_exp(param)'),
+      T0MEANS = matrix(0), T0VAR = matrix(1)))
+    m$pars$indvarying <- FALSE
+    m$pars$indvarying[!is.na(m$pars$param) &
+        m$pars$param %in% c('dr11', 'df11')] <- TRUE
+    m
+  }
+
+  test_that('a PARS-declared random effect is found and rewritten under poprank', {
+    m <- poprank_model_pars()
+    pars <- prepared_pars(m)
+    spec <- ctsem:::.ctPopRegressionSpec(pars, 'auto')
+    expect_equal(spec$basis, 'dr11')
+    expect_equal(spec$regressed, 'df11')
+
+    m$pars <- pars
+    m <- ctsem:::.ctPopRegressionDemote(m, spec)
+    m <- ctsem:::.ctModelIntOverPop(m)
+    m <- ctsem:::.ctPopRegressionRewrite(m, spec)
+    spec <- m$popregression
+
+    # The driven cell is the user's own PARS cell, and it is the one rewritten.
+    expect_equal(spec$cells$matrix, 'PARS')
+    expect_equal(spec$coefficients$coefficient, 'poploading_df11_dim1')
+    driven <- which(m$pars$matrix %in% spec$cells$matrix[1] &
+        m$pars$row == spec$cells$row[1] & m$pars$col == spec$cells$col[1])
+    expect_length(driven, 1L)
+    expect_match(m$pars$param[driven],
+      sprintf('^\\(df11 \\+ poploading_df11_dim1 \\* state\\[%d\\]\\)$',
+        spec$coefficients$state[1]))
+    expect_false(m$pars$indvarying[driven])
+
+    # ... and the mean and the coefficient exist as parameters of their own,
+    # distinct from the cell they drive.
+    mean <- which(m$pars$matrix %in% 'PARS' & m$pars$param %in% 'df11')
+    expect_length(mean, 1L)
+    expect_false(mean %in% driven)
+    expect_length(which(m$pars$param %in% 'poploading_df11_dim1'), 1L)
+  })
+
+  test_that('a model with a PARS-declared random effect builds under poprank', {
+    skip_without_julia()
+    dat <- poprank_data()
+    m <- poprank_model_pars()
+    auto <- suppressWarnings(suppressMessages(ctFit(datalong = dat, model = m,
+      backend = 'julia', fit = FALSE, intoverpop = 'augmented', cores = 1L)))
+    expect_equal(auto$model$popregression$route, 'augmented')
+    expect_equal(auto$model$popregression$cells$matrix, 'PARS')
+
+    # The reduction is real: rank 1 over two effects drops the coordinates the
+    # full covariance would have had.
+    none <- suppressWarnings(suppressMessages(ctFit(datalong = dat, model = m,
+      backend = 'julia', fit = FALSE, intoverpop = 'augmented',
+      poprank = NA, cores = 1L)))
+    expect_lt(ctsem:::.ctBackendNpar(auto), ctsem:::.ctBackendNpar(none))
+  })
+
+  # The `'parameters'` route reaches the same cell by the same lookup, so it
+  # gets the same declaration.
+  # 'none' (sampling) takes the rank exactly as laplace does -- the engine's
+  # loading matrix per level, by the same code -- not a rewrite of its own. A
+  # PARS-declared random effect is an ordinary varying parameter there.
+  test_that('a PARS-declared random effect takes the engine loading under none', {
+    dat <- poprank_data()
+    prepared <- function(...) suppressWarnings(suppressMessages(ctFit(
+      datalong = dat, model = poprank_model_pars(), backend = 'julia',
+      fit = FALSE, intoverpop = FALSE, optimize = FALSE, cores = 1L, ...)))
+    auto <- prepared(poprank = 'auto')
+    names <- ctsem:::.ctBackendRawParameterNames(list(model_spec = auto),
+      ctsem:::.ctBackendNpar(auto))
+    expect_true(any(grepl('^poploading_', names)))
+    expect_false(any(grepl('^beta_', names)))
+    expect_null(auto$model$popregression)
+  })
+
+}

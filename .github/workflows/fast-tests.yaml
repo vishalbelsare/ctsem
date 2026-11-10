@@ -1,0 +1,268 @@
+# Tier 1 of four. Every push, every branch, and the only workflow that is
+# meant to be watched while it runs.
+#
+#   Tier 0  dev/test-local.R -- tt_fast(), tt_changed(), seconds, on a laptop
+#   Tier 1  this file        -- the CRAN-visible surface with no Julia
+#   Tier 2  julia-tests.yaml -- the same suite with Julia present and
+#           julia-engine.yaml   NOT_CRAN=true, plus the engine's own suite
+#   Tier 3  check-standard.yaml -- the full --as-cran matrix, on master, weekly
+#           and on demand
+#
+# What this tier is for. It runs the package exactly as CRAN would -- NOT_CRAN
+# unset, no Julia anywhere -- which is the configuration in which every julia
+# guard has to hold and in which nothing may error. Measured locally in that
+# configuration: 69 example files 189 s, 70 test files 56 s, and zero run-time
+# `rstan::stan_model()` compiles. So the only large cost here is building the
+# package, which is what the compiler cache below is for.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+name: fast-tests
+
+# A burst of pushes to a development branch should leave one run, not six.
+concurrency:
+  group: fast-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast-tests:
+    runs-on: ubuntu-latest
+    # Nothing here has any business taking an hour. A run that does has hung,
+    # and the point of a cap is that a hang costs this rather than six hours.
+    timeout-minutes: 60
+    env:
+      GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
+      R_KEEP_PKG_SOURCE: yes
+      # Set here, and this is the whole tier working or not working.
+      #
+      # `r-lib/actions/setup-r` does
+      #     if (!process.env["NOT_CRAN"]) core.exportVariable("NOT_CRAN","true")
+      # so leaving it unset does not give the CRAN configuration, it gives the
+      # opposite one. Every julia test therefore RAN here, on a runner with no
+      # Julia, and JuliaConnectoR sat waiting for a Julia that was never going
+      # to start: 56.9 minutes in the test step and death at the job cap, the
+      # first time this step was ever reached. The comment below claiming
+      # NOT_CRAN was "deliberately unset" described an intention the runner
+      # had already overridden.
+      #
+      # 'false' rather than unset, for the same reason: the action only skips
+      # its default when the variable is already there. `skip_on_cran()` tests
+      # `identical(Sys.getenv("NOT_CRAN"), "true")`, so anything but "true"
+      # means the CRAN configuration, which is what this tier is for.
+      NOT_CRAN: 'false'
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: release
+          use-public-rspm: true
+
+      - uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          # No `local::.`: that would install ctsem here and then again below.
+          # The action's `packages` default (`deps::., any::sessioninfo`) is
+          # concatenated with this, so the dependencies arrive either way.
+          #
+          # roxygen2 is NOT pinned, and the pin is why the documentation step
+          # below was red for a fortnight: the repository regenerated under
+          # 8.1.0 while the workflow still asked for 8.0.0, so the step
+          # compared two output formats and called the difference drift. A pin
+          # only chooses which version of that argument to have, because it
+          # goes stale the next time anyone documents locally. The step
+          # compares content rather than layout instead, so any roxygen2 will
+          # do -- including one released tomorrow that wraps lines differently.
+          extra-packages: any::testthat, any::pkgload, any::roxygen2, any::rprojroot
+          needs: check
+
+      # The three Stan models are the whole cost of building this package.
+      # ccache keys on the preprocessed source, so an R-only change -- which is
+      # most changes -- recompiles nothing. The cache key covers the inputs that
+      # actually regenerate stanExports_*.h; anything else falls back to the
+      # restore-key and still hits object for object.
+      - name: Compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-ubuntu-release-${{ hashFiles('inst/stan/**', 'inst/include/**', 'configure') }}
+          restore-keys: |
+            ccache-ubuntu-release-
+
+      - name: Point R at ccache
+        run: |
+          command -v ccache >/dev/null || sudo apt-get install -y ccache
+          mkdir -p ~/.R ~/.ccache
+          # Only the compiler driver is replaced. R supplies -std=gnu++17 itself
+          # through CXX17STD, and src/Makevars sets only PKG_* variables, so
+          # nothing here collides with what configure appends.
+          {
+            echo 'CC = ccache gcc'
+            echo 'CXX = ccache g++'
+            echo 'CXX11 = ccache g++'
+            echo 'CXX14 = ccache g++'
+            echo 'CXX17 = ccache g++'
+            echo 'CXX20 = ccache g++'
+          } >> ~/.R/Makevars
+          printf 'max_size = 5.0G\nsloppiness = include_file_ctime,include_file_mtime,time_macros\n' > ~/.ccache/ccache.conf
+          ccache -z
+
+      - name: Install ctsem
+        run: |
+          chmod +x configure
+          R CMD INSTALL --no-multiarch --no-docs --no-byte-compile .
+
+      - name: Compiler cache statistics
+        if: always()
+        run: ccache -s
+
+      # man/ and NAMESPACE are generated and committed, so a roxygen edit that
+      # was never regenerated ships the old help page. That drift is what
+      # produced the "Codoc mismatches" and "Undocumented arguments" WARNINGs in
+      # the four-hour run, four hours after the point where this would have said
+      # so. Seven seconds here.
+      - name: Documentation is regenerated
+        run: |
+          Rscript dev/document.R
+          # Content, not layout. A `git diff` here fails whenever the runner's
+          # roxygen2 wraps a line differently from the one that produced the
+          # committed files, which is not something a user of this package can
+          # be affected by; dev/check-documentation.R asks whether the help
+          # pages still say what the sources say, and explains why.
+          Rscript dev/check-documentation.R
+
+      # NOT_CRAN pinned to 'false' in the job env above, and no Julia
+      # installed: this is the CRAN configuration. Every julia test must skip,
+      # and nothing may error. It has to be pinned rather than left alone --
+      # see the comment there, which is the reason this step used to run for
+      # an hour.
+      #
+      # One file per process, under `timeout`, rather than one `test_dir()`.
+      # Two reasons, and the first is the whole design constraint here:
+      #
+      # GitHub does not serve Actions logs without a login, and the REST API
+      # refuses them unauthenticated, so from outside a browser session the
+      # only thing readable about a failed run is its ANNOTATIONS. A step
+      # that dies at the job's 60-minute cap therefore reports exactly
+      # "Process completed with exit code 1" and nothing about where it was.
+      # That happened: the first run ever to get past the documentation check
+      # spent 56.9 minutes here and said nothing, against 117 s for the same
+      # 80 files locally in the same configuration, slowest file 30.7 s. So
+      # every file's time is echoed as a `::notice::`/`::error::` workflow
+      # command, which becomes an annotation, which the API does serve.
+      #
+      # Second, `timeout` in the shell is the only thing that survives a file
+      # that hangs rather than merely runs long. R's own `setTimeLimit()`
+      # cannot interrupt a blocking C call -- a PSOCK worker that never
+      # connects is exactly that -- so it would hang with the timer armed.
+      #
+      # The cost is one R startup per file, a couple of seconds each on this
+      # tier, which has no Julia to precompile and nothing cached in-session.
+      # Worth it for a tier that is meant to be watched while it runs.
+      - name: Tests, as CRAN runs them
+        env:
+          # Six times the slowest file measured locally in this configuration
+          # (test-sunspots.R, 30.7 s of 117 s for all 80). Anything past this
+          # is blocked, not slow.
+          CTSEM_FILE_TIMEOUT: '180'
+        run: |
+          # GitHub runs a `run:` block as `bash -e`, so a command substitution
+          # whose command fails aborts the script there and then. That is
+          # exactly what this loop is built to survive -- the first file to
+          # time out took the step with it, and the whole point is to keep
+          # going and name every file that failed. The run before this one
+          # reported the bare `exit code 124` from `timeout` and none of the
+          # annotations below, for that reason.
+          set +e
+          cd tests/testthat
+          fail=0; slow=0; ran=0; t_all=$(date +%s); slownames=; failnames=
+          printf 'TIER1 per file, %s s each at most\n' "$CTSEM_FILE_TIMEOUT"
+          for f in $(ls test*.R | sort); do
+            start=$(date +%s)
+            out=$(timeout -k 10 "$CTSEM_FILE_TIMEOUT" Rscript -e '
+              library(testthat)
+              # `load_package = "installed"`, as the `test_dir()` call this
+              # replaced had. `test_file()` defaults to "none", and only 21 of
+              # the 81 files call `library(ctsem)` themselves -- the rest
+              # reached ctsem through the attach `test_dir()` did for them.
+              # Most of those survive the difference by skipping before they
+              # touch anything, which is why dropping it showed up as three
+              # files erroring rather than sixty.
+              d <- as.data.frame(test_file(commandArgs(TRUE)[1], package = "ctsem",
+                     load_package = "installed",
+                     reporter = "silent", stop_on_failure = FALSE))
+              cat(sprintf("COUNTS %d %d %d %d\n", sum(d$passed), sum(d$failed),
+                  sum(d$error), sum(d$skipped)))' "$f" 2>&1)
+            rc=$?; secs=$(( $(date +%s) - start ))
+            counts=$(printf '%s\n' "$out" | sed -n 's/^COUNTS //p' | tail -1)
+            printf '%-44s %4ss rc=%s %s\n' "$f" "$secs" "$rc" "${counts:-<no counts>}"
+            if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+              echo "::error title=Test file timed out::$f did not finish in ${CTSEM_FILE_TIMEOUT}s. It takes seconds locally, so it is blocked rather than slow."
+              slow=$((slow+1)); slownames="$slownames $f"
+            elif [ "$rc" -ne 0 ]; then
+              echo "::error title=Test file failed::$f exited $rc"
+              printf '%s\n' "$out" | tail -40
+              fail=$((fail+1)); failnames="$failnames $f"
+            else
+              set -- $counts
+              ran=$((ran + ${1:-0}))
+              if [ "${2:-0}" -ne 0 ] || [ "${3:-0}" -ne 0 ]; then
+                echo "::error title=Test failures::$f had ${2:-0} failures and ${3:-0} errors"
+                printf '%s\n' "$out" | tail -40
+                fail=$((fail+1)); failnames="$failnames $f"
+              fi
+            fi
+            # Several blocked files at the per-file cap would add up past the
+            # job's own 60-minute cap, and a job killed there loses every
+            # annotation below -- which is the failure this whole step exists
+            # to stop happening again. Stop while there is still time to
+            # report.
+            elapsed=$(( $(date +%s) - t_all ))
+            if [ "$elapsed" -gt 2100 ]; then
+              echo "::error title=Tier 1 budget::stopped after ${elapsed}s at $f, with files remaining. $slow blocked and $fail failed so far."
+              slow=$((slow+1))
+              break
+            fi
+          done
+          printf '\nTIER1 assertions=%s files_failed=%s files_timed_out=%s\n' "$ran" "$fail" "$slow"
+          # The whole list in one annotation as well as the per-file ones.
+          # GitHub serves only the first ten annotations of a run, and on the
+          # run that found the NOT_CRAN problem the tenth was reached before
+          # the end, so the list could have been truncated without saying so.
+          if [ -n "$slownames$failnames" ]; then
+            echo "::error title=Tier 1 summary::blocked:${slownames:- none} | failed:${failnames:- none}"
+          fi
+          # A skip is fine here; an error is not, and neither is a suite that
+          # asserted nothing -- that is what a silently broken guard looks
+          # like.
+          [ "$fail" -eq 0 ] && [ "$slow" -eq 0 ] || { echo "::error::tier 1 had $fail failing and $slow blocked files"; exit 1; }
+          [ "$ran" -ge 300 ] || { echo "::error::suspiciously few assertions: $ran"; exit 1; }
+
+      - name: Examples, with donttest live
+        run: |
+          Rscript -e '
+            # tools::Rd2ex is what R CMD check uses to build ctsem-Ex.R, and
+            # --as-cran runs the donttest blocks, so both are reproduced.
+            # What Rd2ex does not write, and R CMD check puts at the head of
+            # ctsem-Ex.R itself, is the attach and the graphics device. Without
+            # the attach every example dies on "could not find function", so
+            # the first run that reached this step would have called 59 of 69
+            # broken -- an artifact of the harness rather than the package.
+            library(ctsem)
+            pdf(NULL)
+            dir.create("exsweep", showWarnings = FALSE)
+            bad <- character()
+            for (rd in sort(Sys.glob("man/*.Rd"))) {
+              f <- file.path("exsweep", sub("[.]Rd$", ".R", basename(rd)))
+              tools::Rd2ex(rd, f, commentDonttest = FALSE, commentDontrun = TRUE)
+              if (!file.exists(f)) next
+              r <- try(source(f, echo = FALSE, local = new.env(parent = globalenv())),
+                       silent = TRUE)
+              if (inherits(r, "try-error")) {
+                bad <- c(bad, basename(rd))
+                cat("\n#### ", basename(rd), "\n", as.character(r), "\n", sep = "")
+              }
+            }
+            cat(sprintf("\nTIER1 examples failed=%d\n", length(bad)))
+            if (length(bad)) stop("examples failed: ", paste(bad, collapse = ", "))'

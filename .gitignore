@@ -2,3 +2,9 @@
 .Rhistory
 .RData
 /staging
+/src/*
+.positai
+.claude/
+Rplots.pdf
+/dev/vignettes/
+/lib

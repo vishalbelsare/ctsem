@@ -1,0 +1,379 @@
+# Test guards. One spelling per axis, and nothing in tests/ reads an
+# environment variable directly.
+#
+#   skip_without_julia()  this test drives the julia backend
+#   skip_on_cran()        testthat's own: this test is too slow for CRAN
+#   skip_on_32bit()       the stan models do not build in a 32-bit address space
+#   skip_unless_slow()    the release tier: too slow for every push
+#
+# All four work in two places: inside `test_that()`, skipping that block, and
+# at the top of a file before any setup code, skipping the rest of the file.
+# Both are reported with their reason ("(code run outside of `test_that()`)"
+# for the file-level form), which the `if (Sys.getenv("NOT_CRAN") == "true")`
+# wrappers these replaced were not -- a wrapped-out file produced no results at
+# all, so a whole file dropping out looked exactly like a file that passed.
+# Only a reporter sees the file-level form, though: it leaves no row in the
+# results `test_file()` returns, which is what tt() in dev/test-local.R and the
+# CI skip table count. A gate whose skip has to be counted, as the release
+# tier's does, goes inside each block.
+#
+# Why "needs julia" is one call and not two. The two axes used to be spelled
+# three ways -- a file-level NOT_CRAN wrapper, `skip_on_cran()`, and
+# `skip_without_julia()` -- with `skip_on_cran()` standing in for "needs julia"
+# in some blocks and for "is slow" in others. Six test blocks and two examples
+# that should have skipped were erroring instead, because the block they were
+# in had only the CRAN guard. A julia test is always both things, so
+# `skip_without_julia()` asserts both and is the only call such a test needs:
+# add it and delete any `skip_on_cran()` beside it.
+#
+# An example cannot call any of these. It asks the same question through public
+# API instead: wrap the body in `if (isTRUE(ctJuliaStatus()$available))`.
+
+#' The release tier: a check too expensive for every push.
+#'
+#' `CTSEM_SLOW_TESTS=true` runs it. `julia-tests.yaml` sets that on its
+#' scheduled and manually dispatched runs only, so the cost is paid weekly and
+#' on demand rather than per push, and `tt_area(..., release = TRUE)` in
+#' dev/test-local.R sets it for a local run. A file whose every test is gated
+#' this way is listed under the `release` tier in dev/test-areas.csv. Run the
+#' tier before a release.
+#'
+#' The bar for using this is high and it is not "this test is slow". It is: the
+#' behaviour cannot be reproduced any cheaper, and that has been *looked for*
+#' rather than assumed -- a recovery that needs hundreds of subjects to mean
+#' anything, a stan program compiled at test time. Every use should say in a
+#' comment what was tried -- otherwise the next person shrinks the fixture, the
+#' test gets fast, and nobody notices it stopped testing anything.
+skip_unless_slow <- function(what = "this test") {
+  testthat::skip_if(
+    !identical(tolower(trimws(Sys.getenv("CTSEM_SLOW_TESTS", ""))), "true"),
+    paste0(what, " takes minutes; set CTSEM_SLOW_TESTS=true to run it"))
+}
+
+#' Skip unless a live Julia session is available (and this is not CRAN).
+#'
+#' The CRAN check comes first because the julia probe starts a Julia process.
+skip_without_julia <- function() {
+  testthat::skip_on_cran()
+  testthat::skip_if_not_installed("JuliaConnectoR")
+  # The discovery has to run ctsem's own bindir search first. `juliaSetupOk()`
+  # looks for Julia on the PATH, and on Windows a juliaup install is behind a
+  # shim that is not there, so a bare probe reports "Julia could not be found"
+  # on a machine where `ctFit(backend = 'julia')` works perfectly well. Skipping
+  # on that answer is how this suite came to be a no-op on Windows -- silently,
+  # since a skip is not a failure.
+  bin <- tryCatch(ctsem:::.ctJuliaBin(NULL), error = function(e) NULL)
+  if (!is.null(bin) && nzchar(bin)) Sys.setenv(JULIA_BINDIR = bin)
+  testthat::skip_if(
+    !isTRUE(tryCatch(JuliaConnectoR::juliaSetupOk(), error = function(e) FALSE)),
+    "Julia is not available.")
+}
+
+#' Skip on a 32-bit build.
+#'
+#' The stan models are large enough that a 32-bit toolchain runs out of address
+#' space compiling them, so every test that fits one carries this beside
+#' `skip_on_cran()`.
+skip_on_32bit <- function() {
+  testthat::skip_if(.Machine$sizeof.pointer == 4, "32-bit build.")
+}
+
+
+# ---------------------------------------------------------------------------
+# One fit per fixture
+#
+# A fit is the expensive default in this suite, not the free one. Where several
+# tests ask different questions of the same model and data, they share one fit:
+# `fit_cached(key, expr)` evaluates `expr` the first time `key` is asked for and
+# returns the stored value after that. Several files grew a copy of this
+# pattern of their own (`.laplace_cached()` in test-julia-laplace.R, and the
+# `.parity_fit_cache`, `.ac_cache` and `.check_cache` environments); this is the
+# same thing, once, for any file to use.
+#
+# How long a stored fit lives. testthat sources the helpers once per
+# `test_files()` call, so the store lasts exactly that long: one file under
+# `testthat::test_file()` -- which is how tt() and tt_area() in
+# dev/test-local.R run every file, so rerunning a file after an edit never
+# reads a fit made before it -- and the whole run under `test_dir()` or
+# `devtools::test()`, where two files naming the same key share one fit.
+#
+# The random number stream. A hit leaves the generator where the first
+# evaluation left it, so a fixture that sets its own seed hands whatever follows
+# it the same stream whether it was fitted or recalled.
+#
+# Only for what nobody mutates in place. A test that writes into its copy of a
+# fit (`fit$estimate$raw <- ...`) changes that copy, since R copies a list on
+# modification; an environment inside a fit would be shared, and a fit carries
+# none.
+.ct_test_fit_store <- new.env(parent = emptyenv())
+
+fit_cached <- function(key, expr) {
+  stopifnot(is.character(key), length(key) == 1L, nzchar(key))
+  if (!exists(key, envir = .ct_test_fit_store, inherits = FALSE)) {
+    value <- force(expr)
+    seed <- get0(".Random.seed", envir = globalenv(), inherits = FALSE)
+    assign(key, list(value = value, seed = seed), envir = .ct_test_fit_store)
+    return(value)
+  }
+  entry <- get(key, envir = .ct_test_fit_store, inherits = FALSE)
+  if (!is.null(entry$seed)) assign(".Random.seed", entry$seed, envir = globalenv())
+  entry$value
+}
+
+# ---------------------------------------------------------------------------
+# A model the engine's package image has already compiled
+#
+# The first fit of a model shape in a Julia session compiles the engine for
+# that shape -- most of a minute, and often most of what a small test costs.
+# The package image compiles this model, on each route, when it is built
+# (tools/generate-precompile-shapes.R), and a fit of it costs seconds in a
+# fresh session: measured on dev2, 5.0 s augmented and 5.9 s Laplace, against
+# about a minute (augmented) and three (Laplace) for a model the image lacks. A test
+# whose subject is not the model -- the session, the bridge, a method's
+# plumbing -- should fit this one.
+#
+# It is the image's `gaussian_augmented` and `gaussian_laplace`: one latent,
+# two Gaussian indicators loading 1 and sharing one free measurement variance,
+# and a random intercept, whose default route is 'augmented'. The image types a
+# model by its matrix dimensions and transform templates, not by its data, so
+# any data will do; a model that drifts from the generator's still fits, and
+# only pays the compile again.
+image_model <- function() {
+  m <- suppressWarnings(suppressMessages(ctsem::ctModel(type = "ct",
+    n.latent = 1, n.manifest = 2, manifestNames = c("y1", "y2"),
+    latentNames = "eta1", LAMBDA = matrix(1, 2, 1),
+    MANIFESTMEANS = matrix(0, 2, 1), CINT = matrix("cint"),
+    T0MEANS = matrix(0), MANIFESTVAR = matrix(c("mvar", "0", "0", "mvar"), 2, 2),
+    manifesttype = c(0L, 0L))))
+  m$pars$indvarying <- m$pars$param %in% "cint"
+  m
+}
+
+#' Data for `image_model()`: an AR(1) process around each subject's own
+#' intercept, simulated here rather than by ctGenerate, whose draw stream moves
+#' under unrelated commits.
+image_data <- function(nsub = 12L, nobs = 6L, seed = 1L) {
+  set.seed(seed)
+  do.call(rbind, lapply(seq_len(nsub), function(i) {
+    cint <- stats::rnorm(1, 0, 0.5)
+    eta <- numeric(nobs)
+    eta[1] <- stats::rnorm(1)
+    for (t in seq_len(nobs)[-1L]) eta[t] <- 0.74 * eta[t - 1] + 0.86 * cint +
+      stats::rnorm(1, 0, 0.6)
+    data.frame(id = i, time = seq_len(nobs) - 1, y1 = eta + stats::rnorm(nobs, 0, 0.5),
+      y2 = eta + stats::rnorm(nobs, 0, 0.5))
+  }))
+}
+
+# ---------------------------------------------------------------------------
+# The Laplace fixture two files share
+#
+# One latent, one indicator, a random manifest mean, fitted on the Laplace
+# route: test-julia-sample.R samples from it and test-backend-generate.R
+# generates from it. Each wrote it out and fitted it for itself -- seventeen
+# times between them, identically -- and it is fitted once per file now, and
+# once for both under `test_dir()` (`fit_cached()`).
+laplace_fixture_data <- function(nsub = 12L, tp = 6L, seed = 31L) {
+  set.seed(seed)
+  do.call(rbind, lapply(seq_len(nsub), function(i) {
+    intercept <- stats::rnorm(1, 0, 0.8)
+    state <- stats::rnorm(1, 0, 0.5)
+    y <- numeric(tp)
+    for (t in seq_len(tp)) {
+      state <- 0.75 * state + stats::rnorm(1, 0, 0.4)
+      y[t] <- state + intercept + stats::rnorm(1, 0, 0.3)
+    }
+    data.frame(id = i, time = seq_len(tp) - 1, Y1 = y)
+  }))
+}
+
+laplace_fixture_model <- function() {
+  model <- suppressWarnings(suppressMessages(ctsem::ctModel(type = "ct",
+    manifestNames = "Y1", latentNames = "eta1", LAMBDA = matrix(1))))
+  model$pars$indvarying <- FALSE
+  model$pars$indvarying[match(TRUE, model$pars$matrix == "MANIFESTMEANS")] <- TRUE
+  model
+}
+
+laplace_fixture <- function(nsub = 12L, tp = 6L, seed = 31L) {
+  fit_cached(paste("laplace_fixture", nsub, tp, seed), {
+    data <- laplace_fixture_data(nsub, tp, seed)
+    suppressWarnings(suppressMessages(ctsem::ctFit(data, laplace_fixture_model(),
+      backend = "julia", cores = 1, intoverpop = "laplace", priors = TRUE,
+      optimcontrol = list(finishsamples = 20))))
+  })
+}
+
+# ---------------------------------------------------------------------------
+# Fitting one model on both backends
+#
+# The expensive files in this suite used to fit on stan, which is the default
+# backend and the one being deprecated. They fit on julia now and cost a
+# fraction of what they did. Setting CTSEM_TEST_STAN fits both and compares
+# them, so the stan coverage those files used to give is a run away rather
+# than deleted -- and the comparison is stronger than what was there before,
+# which never checked one backend against the other at all.
+#
+#   Rscript -e 'Sys.setenv(NOT_CRAN="true", CTSEM_TEST_STAN="true"); ...'
+#
+# `test-stan-julia-parity.R` does this too, on small models built for it. The
+# difference is scale: these are the suite's large designs -- 50 subjects x 50
+# occasions, nonlinear LAMBDA, individually varying loadings, mixed binary and
+# Gaussian indicators -- and a disagreement that only appears at that size
+# would not show up there.
+#
+# Nothing below reads the environment except `.ctsem_test_stan()`, for the
+# reason at the top of this file.
+
+.ctsem_test_stan <- function() {
+  v <- tolower(trimws(Sys.getenv("CTSEM_TEST_STAN", "")))
+  v %in% c("true", "yes", "1", "t")
+}
+
+#' The backends a test that can run on either should fit.
+#'
+#' Always 'julia', first, so a test can write `fits$julia` unconditionally.
+#' 'stan' as well when CTSEM_TEST_STAN is set.
+test_backends <- function() {
+  if (.ctsem_test_stan()) c("julia", "stan") else "julia"
+}
+
+#' Fit the same model on every backend `test_backends()` asks for.
+#'
+#' Arguments go to `ctFit()` unchanged, minus `backend`. `stanargs` are extra
+#' arguments for the stan fit only, for the few settings that path needs and
+#' julia has no equivalent of; passing one to julia is an error there rather
+#' than a no-op, which is the house rule for an argument a backend cannot
+#' honour.
+#'
+#' Returns a named list, always with `$julia`, `$stan` only when asked for.
+#'
+#' Stan's filter is the EKF's; julia's is not where the model is nonlinear in
+#' the state (`local_julia_ekf()`). So a julia fit made beside its stan twin is
+#' made as stan makes it.
+fit_backends <- function(..., backends = test_backends(), stanargs = list()) {
+  args <- list(...)
+  if (!is.null(args$backend)) stop("fit_backends() chooses the backend")
+  if (all(c("julia", "stan") %in% backends)) local_julia_ekf()
+  out <- list()
+  for (be in backends) {
+    a <- args
+    if (identical(be, "stan")) a <- utils::modifyList(a, stanargs)
+    a$backend <- be
+    out[[be]] <- do.call(ctsem::ctFit, a)
+  }
+  out
+}
+
+#' Julia's filter as stan's, the extended Kalman filter, until `env` exits.
+#'
+#' Stan linearises a measurement that reads the state once, at the prior mean,
+#' and nonlinear dynamics at the mean; julia iterates the first to each row's
+#' posterior mode (`_ekf_iterated_rows!`) and predicts the second by moments
+#' (`_ekf_moment_cells!`). A comparison with stan turns both off.
+local_julia_ekf <- function(env = parent.frame()) {
+  ctsem:::.ctJuliaModule()
+  ctsem:::.ctJuliaEval(paste0("ContinuousTimeSEM.ctsem_set_relinearise!(false); ",
+    "ContinuousTimeSEM.ctsem_set_moment_predict!(false)"))
+  withr::defer(ctsem:::.ctJuliaEval(paste0(
+    "ContinuousTimeSEM.ctsem_set_relinearise!(true); ",
+    "ContinuousTimeSEM.ctsem_set_moment_predict!(true)")), envir = env)
+  invisible(NULL)
+}
+
+# ---------------------------------------------------------------------------
+# Fitting one model under both representations of individual differences
+#
+# `fit_backends()` above guards the stan/julia fork. This guards the larger one
+# inside julia: `intoverpop='augmented'` carries every varying parameter as a
+# latent state, `'laplace'` keeps them as separate coordinates, and the two
+# share no field of the specification -- `spec$random_effects` for one,
+# `spec$laplace$levels` for the other.
+#
+# A function that reads one and not the other does not error on the other. It
+# reports a model with no individual differences, which is a legitimate model,
+# so the wrong answer is shaped exactly like a right one. That is how
+# ctVarianceDecomposition() came to return a between person variance of zero for
+# every Laplace fit -- and it is why a reporting function that says anything
+# about individual differences should be run through this and compared, rather
+# than tested on whichever representation its author happened to use.
+#
+# Only 'laplace' can carry a level above the subject, so a model with one is
+# fitted that way alone and this helper is not the tool for it.
+
+#' Fit the same model under each representation of individual differences.
+#'
+#' Arguments go to `ctFit()` unchanged, minus `intoverpop` and `backend`.
+#' Returns a named list, `$augmented` and `$laplace`.
+fit_intoverpop <- function(..., representations = c("augmented", "laplace")) {
+  args <- list(...)
+  if (!is.null(args$intoverpop)) stop("fit_intoverpop() chooses intoverpop")
+  if (!is.null(args$backend)) stop("fit_intoverpop() is julia only")
+  out <- list()
+  for (rep in representations) {
+    a <- args
+    a$intoverpop <- rep
+    a$backend <- "julia"
+    out[[rep]] <- do.call(ctsem::ctFit, a)
+  }
+  out
+}
+
+# The summary sections both backends build, and that mean the same thing on
+# each. `parmatrices` is deliberately not here: it is compared by the tests
+# that care, row by matrix/row/col, because its row *order* differs between
+# the two and a whole-table comparison would report that as a difference.
+.CT_BACKEND_SECTIONS <- c("popmeans", "popsd", "rawpopcorr")
+
+#' Compare the same model's summary across the backends that were fitted.
+#'
+#' A no-op with one backend, so a test can call it unconditionally.
+#'
+#' Compares the `mean` column of each section elementwise by row name, and the
+#' log likelihood. Elementwise and by name, not as whole tables: the sections
+#' can carry different row orders and different extra columns, and a norm over
+#' the lot reports "not equal" without saying which parameter moved.
+#'
+#' `sections` names what to compare. `rawpopcorr` is the population
+#' correlation, and a mismatch there is the first place the population
+#' covariance shows up -- see the note in the files that pass
+#' `sections = setdiff(.CT_BACKEND_SECTIONS, "rawpopcorr")`.
+expect_backends_agree <- function(fits, tol = 1e-2, logliktol = 1e-1,
+  sections = .CT_BACKEND_SECTIONS) {
+
+  if (length(fits) < 2L) return(invisible(NULL))
+  if (is.null(fits$julia) || is.null(fits$stan)) {
+    stop("expect_backends_agree() wants $julia and $stan")
+  }
+  sj <- summary(fits$julia)
+  ss <- summary(fits$stan)
+
+  testthat::expect_equal(as.numeric(sj$loglik), as.numeric(ss$loglik),
+    tolerance = logliktol)
+
+  compared <- 0L
+  for (sec in sections) {
+    a <- sj[[sec]]
+    b <- ss[[sec]]
+    # A section absent on one side is not a failure -- a model with no random
+    # effects has no popsd -- but absent on one and present on the other is.
+    if (is.null(a) && is.null(b)) next
+    testthat::expect_false(xor(is.null(a), is.null(b)),
+      label = paste0(sec, " is present on one backend and not the other"))
+    if (is.null(a) || is.null(b)) next
+
+    nm <- intersect(rownames(a), rownames(b))
+    # The rows have to line up by name or nothing is being compared, and a
+    # comparison of nothing passes. This is the guard for that.
+    testthat::expect_gt(length(nm), 0L)
+    if (!length(nm)) next
+    av <- stats::setNames(as.numeric(a[nm, "mean"]), nm)
+    bv <- stats::setNames(as.numeric(b[nm, "mean"]), nm)
+    testthat::expect_equal(av, bv, tolerance = tol)
+    compared <- compared + length(nm)
+  }
+  # Same reason again, one level up: every section skipped is a green check
+  # that checked nothing.
+  testthat::expect_gt(compared, 0L)
+  invisible(list(julia = sj, stan = ss))
+}

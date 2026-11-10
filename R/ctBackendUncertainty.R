@@ -1,0 +1,1197 @@
+# Uncertainty for optimisation-backend fits (backend='julia').
+#
+# `ctOptimUncertainty()` was written against `ctStanFit`, but almost none of its
+# machinery is Stan-specific: `ctOptimComputeUncertainty()` needs a raw parameter
+# vector, a function returning the log probability and its gradient, and the
+# subject / datapoint counts. Everything else it reaches for -- the Stan model
+# object, `standata` -- is used only by the score and bootstrap methods.
+#
+# So this file does not reimplement any of it. It builds those three things from
+# a `ctJuliaFit` and calls the same `ctOptimComputeUncertainty()`,
+# `ctOptimNormalDraws()` and `imis_is()` the Stan path uses. A second
+# implementation of a Hessian or an importance sampler is exactly the kind of
+# duplicated numerical surface this project has already been bitten by.
+#
+# One thing worth stating because it would otherwise need re-deriving: the Stan
+# path evaluates `log_prob(..., adjust_transform = TRUE)`, and these engines
+# compute the `adjust_transform = FALSE` quantity. Here that is the same number.
+# ctsem declares every Stan parameter as an unconstrained `vector` (see the
+# `parameters` block of inst/stan/ctsm.stan) -- the parameter transforms live
+# inside the model, not in Stan's constraint syntax -- so there is no Jacobian
+# adjustment to include. The Stan/Julia parity suite compares
+# against `adjust_transform = FALSE` for the same reason.
+
+# Wrap a backend's evaluate function as the `lpgFunc` contract
+# `ctOptimComputeUncertainty` expects: a numeric log probability carrying its
+# gradient as an attribute, and a finite fallback rather than an error at a
+# point the Hessian's finite differences happen to wander into.
+#
+# `gradient = FALSE` returns the value alone, for a caller that reads only the
+# value. That caller is `imis_is`, which evaluates the log probability at every
+# proposal draw through `vapply(..., numeric(1))` -- which strips the attribute
+# -- and so was paying for a reverse pass per draw and throwing it away, tens
+# of thousands of times per run. The engine's value-only route is the same
+# forward accumulation the adjoint's own value comes from, in the same order,
+# so this changes no number; `test-backend-uncertainty.R` asserts the two
+# values bitwise rather than leaving that to be assumed.
+#
+# `gradient = FALSE` also carries a `'batch'` attribute: a function of a draws
+# matrix (rows are draws, as `imis_is`'s own `x_new` is shaped) returning one
+# log probability per row in a single bridge call, through the engine's
+# `ctsem_evaluate_batch`. `imis_is` reads it when present instead of its
+# per-draw `vapply` loop (see IS-importance-sampling-2026-09-06.md s1): the
+# per-draw loop's cost is almost entirely the bridge round trip rather than the
+# arithmetic -- about 41 ms per call measured there, independent of what the
+# call computes -- so collapsing 1000 calls into one is most of the cost of
+# `uncertainty = 'is'`. Both attributes ride on either form, since what reads
+# them -- the importance sampler, the normal screen and score matching -- is
+# handed whichever the caller holds.
+#
+# Deliberately not wrapped in a `try()` the way the per-draw closure below is.
+# A single bad proposal draw cannot make this throw -- `ctsem_evaluate_batch`
+# is a loop over `_ctsem_probe_value` on the engine side, and that already
+# turns a point the model cannot evaluate, or a laplace inner solve that does
+# not converge, into `-Inf` for that column without raising -- so an error out
+# of the bridge call here means the call itself was malformed (a shape
+# mismatch, a disconnected engine), which should surface rather than be read
+# as one more rejected draw.
+#
+# Both routes evaluate under the chunk ceiling already in force, and neither
+# sets one: the subject loop's chunk count sets its summation order, so the
+# two agree bitwise only at the same count. The per-draw closure used
+# `ctJuliaEvaluate()`'s own `cores = 2` while the batch ran at whatever the
+# session held, and at any other ceiling they came apart in the last bits --
+# 1.8e-12 on test-backend-uncertainty.R's fixture at one chunk against two,
+# with two or more Julia threads. It also overrode the ceiling the caller had
+# set: `.ctBackendUncertainty()` sets one for its whole phase, from `cores`,
+# and every per-draw evaluation in it ran at a ceiling of two whatever that was.
+.ctBackendLpgFunc <- function(fit, gradient = TRUE) {
+  if (!inherits(fit, "ctJuliaFit")) {
+    stop("Unsupported fit class for backend uncertainty.", call. = FALSE)
+  }
+  wantgrad <- isTRUE(gradient)
+  evaluate <- function(parm) ctJuliaEvaluate(fit, parm, gradient = wantgrad,
+    cores = NA)
+  fn <- function(parm) {
+    result <- try(evaluate(as.numeric(parm)), silent = TRUE)
+    failed <- inherits(result, "try-error")
+    value <- if (failed) NaN else as.numeric(result$value)[1L]
+    grad <- if (failed || !wantgrad) NULL else as.numeric(result$gradient)
+    if (!is.finite(value) || (wantgrad && (is.null(grad) ||
+        length(grad) != length(parm) || any(!is.finite(grad))))) {
+      # Matches the Stan path's own guard: a large finite penalty with a zero
+      # gradient, so a finite-difference step into an invalid region degrades
+      # the local approximation rather than aborting the whole calculation.
+      # The value-only caller needs the same guard for its own reason: a
+      # proposal draw the model cannot evaluate has to come back with a finite,
+      # negligible weight rather than aborting the batch.
+      value <- -1e100
+      grad <- if (wantgrad) rep(0, length(parm)) else NULL
+    }
+    if (wantgrad) attributes(value) <- list(gradient = grad)
+    value
+  }
+  # The engine's objective on first use rather than here: most densities built
+  # here are only ever evaluated a point at a time.
+  engine <- local({
+    built <- NULL
+    function() {
+      if (is.null(built)) built <<- list(module = .ctJuliaModule(fit$model_spec$project),
+        objective = .ctJuliaObjective(fit, hybrid = TRUE))
+      built
+    }
+  })
+  # This density is a sum over the fit's units, which a coreset of them may
+  # stand in for (`.ctCoresetLpg()`), built on `engine()$objective`.
+  attr(fn, "unitsum") <- TRUE
+  # The engine and its objective, for a stage that runs in the engine on this
+  # density rather than calling it batch by batch (`.ctDaisEngine()`).
+  attr(fn, "engine") <- engine
+  batches <- .ctBackendEngineBatches(engine)
+  attr(fn, "batch") <- batches$batch
+  attr(fn, "gradbatch") <- batches$gradbatch
+  attr(fn, "gradvalues") <- batches$gradvalues
+  fn
+}
+
+# The `'batch'`, `'gradbatch'` and `'gradvalues'` attributes of a density the engine
+# evaluates, on `engine()$objective`: the fit's own (`.ctBackendLpgFunc()`) or
+# the refined fit's placed objective (`.ctLaplacePlacedLpg()`).
+.ctBackendEngineBatches <- function(engine) {
+  batch <- function(draws) {
+    draws <- as.matrix(draws)
+    # The engine takes columns as draws; `imis_is`'s `x_new` (and every
+    # other caller here) has rows as draws, the ordinary R convention for a
+    # sample matrix. Transposed once per batch rather than asking every
+    # caller to remember the engine's orientation.
+    values <- t(draws)
+    # Not an unconditional `JuliaConnectoR::juliaGet()`: a plain
+    # `Vector{Float64}` -- what `ctsem_evaluate_batch` returns -- comes back
+    # already converted to an R numeric, and `juliaGet()` on that throws
+    # ("no applicable method"), where the functions elsewhere in this file
+    # that return a NamedTuple (`.ctBackendHessian`, `.ctBackendJointHessian`)
+    # need it. `.ctBackendJuliaValue()` is the existing guard for exactly
+    # this -- unwrap a `JuliaProxy`, pass anything else through.
+    out <- as.numeric(.ctBackendJuliaValue(
+      engine()$module$ctsem_evaluate_batch(engine()$objective, values)))
+    # Same sentinel as `.ctBackendLpgFunc()`'s per-draw closure, and for the
+    # same reason:
+    # a proposal the model cannot evaluate gets a finite, negligible weight
+    # rather than an infinite or NaN one reaching `imis_is`'s log-weight
+    # arithmetic.
+    out[!is.finite(out)] <- -1e100
+    out
+  }
+  # Values and gradients for a draws matrix in one bridge call, through
+  # `ctsem_evaluate_batch_gradient`: what `imis_is()`'s profile-path search
+  # moves every path by, one Newton step at a time. A point the route
+  # cannot use comes back with the value sentinel and a gradient of NaN.
+  gradbatch <- function(draws) {
+    draws <- as.matrix(draws)
+    out <- matrix(as.numeric(.ctBackendJuliaValue(
+      engine()$module$ctsem_evaluate_batch_gradient(engine()$objective, t(draws)))),
+      nrow = ncol(draws) + 1L)
+    value <- out[1L, ]
+    value[!is.finite(value)] <- -1e100
+    list(value = value, gradient = t(out[-1L, , drop = FALSE]))
+  }
+  # What a gradient costs in values of the objective (`ctsem_gradient_values`,
+  # the engine's one cost model), asked once: the unit `imis_is()` and the
+  # volume tilt count gradients in (`.ctDensityGradientValues()`).
+  gradvalues <- local({
+    price <- NULL
+    function() {
+      if (is.null(price)) price <<- as.numeric(.ctBackendJuliaValue(
+        engine()$module$ctsem_gradient_values(engine()$objective)))[1L]
+      price
+    }
+  })
+  list(batch = batch, gradbatch = gradbatch, gradvalues = gradvalues)
+}
+
+# What a gradient of the density `lpg` costs in its values: the engine's price
+# (`'gradvalues'`, `.ctBackendEngineBatches()`) for a julia density, two for a
+# stan density, which carries none.
+.ctDensityGradientValues <- function(lpg) {
+  price <- attr(lpg, "gradvalues")
+  if (is.function(price)) as.numeric(price())[1L] else 2
+}
+
+# The two counts `ctOptimCheckUncertaintyData` needs. The Julia spec has no
+# `standata`, but it does carry the subject starts and the observation times,
+# which is the same information.
+.ctBackendDataShape <- function(fit) {
+  spec <- fit$model_spec
+  list(nsubjects = length(spec$subject_starts), ndatapoints = length(spec$times),
+    # `.ctFitRowSubject()` rather than a second spelling of the same expansion.
+    # This one wrote `seq_len(max(1L, nsubjects))` where that writes
+    # `seq_along(starts)`; they agree on every input either can be given, but
+    # two spellings of one index map is how they come to disagree.
+    subject = .ctFitRowSubject(fit))
+}
+
+# `fullbootstrap` is the one method still out of reach: it resamples subjects
+# and re-optimises each sample, which needs the model rebuilt per resample
+# rather than just re-evaluated. Everything else these engines can serve, now
+# that they produce per-subject scores directly (see .ctBackendScoreMatrix).
+.ctBackendUncertaintySupported <- c("checked", "hessian", "is", "opg",
+  "sandwich", "bootstrap")
+
+# `lpg` builds the log posterior the curvature, the flat-direction screen and
+# the draws are scored against, as `lpg(fit, gradient = )`; the fit's own
+# objective unless a caller brings another. The Laplace continuation does
+# (`.ctLaplaceContinue()`): its estimate maximises the quadrature objective,
+# and scoring the flat screen or an importance-sampling proposal against the
+# Laplace one would describe a different function from the one reported.
+.ctBackendUncertainty <- function(fit, uncertainty, draws, finishsamples,
+  cores, control, verbose, lpg = .ctBackendLpgFunc) {
+
+  if (!uncertainty %in% .ctBackendUncertaintySupported) {
+    stop("uncertainty='", uncertainty, "' is not available for backend='",
+      fit$backend, "' fits. ",
+      "fullbootstrap resamples subjects and re-optimises each sample, which ",
+      "needs the model rebuilt per resample rather than re-evaluated. ",
+      # `stored` is served by `ctOptimUncertainty()` before it reaches here, so
+      # it is named in the message rather than added to the list checked above.
+      "Available: ", paste(c(.ctBackendUncertaintySupported, "stored"),
+        collapse = ", "), ".", call. = FALSE)
+  }
+
+  # A state-explicit fit has one uncertainty route and not five. The others
+  # all reach for `lpgFunc`, which evaluates the *marginal* likelihood over
+  # the parameters -- a different objective from the one this fit maximised,
+  # and using it here would produce standard errors for a model that was not
+  # fitted. `hessian` needs only the curvature, which the engine supplies
+  # correctly for this target.
+  if (isFALSE(fit$args$resolved$intoverstates) && !identical(uncertainty, "hessian")) {
+    stop("uncertainty='", uncertainty, "' is not available for an ",
+      "intoverstates=FALSE fit: it would score the marginal likelihood, ",
+      "which is not what this fit maximised. Use uncertainty='hessian', ",
+      "which profiles the states out, or fit with optimize=FALSE to sample ",
+      "the states and read the posterior directly.", call. = FALSE)
+  }
+
+  # `control$flat = 'natural'`: the parameters without a prior are flat on
+  # their natural scale rather than on the raw one (R/ctNaturalPrior.R), in the
+  # density the method integrates over. `target`, below, is the fit with that
+  # prior on its specification, which builds an objective of its own; the fit,
+  # its estimate and its optimisation objective are untouched.
+  flat <- .ctJuliaOr(control$flat, "raw")
+  control$flat <- NULL
+  if (!identical(flat, "raw") && !identical(flat, "natural")) stop(
+    "control$flat must be 'raw' or 'natural'.", call. = FALSE)
+  if (identical(flat, "natural") && !uncertainty %in% c("checked", "is")) stop(
+    "control$flat = 'natural' applies to uncertainty = 'checked' or 'is', which ",
+    "integrate over a density.", call. = FALSE)
+
+  est <- as.numeric(fit$estimate$raw)
+  if (!length(est) || any(!is.finite(est))) {
+    stop("The fit has no finite raw parameter estimate to work from.", call. = FALSE)
+  }
+  shape <- .ctBackendDataShape(fit)
+  natural <- NULL
+  target <- fit
+  if (identical(flat, "natural")) {
+    natural <- .ctJuliaNaturalPrior(fit$model_spec)
+    if (nrow(natural)) target$model_spec$naturalprior <- natural
+  }
+  lpgFunc <- lpg(target)
+  # The fit's modes held while this stage evaluates its objective
+  # (R/ctJuliaFitModes.R): the curvature, the screen, the interval check and
+  # any draws read the function the estimate and its Hessian were reached on.
+  .ctJuliaHoldModes(target$model_spec, .ctJuliaFitModes(fit))
+
+  # `cores` here means engine threads, not R processes: the Julia engine splits
+  # its own subject loop, so each log-probability evaluation is parallel and
+  # there is nothing for an R cluster to do.
+  #
+  # The ceiling the caller asked for.
+  #
+  # This forced one chunk, to mitigate a penalty that does not reproduce. The
+  # record it carried, swept in one direction on one machine, was:
+  #
+  #     chunks              1       2       4       8       1 again
+  #     4 latents, 120 subj  31.2 s  68.9 s  43.0 s  30.8 s  31.5 s
+  #     2 latents, 300 subj   5.0 s  11.3 s   7.3 s   5.3 s   5.4 s
+  #
+  # Re-measured on dev1 -- 23 homogeneous cores, no SMT -- with the sweep run
+  # up and back down rather than in one direction, on the same two shapes.
+  # Whole-phase seconds, minimum of three:
+  #
+  #     chunks               1     2     4     8     8     4     2     1
+  #     4 latents, 120 subj 3.68  3.73  3.58  3.69  3.68  3.64  3.65  3.63
+  #     2 latents, 300 subj 2.94  2.98  2.96  2.95  2.98  2.97  2.99  2.90
+  #
+  # The chunk count moves the phase by 4% and 3%, against a baseline that
+  # repeats to 2.9% and 0.1%. There is no penalty here to mitigate.
+  #
+  # The mechanism agrees. This phase spends almost all of its wall time in
+  # JuliaConnectoR round trips rather than in the subject loop: one gradient
+  # costs 0.417 s called from R and 0.005 s measured inside the engine, and a
+  # round trip costs 40-80 ms whatever it carries. Chunking the subject loop
+  # cannot move a number that is one percent subject loop, in either
+  # direction. Whatever produced the first table, it was not the chunking.
+  #
+  # What the chunk count does change is the exact Hessian, the one component
+  # here with enough work in it to divide: 0.40 s to 0.22 s at eight chunks on
+  # the first shape, 0.21 s to 0.16 s on the second. Forcing one chunk gave
+  # that up and bought nothing.
+  #
+  # Set explicitly rather than left alone, because the session may carry a
+  # ceiling from elsewhere; the engine still caps it at its own thread count.
+  chunks <- suppressWarnings(as.integer(cores)[1L])
+  if (is.na(chunks) || chunks < 1L) chunks <- 1L
+  previous <- .ctBackendSetMaxChunks(chunks)
+  # Restored on exit, like the optimiser's. This runs *after* the optimiser has
+  # put its own ceiling back, so without a restore here the session still ended
+  # a fit reconfigured -- measured at 4 after a `cores=4` Laplace fit, where the
+  # optimiser alone had correctly left it at whatever it found.
+  on.exit(.ctBackendRestoreMaxChunks(previous), add = TRUE)
+
+  # The engines produce per-subject scores from one traced pass, so they are
+  # computed here and handed in rather than reconstructed a subject at a time.
+  scores <- if (uncertainty %in% c("opg", "sandwich", "bootstrap")) {
+    .ctBackendScoreMatrix(fit, est)
+  } else NULL
+
+  # Likewise the Hessian: exact rather than finite-differenced, because the
+  # engine can differentiate its own gradient. `control$analyticHessian=FALSE`
+  # falls back to the shared finite-difference path, which is worth keeping
+  # reachable -- it is the only way to compare the two on a real model.
+  needsHessian <- uncertainty %in% c("checked", "hessian", "sandwich",
+    "bootstrap", "is")
+  # What the fit already knows about its curvature, kept before
+  # `fit$uncertainty` is replaced below: the Hessian the certification decided
+  # on, where it was evaluated, and that certification.
+  stored <- fit$uncertainty
+  # No budget on `'checked'`'s sampling unless the caller sets one
+  # (`control$imisBudget`). It once stopped at what the optimiser had spent and
+  # fell back to the Hessian's normal, which on a shell is the answer the check
+  # had just found wrong.
+  hessian <- if (needsHessian && !identical(control$analyticHessian, FALSE)) {
+    .ctBackendHessian(fit, est, verbose = verbose)
+  } else NULL
+  control$analyticHessian <- NULL
+  # The natural-scale prior's curvature, which is separable: its diagonal. For
+  # this call's check and sampling only: the fit keeps its objective's own
+  # curvature (below), which its certification, the continuation, adequacy and
+  # a later raw-flat call read.
+  objectivehessian <- hessian
+  if (!is.null(hessian) && length(natural) && nrow(natural)) {
+    curvature <- .ctNaturalCurvature(natural, .ctBackendRawFull(fit$model_spec, est))
+    hessian[cbind(natural$index, natural$index)] <-
+      hessian[cbind(natural$index, natural$index)] + curvature
+  }
+
+  uncertaintyfit <- ctOptimComputeUncertainty(est = est, standata = shape,
+    sm = NULL, lpgFunc = lpgFunc, uncertainty = uncertainty,
+    finishsamples = finishsamples, cores = cores, matsetup = NA,
+    control = control, verbose = verbose, scores = scores, hessian = hessian)
+
+  # The draw choice itself is `.ctOptimDrawSamples()`, shared with the stan
+  # branch of `ctOptimUncertainty()`. It used to be written out here as well,
+  # and the copies drifted: `empirical` was missing on this side, so
+  # `uncertainty='bootstrap'` -- which `.ctResolveDraws()` resolves to
+  # `draws='empirical'` -- fell through to normal draws and recorded
+  # `draws='empirical'` in `$uncertainty$settings` anyway. The covariance was
+  # the bootstrap's, so nothing looked wrong; the draws were a Gaussian around
+  # the estimate, which is the one thing asking for a bootstrap says you do not
+  # want. Detectable only by noticing that `sd(rawposterior)` no longer equalled
+  # `sqrt(diag(cov))`, as it does on stan by construction.
+  #
+  # Two arguments carry what is genuinely this backend's:
+  #
+  #   `backend`, the proposal's scale: julia's by whether its start's widths
+  #   were measured (`.ctImisProposalDefaults()`).
+  #
+  #   `lpg` value-only, not `lpgFunc`: `imis_is` reads the log probability and
+  #   nothing else, so the reverse pass `lpgFunc` computes per draw was being
+  #   discarded by the `vapply` that collects it. Value-only is also what
+  #   carries the `'batch'` attribute (see `.ctBackendLpgFunc()`), so
+  #   `uncertainty = 'is'` evaluates a whole proposal batch in one bridge call
+  #   rather than one per draw. `.ctCoresetLpg()` puts a coreset of the
+  #   units behind it.
+  drawn <- .ctOptimDrawSamples(uncertaintyfit, draws = draws, control = control,
+    est = est, finishsamples = finishsamples,
+    parnames = tryCatch(.ctFitRawParNames(fit), error = function(e) NULL),
+    proper = identical(.ctFitPriorScope(fit), 'all'),
+    lpg = .ctCoresetLpg(target, lpg(target, gradient = FALSE), control), verbose = verbose,
+    backend = 'julia',
+    tailremedy = "ctFitUncertainty(fit, 'sample') samples the posterior itself.")
+  samples <- drawn$samples
+  uncertaintyfit <- drawn$uncertaintyfit
+  control <- drawn$control
+  draws <- drawn$draws
+
+  storedControl <- control
+  storedControl$flat <- flat
+  uncertaintyfit$draws <- draws
+  uncertaintyfit$settings <- list(method = uncertainty, draws = draws,
+    finishsamples = finishsamples, cores = cores, control = storedControl)
+
+  fit$estimate$cov <- uncertaintyfit$cov
+  fit$estimate$se <- sqrt(diag(uncertaintyfit$cov))
+  fit$estimate$rawposterior <- samples
+  # All three carry the raw parameter names, and stan's equivalents get them
+  # from the same helper -- see `.ctFitNameRawUncertainty()` for why it has to
+  # be all of them and both backends.
+  fit <- .ctFitNameRawUncertainty(fit)
+  # Whether each interval just produced is as wide as the curvature at the
+  # estimate supports. Attached here rather than at the end of a fit so it
+  # describes whatever `uncertainty` was last run, a later
+  # `ctOptimUncertainty()` call included -- a check that silently went on
+  # describing the previous method would be worse than none.
+  uncertaintyfit$intervalcheck <- .ctBackendIntervalCheck(uncertaintyfit$hessian,
+    fit$estimate$se, names(fit$estimate$se),
+    # The null mass the covariance construction actually used, so the report
+    # and the intervals cannot disagree about which coordinates were dropped;
+    # after a route that drew gave a dropped direction a width, only what is
+    # still held. See `.ctBackendHeldMass()`.
+    mass = .ctBackendHeldMass(uncertaintyfit$details))
+  # Where the curvature this call used was evaluated. `est` is this call's own
+  # point, which is not always the fit's: `ctOptimUncertainty()` can be handed
+  # an estimate from elsewhere.
+  #
+  # `evaluated_at`, and deliberately NOT `hessian_at`. R's `$` partial-matches
+  # on lists, so a sibling named `hessian_at` makes `x$hessian` resolve to it
+  # the moment `hessian` itself is absent -- handing a length-npar vector to
+  # every `is.null(fit$uncertainty$hessian)` guard in the package, which then
+  # takes the "no curvature" branch's opposite and treats a vector as a matrix.
+  # test-julia-laplace-check.R found it by doing exactly that: it removes the
+  # Hessian to check the refusal, and the refusal stopped firing. Nothing in
+  # `$uncertainty` may be a prefix-extension of another name there; the
+  # duplication ratchet asserts it.
+  #
+  # The stored matrix, when it was the one used, keeps the point it was
+  # evaluated at: the optimiser's finish may have taken it at the hand-over,
+  # within the fit's `hessianreuse` standard errors of `est`, and saying `est`
+  # would claim more than was measured.
+  if (!is.null(uncertaintyfit$hessian) && !identical(objectivehessian, hessian))
+    uncertaintyfit$hessian <- objectivehessian
+  reused <- !is.null(stored$hessian) && !is.null(uncertaintyfit$hessian) &&
+    identical(uncertaintyfit$hessian, stored$hessian)
+  if (!is.null(uncertaintyfit$hessian)) {
+    uncertaintyfit$evaluated_at <- if (reused && length(stored$evaluated_at))
+      as.numeric(stored$evaluated_at) else as.numeric(est)
+  }
+  fit$uncertainty <- uncertaintyfit
+  # What the curvature says about convergence, which a gradient cannot: the
+  # objective still available under the local quadratic approximation, over the
+  # subspace whose curvature the data supports, plus a measurement of what the
+  # excluded directions hold. See R/ctBackendOptimGap.R.
+  #
+  # Once per fit. The certification made on the way out of the optimiser was
+  # decided on this same matrix, with the engine's own probe, so it is kept;
+  # computing it again here with another evaluator, and overwriting it, is what
+  # this stage used to do. Only a matrix from elsewhere -- a fit certified with
+  # none (`estonly`), an estimate moved since -- is certified here.
+  fit$uncertainty$certification <- if (reused &&
+      length(stored$certification$status)) {
+    stored$certification
+  } else {
+    # At the bar the run that reached the estimate found its objective
+    # resolves (`.ctBackendResolvedTolerance()`).
+    .ctBackendCertification(fit, uncertaintyfit$hessian,
+      tolerance = .ctBackendResolvedTolerance(
+        list(converge_floor = fit$optim$convergence_floor),
+        .ctBackendGapTolerance(fit)))
+  }
+  # And the identifiability report, for the same reason: it is a statement
+  # about the curvature this call just used. A fit made with `estonly = TRUE`
+  # and finished later by `ctOptimUncertainty()` carried none at all, so
+  # nothing named the parameter whose interval had no width.
+  # `screen` is what the likelihood said along the flat directions of that same
+  # curvature, so the report names what was measured flat and not only what
+  # the eigenvalue has decayed far enough to call flat at this stopping point.
+  # After the certification, which is of the same curvature: a negative
+  # direction its saddle ladder found flat is reported as unidentified rather
+  # than as a saddle.
+  fit$identifiability <- .ctBackendIdentifiability(uncertaintyfit$hessian,
+    names(fit$estimate$se), fit = fit, at = fit$estimate$raw,
+    screen = uncertaintyfit$details$flatdirections,
+    certification = fit$uncertainty$certification)
+  # And `converged` with it: a fit finished here had only the engine's verdict
+  # until this call, and that verdict is what this one replaces.
+  fit <- .ctBackendCertifiedVerdict(fit)
+  # New draws mean the fit's constrained draws describe the previous ones, so
+  # they are refreshed here rather than left to be noticed downstream.
+  fit$transformedpars <- .ctBackendConstrain(fit)
+  # Deliberately no transformed-parameter summary: `ctOptimUpdateTransformed()`
+  # goes through `rstan::constrain_pars` and the Stan model object, and neither
+  # backend has a parameter-matrix reconstruction API yet (the same gap that
+  # makes `ctSummaryMatrices()` unavailable for these fits). The raw-scale
+  # covariance and draws are complete and usable; anything on the transformed
+  # scale would have to be reconstructed, not merely relabelled.
+  fit
+}
+
+# --- priors ----------------------------------------------------------------
+#
+# The generated Stan model's prior block is a sum of `normal_lpdf(x/scale|0,1)`
+# terms over the raw parameter vector, and the Julia engine uses that
+# same vector in that same order (which is why the parity tests can hand the
+# identical `raw` to all three). So the whole of ctsem's prior semantics reduces
+# to a list of (index, scale) pairs, decided here where the semantics live, and
+# evaluated in the engine as a normal log-density.
+#
+# The layout, from `ctModelWriter.R`'s model block and `ctData.R`:
+#   1..nparams                     rawpopmeans          scale 1
+#   next nindvarying               rawpopsdbase         scale 1
+#   next nindvaryingoffdiagonals   sqrtpcov             scale 1
+#   TI effect coefficients         tipredeffectparams   scale tipredeffectscale
+#
+# `.ctJuliaAugmentRandomEffects` appends the population SD and correlation
+# parameters in exactly that order, and `.ctJuliaTIEffects` appends the TI
+# coefficients after them, so the indices line up without a separate mapping.
+# Priors for the Laplace route, built from *its* raw layout rather than Stan's.
+#
+# `.ctBackendPriorSpec` below encodes the generated Stan model's ordering:
+# population means, one block of population scales, one block of correlations,
+# then TI-predictor effects. That is right for a single level and wrong for a
+# hierarchy, where there is a scale block and a correlation block *per level* --
+# it refuses rather than mis-assigning, which is how the gap surfaced.
+#
+# Every level gets the prior shape the subject level has: `normal(0,1)` on the
+# untransformed scales and on the unconstrained correlation coordinates, which
+# is what `rawpopsdbase` and `sqrtpcov` carry in the generated model. That is a
+# deliberate choice rather than an inherited one -- the parameterisation is
+# identical at every level, so the prior should be too, while noting that the
+# same nominal prior does far more work over six studies than over three
+# hundred subjects.
+#
+# `.ctBackendLaplacePriorSpec` reproduces `.ctBackendPriorSpec` exactly when
+# there is one level, and `test-julia-laplace.R` asserts that rather than
+# trusting it.
+#' The random-effect correlations alone, as a prior spec.
+#'
+#' What `priors = 'randomCorr'` builds: the random-effect correlations only, at every level of a hierarchy -- not their standard
+#' deviations, which the likelihood alone determines poorly enough to warrant
+#' a warning but not, on their own, the walk a correlation coordinate is
+#' capable of (see below). Every other coordinate is left to the likelihood;
+#' the correlations are the ones where unbounded maximum likelihood is not
+#' merely uncertain but ill-posed.
+#'
+#' A correlation is bounded and its coordinate is not, so every construction
+#' that maps one to the other flattens as the correlation approaches its
+#' limit. Along a direction the data do not determine, the objective is flat,
+#' a quasi-Newton step is `gradient / curvature` with both underflowing, and
+#' the coordinate walks. Measured on a 4x4 population covariance with 50
+#' subjects and no prior: coordinates reached 118 under `covmattransform='z'`
+#' and 970 under `'rawcorr'` on a related model, where the correlation they
+#' produce is 1 to within rounding. The fit then reports convergence, because
+#' nothing is moving, and the curvature is gone -- not only along the flat
+#' direction but along every correlation, since these constructions couple
+#' each coordinate to the whole matrix. Every correlation came back `NA`,
+#' including the ones the data determine perfectly well.
+#'
+#' The same N(0,1) the other coordinates would get, which on the correlation
+#' scale under `'z'` is close to flat: measured over dimensions 2 to 30, an
+#' implied correlation sd of 0.64 falling only to 0.56, with 6 per cent of the
+#' mass still beyond 0.9 in absolute value at 30x30. It bounds the walk
+#' without ruling anything out. That stability across dimension is a property
+#' of `'z'`; under `'rawcorr'` the same prior tightens to an sd of 0.21 by
+#' 30x30, which would be a real shrink rather than a guard rail.
+#'
+#' The standard deviations are deliberately not included, and the cost of
+#' leaving them out is known rather than assumed. Under `intoverpop='augmented'`
+#' an sd is not separately identified from its correlations -- only their
+#' products are -- so a correlation prior alone leaves a partly flat surface:
+#' measured on a 4x4 block with 50 subjects, 1039 iterations and four warnings
+#' against 462 and none when the sds were penalised too.
+#'
+#' Those warnings are nonetheless the right outcome. They report a real
+#' property of the augmented objective -- not of the model, which laplace fits
+#' from the same data -- and they name the remedy, which is
+#' `intoverpop='laplace'` rather than a prior. A prior on the sds removes the
+#' warnings by regularising a variance, which hides the non-identification
+#' instead of resolving it, and changes a variance estimate on every model
+#' that has random effects. A guard rail on a coordinate that would otherwise
+#' walk off a flat direction is a smaller claim than that, and it is the whole
+#' of what this default is for.
+#' @noRd
+.ctBackendRandomCorrPriorSpec <- function(standata, laplace, npar) {
+  if (is.null(standata)) {
+    stop("priors='randomCorr' needs the prepared model data; this fit was ",
+      "built without it.", call. = FALSE)
+  }
+  .ctBackendRejectLaplacePriors(standata)
+  index <- integer(0)
+  if (!is.null(laplace)) {
+    # One block per level of the hierarchy, each with its own sds and
+    # correlations.
+    for (level in laplace$levels) {
+      if (length(level$cor_index)) index <- c(index,
+        setdiff(as.integer(level$cor_index), 0L))
+    }
+  } else {
+    # The single-level layout, whose blocks are counted rather than indexed:
+    # the population means, then the random-effect sds, then their
+    # correlations. Only the last block is wanted, so the first two are
+    # stepped over.
+    nparams <- as.integer(standata$nparams)[1L]
+    nindvarying <- as.integer(standata$nindvarying)[1L]
+    noffdiagonals <- as.integer(standata$nindvaryingoffdiagonals)[1L]
+    if (is.na(nparams)) nparams <- 0L
+    if (is.na(nindvarying)) nindvarying <- 0L
+    if (is.na(noffdiagonals)) noffdiagonals <- 0L
+    if (nindvarying > 1L && noffdiagonals > 0L) {
+      index <- nparams + nindvarying + seq_len(noffdiagonals)
+    }
+  }
+  index <- index[index >= 1L & index <= npar]
+  # A model with no random effects, or with one varying parameter, has no
+  # correlations and therefore no priors. That is not a failure: it is the
+  # likelihood on its own, which is what it was before this default existed.
+  if (!length(index)) return(NULL)
+  list(index = as.integer(index), scale = rep(1, length(index)), weight = 1)
+}
+
+# What `priors = TRUE` builds on the Laplace route: a standard
+# `normal(0, 1)` on every raw coordinate the loop below reaches -- each
+# level's random-effect sds, its correlations, and, for a reduced-rank level,
+# its loadings instead of the scales (see the comment at `load_index` below
+# for why those are scaled by `1 / sqrt(rank)` rather than left at 1). Time
+# independent predictor effects get their own scale from `standata`, not this
+# one. One of the seven leverage constants that move where a fit ends
+# (`review/OPTIM-consolidation-plan-2026-09-25.md` Appendix B) --
+# `priors = 'randomCorr'`, `.ctBackendRandomCorrPriorSpec` above, is the
+# narrower default that applies the same N(0,1) to the correlations alone.
+.ctBackendLaplacePriorSpec <- function(standata, laplace, npar) {
+  if (is.null(standata)) {
+    stop("priors=TRUE needs the prepared model data; this fit was built without it.",
+      call. = FALSE)
+  }
+  .ctBackendRejectLaplacePriors(standata)
+
+  nparams <- as.integer(standata$nparams)[1L]
+  if (is.na(nparams)) nparams <- 0L
+  index <- seq_len(nparams)
+  scale <- rep(1, nparams)
+
+  for (level in laplace$levels) {
+    # Stated entries (index 0) are not parameters and take no prior.
+    sdfree <- setdiff(as.integer(level$sd_index), 0L)
+    corfree <- setdiff(as.integer(level$cor_index), 0L)
+    if (length(sdfree)) {
+      index <- c(index, sdfree)
+      scale <- c(scale, rep(1, length(sdfree)))
+    }
+    if (length(corfree)) {
+      index <- c(index, corfree)
+      scale <- c(scale, rep(1, length(corfree)))
+    }
+    # A reduced level carries loadings instead, and they need a prior of their
+    # own rather than the scales' -- a row of `L` contributes its squared norm
+    # to that parameter's population variance, so `rank` independent
+    # `normal(0, 1)` loadings would imply a variance of `rank` rather than of
+    # 1, and the same nominal prior would mean something different at every
+    # rank. Scaling by `1/sqrt(rank)` keeps the implied population variance at
+    # 1 whatever rank was asked for, which is what makes a rank a restriction
+    # on shape rather than an accidental change of scale.
+    if (length(level$load_index)) {
+      rank <- as.integer(if (is.null(level$rank)) 1L else level$rank)[1L]
+      if (!is.finite(rank) || rank < 1L) rank <- 1L
+      index <- c(index, as.integer(level$load_index))
+      # A level with blocks scales each loading by the dimensions its own
+      # effect may load on (`.ctJuliaBlockPattern()`), the same rule.
+      scale <- c(scale, if (length(level$load_prior) == length(level$load_index))
+        as.numeric(level$load_prior) else rep(1 / sqrt(rank), length(level$load_index)))
+    }
+    # Own variances (`popunique`) take a full-rank sd's transform, and so its
+    # prior.
+    ownfree <- setdiff(as.integer(level$unique_index), 0L)
+    if (length(ownfree)) {
+      index <- c(index, ownfree)
+      scale <- c(scale, rep(1, length(ownfree)))
+    }
+  }
+
+  ntipredeffects <- as.integer(standata$ntipredeffects)[1L]
+  if (!is.na(ntipredeffects) && ntipredeffects > 0L) {
+    tipredscale <- as.numeric(standata$tipredeffectscale)[1L]
+    if (!is.finite(tipredscale) || tipredscale <= 0) tipredscale <- 1
+    index <- c(index, laplace$npar + seq_len(ntipredeffects))
+    scale <- c(scale, rep(tipredscale, ntipredeffects))
+  }
+
+  if (length(index) != npar) {
+    stop("Cannot map ctsem's priors onto this model's raw parameters: the ",
+      "Laplace layout accounts for ", length(index), " of ", npar,
+      " free parameters. Please report this model shape.", call. = FALSE)
+  }
+  priormod <- as.numeric(standata$priormod)[1L]
+  if (!is.finite(priormod)) priormod <- 1
+  nsubsets <- as.numeric(standata$nsubsets)[1L]
+  if (!is.finite(nsubsets) || nsubsets <= 0) nsubsets <- 1
+  list(index = as.integer(index), scale = as.numeric(scale),
+    weight = priormod / nsubsets)
+}
+
+# The prior families these engines cannot evaluate, refused identically
+# whichever layout is in use.
+.ctBackendRejectLaplacePriors <- function(standata) {
+  laplaceprior <- as.integer(standata$laplaceprior)
+  if (length(laplaceprior) && any(laplaceprior == 1L)) {
+    stop("Laplace priors are not implemented for backend='julia'. ",
+      "The generated Stan model uses a smoothed double-exponential density for ",
+      "these, which these engines do not evaluate; use backend='stan', or drop ",
+      "laplaceprior for the affected matrices.", call. = FALSE)
+  }
+  if (isTRUE(as.integer(standata$laplacetipreds)[1L] == 1L)) {
+    stop("Laplace priors on TI predictor effects are not implemented for ",
+      "backend='julia'; use backend='stan'.", call. = FALSE)
+  }
+  if (isTRUE(as.integer(standata$laplaceprioronly)[1L] == 1L)) {
+    stop("laplaceprioronly is not implemented for backend='julia'; ",
+      "use backend='stan'.", call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
+# `nextra`: raw parameters past the stan layout that carry a density of their
+# own and so take no raw prior -- the sampled values of missing TI predictors,
+# whose density is the imputation model's (`_ctsem_ti_missing_loglik`). They
+# sit at the end of the vector, after every index this assigns.
+.ctBackendPriorSpec <- function(standata, npar, nextra = 0L) {
+  if (is.null(standata)) {
+    stop("priors=TRUE needs the prepared model data; this fit was built without it.",
+      call. = FALSE)
+  }
+  .ctBackendRejectLaplacePriors(standata)
+
+  nparams <- as.integer(standata$nparams)[1L]
+  nindvarying <- as.integer(standata$nindvarying)[1L]
+  noffdiagonals <- as.integer(standata$nindvaryingoffdiagonals)[1L]
+  if (is.na(nparams)) nparams <- 0L
+  if (is.na(nindvarying)) nindvarying <- 0L
+  if (is.na(noffdiagonals)) noffdiagonals <- 0L
+
+  index <- seq_len(nparams)
+  scale <- rep(1, nparams)
+  position <- nparams
+  if (nindvarying > 0L) {
+    index <- c(index, position + seq_len(nindvarying))
+    scale <- c(scale, rep(1, nindvarying))
+    position <- position + nindvarying
+    if (nindvarying > 1L && noffdiagonals > 0L) {
+      index <- c(index, position + seq_len(noffdiagonals))
+      scale <- c(scale, rep(1, noffdiagonals))
+      position <- position + noffdiagonals
+    }
+  }
+  ntipredeffects <- as.integer(standata$ntipredeffects)[1L]
+  if (!is.na(ntipredeffects) && ntipredeffects > 0L) {
+    tipredscale <- as.numeric(standata$tipredeffectscale)[1L]
+    if (!is.finite(tipredscale) || tipredscale <= 0) tipredscale <- 1
+    index <- c(index, position + seq_len(ntipredeffects))
+    scale <- c(scale, rep(tipredscale, ntipredeffects))
+    position <- position + ntipredeffects
+  }
+
+  # If the engine's free-parameter count and the Stan-side layout disagree, the
+  # indices are meaningless and a silently mis-scaled posterior is far worse
+  # than a refusal.
+  nextra <- max(0L, as.integer(nextra)[1L], na.rm = TRUE)
+  if (position + nextra != npar) {
+    stop("Cannot map ctsem's priors onto this model's raw parameters: the Stan ",
+      "layout accounts for ", position, " of ", npar, " free parameters. ",
+      "Please report this model shape.", call. = FALSE)
+  }
+  priormod <- as.numeric(standata$priormod)[1L]
+  if (!is.finite(priormod)) priormod <- 1
+  nsubsets <- as.numeric(standata$nsubsets)[1L]
+  if (!is.finite(nsubsets) || nsubsets <= 0) nsubsets <- 1
+  list(index = as.integer(index), scale = as.numeric(scale),
+    weight = priormod / nsubsets)
+}
+
+# --- the Hessian ------------------------------------------------------------
+
+# The exact Hessian of the log posterior, from the engine.
+#
+# The shared path finite-differences the gradient: `2 * npar` reverse sweeps,
+# accurate to about the square root of machine precision, and only if the step
+# suits the parameter's scale -- which one global step cannot do for a vector
+# mixing log standard deviations with unconstrained correlations. The engine
+# instead differentiates its own reverse-mode gradient in forward mode, which
+# costs `ceil(npar / chunksize)` sweeps and is exact. Measured against
+# `ForwardDiff.hessian` of the primal on a state-dependent 13-parameter model,
+# the exact route agrees to 2e-16 relative and the finite difference to 2e-6.
+#
+# Returns NULL rather than erroring if anything goes wrong, so the caller falls
+# back to the finite-difference Hessian: a worse covariance is a better outcome
+# than no fit at all, and the two are interchangeable at this seam.
+.ctBackendHessian <- function(fit, est, verbose = 0, gradient = "adjoint") {
+  # A state-explicit fit maximised a different object, so its curvature is a
+  # different object too. See `.ctBackendJointHessian`.
+  if (isFALSE(fit$args$resolved$intoverstates)) return(.ctBackendJointHessian(fit, est))
+  # The optimiser's finish formed this matrix on the way out, and the
+  # certification decided on it -- see `.ctBackendCorrectResult()`.
+  # Recomputing it would be the fit's second most expensive step run twice for
+  # the same answer.
+  #
+  # Reused only when it describes the point being asked about: evaluated there,
+  # or within the fit's `hessianreuse` standard errors (`.ctBackendStoredHessian()`),
+  # and `evaluated_at` is what says where it was. Comparing against
+  # `fit$estimate$raw` instead is the trap: it is the same point on an
+  # optimised fit and a different one on a sampled fit, whose Hessian is at the
+  # Laplace estimate while `$estimate$raw` is the posterior mean -- so a guard
+  # written that way passes exactly where it must not and returns curvature
+  # from somewhere else. A fit carrying a Hessian and no `evaluated_at` predates
+  # this and is not reused.
+  stored <- .ctBackendStoredHessian(fit, est)
+  if (!is.null(stored)) return(stored)
+  module <- .ctJuliaModule(.ctBackendSpec(fit)$project)
+  # `gradient='forward'` selects `ctsem_hessian_forward` instead of
+  # `ctsem_hessian`, whichever the caller asked `optimcontrol$gradient` for
+  # (default 'adjoint'; see `.ctFitJuliaBackendImpl`). A sampled (missing) TI
+  # predictor value used to force 'forward' here, because `ctsem_hessian`
+  # nested over the adjoint gradient and refused such a model outright; the
+  # reverse pass covers it now (see the note beside `gradient <-` in
+  # `.ctFitJuliaBackendImpl`), so neither method is singled out for it any
+  # more and this just follows what the fit itself used -- except on the
+  # Laplace route, which has no forward method: see
+  # `.ctBackendHessianFunction()`.
+  hessian_fn_name <- .ctBackendHessianFunction(.ctBackendSpec(fit), gradient)
+  # A user whose cached engine environment predates this function has no such
+  # function, and that is a silent fallback rather than an error: the engine
+  # environment is keyed on a hash of the engine's source, so it refreshes
+  # itself the moment that source changes.
+  available <- isTRUE(tryCatch(is.function(module[[hessian_fn_name]]),
+    error = function(e) FALSE))
+  if (!available) return(NULL)
+  # Said out loud, as the finite-difference path says "Estimating Hessian",
+  # because the first call on a given model shape spends about ten seconds in
+  # Julia compiling the reverse pass for dual numbers. That is once per model
+  # per session -- the second call on this 28-parameter model takes 0.08 s,
+  # against 0.78 s for the 2*npar gradient evaluations a finite difference
+  # needs -- but an unexplained ten-second pause is worth a line of output.
+  message("Computing exact Hessian")
+  # On the Laplace route -- `hessian_fn_name` is always "ctsem_hessian" there
+  # -- this is `ctsem_laplace_hessian`'s own `2 * npar` gradient loop, the same
+  # slow one the optimiser's finish reports through `hessian_progress`, unless
+  # no unit holds a coordinate, when it is the marginal route's. This
+  # call reaches it from outside any fit's optimisation at all (a bare
+  # `ctFitUncertainty()`, or the certification's own re-derivation), which is
+  # exactly the case `ctsem_endgame` already exists for -- so this borrows the
+  # engine's own reporter through `ctsem_hessian_progress()` (the same
+  # `CTSEMProgress`/`_due`/`_progress_fraction` machinery, wrapping whichever
+  # of `ctsem_hessian`/`ctsem_hessian_forward` applies) rather than building a
+  # second rate limiter and a second copy of the line's text on this side.
+  # `sink` is the bare, unthrottled sink: the engine throttles on its own
+  # cadence now, as it does for every other stage.
+  sink <- .ctBackendProgressSink(verbose)
+  # A user whose cached engine environment predates `ctsem_hessian_progress`
+  # has no such function -- same silent fallback as `hessian_fn_name` above,
+  # just without progress, rather than losing the Hessian over it.
+  reporting_available <- isTRUE(tryCatch(is.function(module$ctsem_hessian_progress),
+    error = function(e) FALSE))
+  result <- try(.ctBackendJuliaValue(
+    if (reporting_available) {
+      module$ctsem_hessian_progress(.ctJuliaObjective(fit, hybrid = TRUE),
+        .ctJuliaVector(as.numeric(est)),
+        forward = identical(hessian_fn_name, "ctsem_hessian_forward"),
+        progress = !is.null(sink), progress_sink = sink,
+        progress_overwrite = .ctProgressOverwrite(verbose), progress_label = "hessian")
+    } else {
+      module[[hessian_fn_name]](.ctJuliaObjective(fit, hybrid = TRUE),
+        .ctJuliaVector(as.numeric(est)))
+    }), silent = TRUE)
+  # Ends the in-place line, if the loop ran long enough for one to be open,
+  # before anything else -- a warning below, or nothing at all -- prints on
+  # its own line right after it.
+  if (!is.null(sink)) sink("", "break")
+  if (inherits(result, "try-error")) {
+    warning("The engine could not differentiate its gradient here; ",
+      "falling back to the finite-difference Hessian.", call. = FALSE)
+    return(NULL)
+  }
+  hessian <- matrix(as.numeric(result), nrow = length(est), ncol = length(est))
+  if (any(!is.finite(hessian))) {
+    warning("The exact Hessian was not finite at the estimate; ",
+      "falling back to the finite-difference Hessian.", call. = FALSE)
+    return(NULL)
+  }
+  hessian
+}
+
+# --- per-subject scores -----------------------------------------------------
+
+# The score matrix `ctOptimScoreMatrix()`/`bootstrapHessian()` consume, from the
+# engines' own per-subject adjoint contributions rather than by re-initialising
+# a model per subject the way `scorecalc()` must for Stan. One row per unit:
+# subject, or under the Laplace layer outermost group. `prior = FALSE` leaves
+# out each row's share of the prior, for what removing a unit removes.
+.ctBackendScoreMatrix <- function(fit, est, prior = TRUE) {
+  module <- .ctJuliaModule(fit$model_spec$project)
+  result <- .ctJuliaGet(module$ctsem_subject_gradients(
+    .ctJuliaObjective(fit, hybrid = TRUE), .ctJuliaVector(as.numeric(est)),
+    prior = isTRUE(prior)))
+  scores <- as.matrix(result$scores)
+  if (any(!is.finite(scores))) {
+    stop("The engine returned non-finite per-subject scores at the estimate; ",
+      "score-based uncertainty cannot be computed here.", call. = FALSE)
+  }
+  scores
+}
+
+# The Hessian of an `intoverstates=FALSE` fit.
+#
+# Not the second derivative of the joint density in the parameter block: that
+# is the curvature at *fixed* states, which treats a trajectory that was
+# estimated as though it had been observed and gives intervals far too
+# narrow. What a standard error needs here is the curvature of the profile,
+# which is the Schur complement of the joint Hessian -- equivalently the
+# Laplace approximation to the observed information with the states
+# integrated back out. The engine forms it per subject, so no matrix of the
+# full state dimension is ever built; see `ctsem_joint_hessian`.
+.ctBackendJointHessian <- function(fit, est) {
+  spec <- .ctBackendSpec(fit)
+  module <- .ctJuliaModule(spec$project)
+  innovations <- as.numeric(fit$estimate$innovations)
+  if (!length(innovations)) return(NULL)
+  joint <- try(.ctJuliaJointObjective(fit, length(est)), silent = TRUE)
+  if (inherits(joint, "try-error")) return(NULL)
+  message("Computing exact Hessian, with the states profiled out")
+  result <- try(.ctBackendJuliaValue(module$ctsem_joint_hessian(joint,
+    .ctJuliaNumericVector(c(as.numeric(est), innovations)),
+    profile = TRUE)), silent = TRUE)
+  if (inherits(result, "try-error") || is.null(result)) {
+    warning("The profiled Hessian could not be formed at the estimate -- ",
+      "usually a subject whose trajectory the data does not determine. ",
+      "Falling back to the finite-difference Hessian, which differentiates ",
+      "the marginal likelihood and so does not describe this fit.",
+      call. = FALSE)
+    return(NULL)
+  }
+  hessian <- matrix(as.numeric(result), nrow = length(est), ncol = length(est))
+  if (any(!is.finite(hessian))) return(NULL)
+  hessian
+}
+
+# `ctFitUncertainty(fit, 'is' | 'checked', intoverpop = 'quadrature')` and
+# `filter = 'particle'`, internally `control$likelihood`:
+# the draws behind a fit's intervals against a density the fit did not
+# maximise -- the quadrature hybrid the continuation climbs, or the particle
+# filter for a filter fit. The two targets own their densities and their
+# records (`.ctLaplaceContinue()`, `.ctParticleCorrect()`); this maps the
+# shared controls onto them.
+.ctBackendUncertaintyLikelihoods <- c("fit", "quadrature", "particle")
+
+.ctBackendUncertaintyLikelihood <- function(fit, uncertainty, likelihood,
+  finishsamples, cores, control, verbose) {
+  own <- switch(likelihood, quadrature = c("nodes", "check"),
+    particle = c("particles", "substeps", "transition", "seed"))
+  shared <- c(isESS = "target_ess", isitersize = "nbatch",
+    imisMaxIter = "maxiter", imisScaleInit = "scale",
+    correctEstimate = "correct_estimate")
+  unknown <- setdiff(names(control), c(own, names(shared)))
+  if (length(unknown)) {
+    # `check` comes from the argument `checks`.
+    stop("control$", unknown[1L], " is not used with ",
+      .ctLikelihoodWords(likelihood), ". Its settings are ",
+      paste(setdiff(c(own, names(shared)), "check"), collapse = ", "), ".",
+      call. = FALSE)
+  }
+  switch(likelihood,
+    quadrature = .ctBackendUncertaintyQuadrature(fit, uncertainty,
+      finishsamples = finishsamples, cores = cores, control = control,
+      verbose = verbose, shared = setdiff(names(shared), "correctEstimate")),
+    particle = .ctBackendUncertaintyParticle(fit, uncertainty,
+      finishsamples = finishsamples, cores = cores, control = control,
+      verbose = verbose, own = own, shared = shared))
+}
+
+# `likelihood = 'particle'`: the particle filter's density, sampled by the
+# adaptive importance sampler alone (`.ctParticleCorrect()`): it has no
+# normal to check, so `'is'` is the one method against it.
+.ctBackendUncertaintyParticle <- function(fit, uncertainty, finishsamples,
+  cores, control, verbose, own, shared) {
+  if (!identical(uncertainty, "is")) {
+    stop("filter = 'particle' is sampled by method = 'is'; ",
+      "method = '", uncertainty, "' has no sampler against it.",
+      call. = FALSE)
+  }
+  args <- c(list(fit = fit, finishsamples = finishsamples, cores = cores,
+    verbose = verbose), control[intersect(names(control), own)])
+  for (name in intersect(names(control), names(shared))) {
+    args[[shared[[name]]]] <- control[[name]]
+  }
+  fit <- do.call(.ctParticleCorrect, args)
+  # The record every other method writes, so `summary()` and a later
+  # `uncertainty = 'stored'` describe these draws rather than the pass before.
+  fit$uncertainty$settings <- list(method = "is", draws = "imis",
+    finishsamples = nrow(fit$estimate$rawposterior), cores = cores,
+    control = c(list(likelihood = "particle"), control))
+  fit
+}
+
+# `likelihood = 'quadrature'`: the continuation from the fit's estimate, and
+# the uncertainty by `uncertainty` on the hybrid it ends on, whose error the
+# record reports (`fit$laplace$correction$error`). A fit the fit-time
+# correction already moved is placed where it stands and not moved again
+# (`stay = TRUE`), as is any fit under `correctEstimate = FALSE`; one made
+# without the correction is climbed first, with the units its shift check
+# named (`check$carriers`, the default fit's warning) integrated whatever the
+# screen says, as the fit-time correction integrates them. `'hessian'` takes
+# the hybrid's own curvature at the end, the fit-time default's uncertainty
+# after a correction. Where the screen finds Laplace
+# exact at the estimate the hybrid is the fit's own objective there, and the
+# draws are taken on it; where the continuation could not draw (no Hessian
+# to certify its end, every unit too wide) the draws are taken on the fit's
+# own objective too, at its optimum where the climb moved the estimate
+# (`.ctLaplaceUncertaintyAtOptimum()`, as ctFit draws them), and a message
+# says so. The interval check (`control$check`, from `checks`) is made with
+# whichever draws are taken, on their density.
+.ctBackendUncertaintyQuadrature <- function(fit, uncertainty, finishsamples,
+  cores, control, verbose, shared) {
+  if (is.null(fit$model_spec$laplace)) {
+    stop("intoverpop = 'quadrature' applies to fits made with ",
+      "intoverpop = 'laplace'. The augmented route carries the random effects ",
+      "in the state and has no separate integral to take by quadrature; ",
+      "filter = 'particle' is its exact reference.", call. = FALSE)
+  }
+  already <- .ctLaplaceIsCorrected(fit)
+  if (already && isTRUE(control$correctEstimate)) {
+    stop("This fit was already corrected by quadrature when it was fitted ",
+      "(fit$laplace$correction), so moving the estimate again would correct ",
+      "it twice. Drop correctEstimate to redraw around the corrected ",
+      "estimate, or fit again without intoverpop = 'quadrature'.",
+      call. = FALSE)
+  }
+  stay <- already || identical(control$correctEstimate, FALSE)
+  est <- as.numeric(fit$estimate$raw)
+  # The climb's first metric and basis is the fit's curvature at its
+  # estimate; a fit left where it is needs none (`.ctLaplaceContinue()`
+  # forms the hybrid's own at the end).
+  if (!stay && is.null(.ctBackendStoredHessian(fit, est))) {
+    stop("intoverpop = 'quadrature' needs the fit's curvature at its ",
+      "estimate (its parameter covariance): the continuation's first metric, ",
+      "and the certification of where it ends. Run ctFitUncertainty(fit) ",
+      "first, or refit without optimcontrol$estonly.", call. = FALSE)
+  }
+  settings <- .ctLaplaceContinueDefaults
+  # The hybrid was asked for by name, so its rules are placed whatever the
+  # shift check would have said about the estimate.
+  settings$check <- FALSE
+  if (!is.null(control$nodes)) settings$nodes <- as.integer(control$nodes)
+  if (stay) settings$stay <- TRUE
+  if (is.null(finishsamples)) {
+    finishsamples <- if (!is.null(fit$estimate$rawposterior))
+      nrow(fit$estimate$rawposterior) else 1000L
+  }
+  iscontrol <- control[intersect(names(control), c(shared, "check"))]
+  draws <- .ctResolveDraws(uncertainty, "auto")
+  fit$uncertainty$settings <- list(method = uncertainty, draws = draws,
+    finishsamples = finishsamples, cores = cores, control = iscontrol)
+  corrected <- fit$laplace$correction
+  fit <- .ctLaplaceContinue(fit, cores = cores, verbose = verbose,
+    control = settings, method = uncertainty, force = corrected$check$carriers)
+  # A corrected fit stays corrected: its record is what says where the
+  # Laplace optimum was (`.ctLaplaceOptimum()`, which cross-validation scores
+  # at), and the run that only placed rules there for these draws would
+  # replace it with one that says the fit was never moved. What the draws were
+  # taken on is in `fit$uncertainty$details$laplace_correction`.
+  if (already) fit$laplace$correction <- corrected
+  drawn <- identical(fit$uncertainty$settings$method, uncertainty) &&
+    !is.null(fit$uncertainty$details$laplace_correction$error)
+  if (!drawn) {
+    status <- as.character(.ctJuliaOr(fit$laplace$correction$status, ""))[1L]
+    if (!identical(status, "exact")) {
+      message("The quadrature hybrid could not be drawn on (", status,
+        "); the draws are against the fit's own objective.")
+    }
+    fit <- .ctLaplaceUncertaintyAtOptimum(fit, function(fit)
+      .ctBackendUncertainty(fit, uncertainty = uncertainty, draws = draws,
+        finishsamples = finishsamples, cores = cores, control = iscontrol,
+        verbose = verbose))
+  }
+  fit$uncertainty$settings$control <- c(list(likelihood = "quadrature"), control)
+  fit
+}
+
+# One accuracy, in posterior standard deviations, and the escalation that
+# reaches it: `optimcontrol$accuracy` (`ctFitUncertainty`'s
+# `control$accuracy`). The uncertainty stage runs the method it was given
+# and reads that method's own account of its error; where the account is
+# short of the accuracy, or the method has none, the stage goes on to a
+# brief sampling run whose stopping rule is the accuracy itself
+# (`.ctAccuracyTargets()`), and the fit reports the method reached
+# (`fit$uncertainty$escalation`). Off (NULL) by default, so no fit changes.
+#
+# What each method knows of its error, in the units the escalation reads:
+#
+#   'checked', 'is'   the Stein check (`.ctSteinCheck()`): each parameter's
+#                     mean error in its own sds (`meanerror`), and its
+#                     spread against what the gradient implies (`sdratio`),
+#                     where the draws were kept; where the sampler fell back
+#                     to the normal (`importance_sampling$used` FALSE) the
+#                     error is unknown. The check is one-sided: a pass
+#                     certifies nothing about the tails, which is why the
+#                     escalation reads a spread off by more than the accuracy
+#                     too.
+#   'hessian' and the score methods    no account of their own: the accuracy
+#                     cannot be read, and the stage escalates.
+#   'sample'          the stop the accuracy sets, read by the run itself.
+#
+# The sampler's stop from an accuracy `eps` is the calibration of
+# review/APPROX-endpoint-2026-10-04.md: a reported 5% or 95% point's Monte
+# Carlo error is about `1.96 * 2.1 / sqrt(ESS)` posterior sds, the median's
+# `1.96 * 1.25 / sqrt(ESS)`, and chains whose means disagree by `d` sds give
+# an R-hat of about `sqrt(1 + d^2)`; measured on 3168 parameter-by-prefix
+# cases those claims are optimistic by a factor of 1.35 at 90 per cent
+# coverage, so the margin is in the targets. `eps = 0.5` is then a tail
+# effective size of about 125 and R-hat 1.07; `eps = 0.3`, 350 and 1.025;
+# the sampler's own defaults (200, 1.01) are about 0.2 at the centre and 0.4
+# in the tails.
+.ctAccuracyMargin <- 1.35
+
+#' @keywords internal
+.ctAccuracyTargets <- function(accuracy) {
+  eps <- as.numeric(accuracy)[1L]
+  if (!is.finite(eps) || eps <= 0) stop("accuracy must be a positive number ",
+    "of posterior standard deviations.", call. = FALSE)
+  list(minESS = ceiling((1.96 * 2.1 * .ctAccuracyMargin / eps)^2),
+    rhatTarget = sqrt(1 + (eps / .ctAccuracyMargin)^2))
+}
+
+# What a fit's uncertainty pass says of its own error, against `accuracy`:
+# `short` (reached it, or could not say), `error` (the largest per-parameter
+# mean error in sds the check found, NA where it has none), `spread` (the
+# largest departure of a spread ratio from one, NA likewise), and `reason`.
+#' @keywords internal
+.ctAccuracyShortfall <- function(fit, accuracy) {
+  eps <- as.numeric(accuracy)[1L]
+  method <- .ctJuliaOr(fit$uncertainty$settings$method, "hessian")
+  none <- function(reason) list(short = TRUE, error = NA_real_, spread = NA_real_,
+    reason = reason, method = method)
+  if (!is.null(fit$sample)) return(list(short = FALSE, error = NA_real_,
+    spread = NA_real_, reason = "sampled", method = "sample"))
+  if (!method %in% c("checked", "is")) return(none(paste0("'", method,
+    "' gives no account of its error")))
+  is <- fit$uncertainty$details$importance_sampling
+  if (is.null(is)) return(none("no draws were taken"))
+  if (!isTRUE(is$used)) return(none("the sampler fell back to the normal"))
+  stein <- is$stein
+  if (is.null(stein)) return(none("the draws were not checked against the gradient"))
+  error <- suppressWarnings(max(abs(stein$meanerror), na.rm = TRUE))
+  spread <- suppressWarnings(max(abs(log(stein$sdratio)), na.rm = TRUE))
+  if (!is.finite(error)) error <- NA_real_
+  if (!is.finite(spread)) spread <- NA_real_
+  short <- is.na(error) || error > eps ||
+    (!is.na(spread) && spread > log1p(eps))
+  list(short = short, error = error, spread = spread, method = method,
+    reason = if (!short) "within the accuracy" else if (is.na(error))
+      "the check could not read the error" else if (error > eps)
+      sprintf("a mean %.2g sds off against %.2g asked", error, eps) else
+      sprintf("a spread %.2g times the gradient's against %.2g asked",
+        exp(spread), 1 + eps))
+}
+
+# The escalation: the fit as its uncertainty pass left it, sampled on where
+# the pass was short of `accuracy`. Records what it read and what it did in
+# `fit$uncertainty$escalation`; the method the fit reports is the one
+# reached.
+#' @keywords internal
+.ctUncertaintyEscalate <- function(fit, accuracy, cores = 1L, verbose = 0,
+  control = list()) {
+  if (is.null(accuracy)) return(fit)
+  read <- .ctAccuracyShortfall(fit, accuracy)
+  targets <- .ctAccuracyTargets(accuracy)
+  record <- list(accuracy = as.numeric(accuracy)[1L], from = read$method,
+    error = read$error, spread = read$spread, reason = read$reason,
+    minESS = targets$minESS, rhatTarget = targets$rhatTarget,
+    sampled = FALSE)
+  if (!isTRUE(read$short)) {
+    fit$uncertainty$escalation <- record
+    return(fit)
+  }
+  if (.ctBackendReporting(verbose)) {
+    message("Uncertainty by '", read$method, "' is short of the accuracy asked (",
+      read$reason, "); sampling to it.")
+  }
+  sampled <- .ctBackendUncertaintySample(fit,
+    control = utils::modifyList(control, list(minESS = targets$minESS,
+      rhatTarget = targets$rhatTarget)),
+    cores = cores, verbose = verbose)
+  record$sampled <- TRUE
+  sampled$uncertainty$escalation <- record
+  sampled
+}
+
+# The null mass an uncertainty pass's intervals are to be read against, per raw
+# coordinate. `ctOptimCovFromHessian()` drops the directions without curvature,
+# and `nullMass` says how much of each coordinate went with them; the summary
+# reports a coordinate with most of its share there as having no width
+# (`.ctBackendNoWidthCoordinates()`), since its sd is the projection's
+# artefact. The routes that draw (`'checked'`, `'is'`) give the dropped
+# directions a width measured along the likelihood (`.ctOptimZeroWidth()`), and
+# their draws then spread along them, so for them only what is still held
+# (`heldMass`) has no width. Read from the diagnostics the pass kept, which move
+# to `proposal_covariance` once importance sampling replaced the covariance.
+.ctBackendHeldMass <- function(details) {
+  for (d in list(details$covariance, details$proposal_covariance)) {
+    if (!is.null(d$widened)) return(d$heldMass)
+  }
+  details$covariance$nullMass
+}

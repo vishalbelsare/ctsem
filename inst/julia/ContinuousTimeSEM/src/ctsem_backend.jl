@@ -1,0 +1,4323 @@
+"""
+    CTSEMOptimisable
+
+Anything `ctsem_optimize` can maximise: a prepared likelihood over a vector,
+answering `ctsem_evaluate(objective, x; gradient, gradient_method)`.
+
+There are three. `CTSEMObjective` is the marginal one, over the parameters
+alone with the latent states integrated out by the filter. `CTSEMJointObjective`
+(`state_sampling.jl`) is the state-explicit one, over the parameters *and* the
+innovations that build the states. `CTSEMLaplaceObjective` (`laplace.jl`) is
+the multilevel one, over the population parameters with each unit's random
+effects at their own mode. The optimiser needs to know nothing about the
+difference, and does not: it asks for a value and a gradient at a vector, and
+all three answer.
+
+The third answers that contract but does not yet go through
+`ctsem_optimize`: it has its own copy of the driver, which is why the
+convergence verdict below is shared rather than duplicated a fourth time. What
+remains to merge is the `fg!` closure -- whose only semantic difference is that
+a trial point where a unit's inner Newton did not converge is invalid, since
+the objective is not defined away from the mode -- the trace's extra `inner`
+column, the progress line's extra field, the call accounting, and five extra
+result fields.
+
+An abstract type rather than a `Union` because the second is defined several
+files later -- a signature naming it here could not be parsed.
+"""
+abstract type CTSEMOptimisable end
+
+"""
+    CTSEMCorBound(k, code, index, fixed)
+
+A full-rank population covariance whose correlations are bounded
+(`_ctsem_corbound`): its dimension `k`, its construction (`sdcovsqrt2cov`'s
+code: 0 the correlation square root, 2 `'z'`), and for each cell below the
+diagonal, in column-major order, the raw parameter it reads, or 0 and the value
+it is fixed at. Both routes read those coordinates untransformed, the Laplace
+level as `cor_index` and the augmented route as `RAWPOPVAR`'s cells, so one
+description serves both and the R side writes it (`.ctCorBoundSpec`).
+"""
+struct CTSEMCorBound
+    k::Int
+    code::Int
+    index::Vector{Int}
+    fixed::Vector{Float64}
+end
+
+"""
+    CTSEMObjective(params, subject_starts, timesteps, data)
+
+Prepared continuous-time likelihood for the R `ctsem` backend. `data` is
+stored as manifest variables by observation. Subject starts are prepared by R,
+which owns data ordering and predictor preprocessing. This type retains only
+the numerical per-subject EKF workspaces needed for repeated evaluation.
+"""
+mutable struct CTSEMObjective{P,O} <: CTSEMOptimisable
+    params::P
+    subject_objectives::O
+    # Lazily built reverse-mode workspace (see adjoint.jl). Cached here so the
+    # one-off model inspection it does -- discovering each transform's read set
+    # -- happens once per objective rather than once per gradient evaluation.
+    adjoint_ws::Any
+    # Prior specification, as index/scale pairs over the raw parameter vector.
+    # Deliberately *data*, not logic: which raw parameters carry which prior is
+    # ctsem semantics that the R side already knows (it reads `laplaceprior`,
+    # `tipredeffectscale`, `rawpopsdbase` and the parameter ordering out of
+    # `standata`), while all the engine needs to do is evaluate a normal
+    # log-density and its derivative. Keeping the decision on the R side also
+    # keeps one copy of it rather than three.
+    prior_index::Vector{Int}
+    prior_scale::Vector{Float64}
+    prior_weight::Float64
+    # The conditional-imputation term for sampled (missing) TI predictor
+    # values: one Gaussian per missing cell, `values[ti_missing_parameter[k]]
+    # ~ Normal(ti_missing_mu[k], ti_missing_sigma[k])`. `mu`/`sigma` are
+    # pre-computed once on the R side from complete cases (see
+    # SPEC-tipred-sampling.md, "Decisions") and held fixed here -- this is
+    # data, exactly like `prior_index`/`prior_scale` above, and for the same
+    # reason. Empty for every model with no missing TI predictor cells, which
+    # is what keeps `_ctsem_ti_missing_loglik` free for them. `subject` is the
+    # subject each cell belongs to, so that per-subject scores can give the
+    # cell's density to its own row (`_ctsem_prior_scores!`).
+    ti_missing_parameter::Vector{Int}
+    ti_missing_mu::Vector{Float64}
+    ti_missing_sigma::Vector{Float64}
+    ti_missing_subject::Vector{Int}
+    # Sampling weights, one per subject, or empty for none. Each multiplies its
+    # subject's term in the objective -- on this route the subject's log
+    # marginal likelihood, on the Laplace route its unit's -- and never the
+    # prior: the weighted pseudo-likelihood. Its gradient, Hessian and
+    # per-subject scores follow; the per-subject log likelihoods reported as
+    # contributions stay the data's own. A subject of weight zero is skipped.
+    subject_weights::Vector{Float64}
+    # The population correlation blocks whose multiple correlations are
+    # bounded (`_ctsem_corbound`), or empty for none.
+    corbound::Vector{CTSEMCorBound}
+    # Smoothing penalties (`_ctsem_penalty`): coefficients of a smooth term's
+    # penalised basis, each `Normal(0, 1 / sqrt(precision))`. Part of the model
+    # whenever a fit has a smooth, so no `prior_weight` scales them; the R side
+    # sets each term's precision (R/ctTIpredSmooth.R). Empty for none.
+    penalty_index::Vector{Int}
+    penalty_precision::Vector{Float64}
+    # The flat prior on the natural scale (`_ctsem_natural_prior`): for each
+    # raw parameter R names, log |f'(x)| of its own transform and that term's
+    # derivative, as expressions R writes symbolically
+    # (`.ctJuliaNaturalPrior()`). Set only on the objective an uncertainty
+    # method integrates over, never on one a fit optimises; empty for none.
+    jacobian_index::Vector{Int}
+    jacobian_value::Vector{CTSEMExpr}
+    jacobian_slope::Vector{CTSEMExpr}
+    # This objective as a sum over its subjects (`_ctsem_unit_sum`), for
+    # whatever lets a weighted few of them stand in for all; built when first
+    # asked for, `nothing` until then.
+    unit_sum::Any
+end
+
+# Without its unit-sum view, which is built when first asked for.
+CTSEMObjective(params, subject_objectives, adjoint_ws, prior_index, prior_scale,
+    prior_weight, ti_missing_parameter, ti_missing_mu, ti_missing_sigma,
+    ti_missing_subject, subject_weights, corbound::Vector{CTSEMCorBound},
+    penalty_index, penalty_precision, jacobian_index, jacobian_value, jacobian_slope) =
+    CTSEMObjective(params, subject_objectives, adjoint_ws, prior_index, prior_scale,
+        prior_weight, ti_missing_parameter, ti_missing_mu, ti_missing_sigma,
+        ti_missing_subject, subject_weights, corbound, penalty_index,
+        penalty_precision, jacobian_index, jacobian_value, jacobian_slope, nothing)
+
+CTSEMObjective(params, subject_objectives) =
+    CTSEMObjective(params, subject_objectives, nothing, Int[], Float64[], 1.0,
+        Int[], Float64[], Float64[], Int[], Float64[], CTSEMCorBound[], Int[],
+        Float64[])
+
+# Without the natural-scale prior.
+CTSEMObjective(params, subject_objectives, adjoint_ws, prior_index, prior_scale,
+    prior_weight, ti_missing_parameter, ti_missing_mu, ti_missing_sigma,
+    ti_missing_subject, subject_weights, corbound::Vector{CTSEMCorBound},
+    penalty_index, penalty_precision) =
+    CTSEMObjective(params, subject_objectives, adjoint_ws, prior_index, prior_scale,
+        prior_weight, ti_missing_parameter, ti_missing_mu, ti_missing_sigma,
+        ti_missing_subject, subject_weights, corbound, penalty_index,
+        penalty_precision, Int[], CTSEMExpr[], CTSEMExpr[])
+
+# Without smoothing penalties.
+CTSEMObjective(params, subject_objectives, adjoint_ws, prior_index, prior_scale,
+    prior_weight, ti_missing_parameter, ti_missing_mu, ti_missing_sigma,
+    ti_missing_subject, subject_weights, corbound::Vector{CTSEMCorBound}) =
+    CTSEMObjective(params, subject_objectives, adjoint_ws, prior_index, prior_scale,
+        prior_weight, ti_missing_parameter, ti_missing_mu, ti_missing_sigma,
+        ti_missing_subject, subject_weights, corbound, Int[], Float64[])
+
+# Without weights, as every objective was built before they existed.
+CTSEMObjective(params, subject_objectives, adjoint_ws, prior_index, prior_scale,
+    prior_weight, ti_missing_parameter, ti_missing_mu, ti_missing_sigma,
+    ti_missing_subject) =
+    CTSEMObjective(params, subject_objectives, adjoint_ws, prior_index, prior_scale,
+        prior_weight, ti_missing_parameter, ti_missing_mu, ti_missing_sigma,
+        ti_missing_subject, Float64[], CTSEMCorBound[])
+
+# Without bounded correlation blocks.
+CTSEMObjective(params, subject_objectives, adjoint_ws, prior_index, prior_scale,
+    prior_weight, ti_missing_parameter, ti_missing_mu, ti_missing_sigma,
+    ti_missing_subject, subject_weights) =
+    CTSEMObjective(params, subject_objectives, adjoint_ws, prior_index, prior_scale,
+        prior_weight, ti_missing_parameter, ti_missing_mu, ti_missing_sigma,
+        ti_missing_subject, subject_weights, CTSEMCorBound[])
+
+"""Subject `i`'s sampling weight: one when the objective has none."""
+@inline _ctsem_subject_weight(objective::CTSEMObjective, i::Integer) =
+    isempty(objective.subject_weights) ? 1.0 : @inbounds(objective.subject_weights[i])
+
+"""
+    _ctsem_log_prior(objective, values)
+
+The prior contribution to the log posterior, and its gradient: the
+parameters' prior, scaled by `prior_weight`, plus the imputation density of
+every sampled TI predictor cell (`_ctsem_ti_missing_loglik`), which no weight
+scales -- it is part of the model whenever a cell is sampled, `priors = FALSE`
+included, not a prior that a warm-up eases in. Every route reaches the cells
+through here: the plain adjoint, the Laplace objective, the samplers and SAEM.
+
+The parameter prior matches the generated Stan model's `model` block term for
+term: `normal_lpdf(x / scale | 0, 1)`, i.e. `-x^2/(2 scale^2) - log(2pi)/2`,
+summed over the parameters the R side flagged. Note the missing `-log(scale)`:
+Stan takes the density *of the scaled quantity*, so that Jacobian term is
+absent there too. It is a constant and so irrelevant to optimisation, but
+including it would put this engine's log probability a constant away from
+Stan's, which is exactly what the parity tests would then report as a
+mismatch.
+"""
+function _ctsem_log_prior(objective::CTSEMObjective, values::AbstractVector{T}) where {T}
+    cells = _ctsem_ti_missing_loglik(objective, values) +
+        _ctsem_corbound(objective, values) + _ctsem_penalty(objective, values) +
+        _ctsem_natural_prior(objective, values)
+    isempty(objective.prior_index) && return cells
+    total = zero(T)
+    weight = objective.prior_weight
+    @inbounds for k in eachindex(objective.prior_index)
+        scaled = values[objective.prior_index[k]] / objective.prior_scale[k]
+        total += -0.5 * scaled * scaled - 0.5 * log(2 * pi)
+    end
+    return weight * total + cells
+end
+
+"""
+    _ctsem_natural_prior(objective, values)
+
+A flat prior on each named raw parameter's natural scale, as a density over
+the raw parameters: `sum log |f_k'(x_k)|`, `f_k` the parameter's own transform.
+Where a transform saturates towards a bound -- a standard deviation towards
+zero, a drift towards zero -- the term falls off with it, so a likelihood that
+levels off at the bound leaves a proper posterior; where it runs off without
+bound the term is constant, as flat as before. No `prior_weight` scales it: it
+is the density's own change of variable, set only on objectives that are
+integrated over, never optimised.
+"""
+function _ctsem_natural_prior(objective::CTSEMObjective, values::AbstractVector{T}) where {T}
+    total = zero(T)
+    @inbounds for k in eachindex(objective.jacobian_value)
+        total += objective.jacobian_value[k](values)
+    end
+    return total
+end
+
+"""The prior's precision on each raw parameter, as a vector (zero where a
+parameter has no prior): minus the Hessian of `_ctsem_log_prior`. The
+natural-scale prior's curvature is not in it: no objective that carries that
+prior is optimised, and the uncertainty methods add its curvature themselves."""
+function _ctsem_prior_precision(objective::CTSEMObjective, npar::Integer)
+    prec = zeros(npar)
+    for j in eachindex(objective.prior_index)
+        prec[objective.prior_index[j]] += objective.prior_weight / objective.prior_scale[j]^2
+    end
+    for k in eachindex(objective.penalty_index)
+        prec[objective.penalty_index[k]] += objective.penalty_precision[k]
+    end
+    for k in eachindex(objective.ti_missing_parameter)
+        prec[objective.ti_missing_parameter[k]] += 1 / objective.ti_missing_sigma[k]^2
+    end
+    return prec
+end
+
+"""Accumulate the prior's gradient contribution into `gradient`: the
+parameter prior at `weight` times its own, and, when `cells`, the sampled TI
+predictor cells' imputation density whole. Per-row scores pass `cells = false`
+and give each cell to its own row instead (`_ctsem_prior_scores!`)."""
+function _ctsem_log_prior_gradient!(gradient::AbstractVector{T},
+    objective::CTSEMObjective, values::AbstractVector{T}, weight::Real=1.0,
+    cells::Bool=true) where {T}
+    cells && _ctsem_ti_missing_loglik_gradient!(gradient, objective, values)
+    cells && _ctsem_corbound_gradient!(gradient, objective, values)
+    # The natural-scale prior in `weight`'s share, like the parameter prior.
+    @inbounds for k in eachindex(objective.jacobian_index)
+        gradient[objective.jacobian_index[k]] += weight * objective.jacobian_slope[k](values)
+    end
+    # The smoothing penalty in `weight`'s share, as the parameter prior below
+    # but with no `prior_weight`: it is part of the model, not eased in.
+    @inbounds for k in eachindex(objective.penalty_index)
+        idx = objective.penalty_index[k]
+        gradient[idx] -= weight * objective.penalty_precision[k] * values[idx]
+    end
+    isempty(objective.prior_index) && return gradient
+    scale_weight = objective.prior_weight * weight
+    @inbounds for k in eachindex(objective.prior_index)
+        idx = objective.prior_index[k]
+        scale = objective.prior_scale[k]
+        gradient[idx] -= scale_weight * values[idx] / (scale * scale)
+    end
+    return gradient
+end
+
+"""
+    _ctsem_prior_scores!(scores, objective, values, row=Base.OneTo(nsubjects))
+
+Add the prior's gradient to per-row scores, so that the rows still sum to the
+full posterior gradient: the parameter prior in equal shares, which is what
+the R side's `scorecalc()` does for the Stan backend (its `priormod` of
+`1/nsubjects`), and each sampled TI predictor cell's imputation density whole,
+to the row of the subject it belongs to -- `row[subject]`, a unit under the
+Laplace layer.
+"""
+function _ctsem_prior_scores!(scores::AbstractMatrix, objective::CTSEMObjective,
+    values::AbstractVector, row::AbstractVector{<:Integer}=Base.OneTo(size(scores, 1)))
+    nrows = size(scores, 1)
+    nrows > 0 || return scores
+    if !isempty(objective.prior_index) || !isempty(objective.penalty_index) ||
+            !isempty(objective.jacobian_index)
+        share = 1 / nrows
+        @inbounds for r in 1:nrows
+            _ctsem_log_prior_gradient!(view(scores, r, :), objective, values, share, false)
+        end
+    end
+    if !isempty(objective.corbound)
+        wall = _ctsem_corbound_gradient!(zeros(eltype(scores), size(scores, 2)),
+            objective, values)
+        if any(!iszero, wall)
+            wall ./= nrows
+            @inbounds for r in 1:nrows
+                view(scores, r, :) .+= wall
+            end
+        end
+    end
+    @inbounds for k in eachindex(objective.ti_missing_parameter)
+        idx = objective.ti_missing_parameter[k]
+        sigma = objective.ti_missing_sigma[k]
+        scores[row[objective.ti_missing_subject[k]], idx] -=
+            (values[idx] - objective.ti_missing_mu[k]) / (sigma * sigma)
+    end
+    return scores
+end
+
+"""
+    _ctsem_penalty(objective, values)
+
+The smoothing penalties' log density: each penalised coefficient
+`Normal(0, 1 / sqrt(precision))`, normalising constant included, so the log
+posterior a fit with a smooth reports carries the smooth's prior whole. Its
+gradient is in `_ctsem_log_prior_gradient!`.
+"""
+function _ctsem_penalty(objective::CTSEMObjective, values::AbstractVector{T}) where {T}
+    total = zero(T)
+    @inbounds for k in eachindex(objective.penalty_index)
+        lambda = objective.penalty_precision[k]
+        x = values[objective.penalty_index[k]]
+        total += -0.5 * lambda * x * x + 0.5 * log(lambda) - 0.5 * log(2 * pi)
+    end
+    return total
+end
+
+"""
+    _ctsem_ti_missing_loglik(objective, values)
+
+The conditional-imputation contribution to the log posterior, which
+`_ctsem_log_prior` includes: a proper Gaussian log-density (the `-log(sigma)`
+term is *not* dropped, unlike the parameter prior -- these are genuine data
+values on their own scale, not a standardised quantity, and the pre-computed
+`sigma` differs per predictor, so the normalising constant is part of the
+answer here).
+
+`_ctsem_ti_missing_loglik_gradient!`, right below, is its analytic derivative,
+which `_ctsem_log_prior_gradient!` adds. Empty and free for every model with no
+missing TI predictor cells.
+"""
+function _ctsem_ti_missing_loglik(objective::CTSEMObjective, values::AbstractVector{T}) where {T}
+    isempty(objective.ti_missing_parameter) && return zero(T)
+    total = zero(T)
+    @inbounds for k in eachindex(objective.ti_missing_parameter)
+        idx = objective.ti_missing_parameter[k]
+        sigma = objective.ti_missing_sigma[k]
+        z = (values[idx] - objective.ti_missing_mu[k]) / sigma
+        total += -0.5 * z * z - log(sigma) - 0.5 * log(2 * pi)
+    end
+    return total
+end
+
+"""
+    _ctsem_ti_missing_loglik_gradient!(gradient, objective, values)
+
+Accumulate `_ctsem_ti_missing_loglik`'s gradient contribution into `gradient`,
+analytically: `d/d(values[idx]) [-0.5 z^2 - log(sigma) - 0.5 log(2 pi)]` with
+`z = (values[idx] - mu) / sigma` is `-z / sigma`, i.e.
+`-(values[idx] - mu) / sigma^2`. Each sampled cell gets its own raw-parameter
+index (`.ctJuliaBackend.R` reserves one past every other block), so no two
+`k` ever write the same `idx` -- but `+=` regardless, matching
+`_ctsem_log_prior_gradient!`'s style, since summing is always safe and never
+assumes that non-collision.
+
+Mirrors `_ctsem_log_prior_gradient!` exactly: a closed-form function of the
+raw parameters alone, so it is added once per evaluation rather than folded
+into any per-subject pass. Empty and free for every model with no missing TI
+predictor cells.
+"""
+function _ctsem_ti_missing_loglik_gradient!(gradient::AbstractVector{T},
+    objective::CTSEMObjective, values::AbstractVector{T}) where {T}
+    isempty(objective.ti_missing_parameter) && return gradient
+    @inbounds for k in eachindex(objective.ti_missing_parameter)
+        idx = objective.ti_missing_parameter[k]
+        sigma = objective.ti_missing_sigma[k]
+        gradient[idx] -= (values[idx] - objective.ti_missing_mu[k]) / (sigma * sigma)
+    end
+    return gradient
+end
+
+################################################################################
+# The bound on random-effect correlations
+################################################################################
+
+"""
+The largest multiple correlation a random effect may have with the others at
+its level, and the steepness of the wall that holds it there.
+
+Unpenalised maximum likelihood often puts a random-effects covariance on the
+singular boundary: an effect with no variance of its own, which the others
+predict exactly. The sd-and-correlation constructions reach that boundary only
+as their coordinates go to infinity, so a fit walks along a ridge whose height
+barely changes, stops wherever its stopping rule says, and the curvature of
+every correlation goes with it. A correlation matrix may approach singularity
+without any one correlation approaching one -- on the ?ctFit model the
+maximum-likelihood covariance had rank 2 of 4 with no correlation above 0.96 --
+so the bound is on what goes singular: each effect's multiple correlation with
+the others, `1 - 1/((R^-1)_jj R_jj)`. For two effects it is exactly the
+correlation. It also keeps the smallest eigenvalue of `R` above
+`(1 - bound^2) / k`, so nothing downstream factors a near-singular matrix.
+
+The wall is `-steepness * excess^3` past `log((R^-1)_jj R_jj) = -log(1 -
+bound^2)`, zero inside: a fit stops on it as at an ordinary point, with
+curvature, rather than on a flat extension (the clamp that preceded it left
+the coordinate flat past its cap). Cubic, not quadratic, so that its curvature
+too starts from zero: a fit stops where the wall balances a weak push, barely
+past the bound, and a quadratic wall's jump in curvature there made the Laplace
+route's differenced Hessian mix columns that saw it with columns that did not
+-- a negative eigenvalue at a maximum the exact Hessian resolved, on a
+simulated boundary model. It is part of the parameter space, not a
+prior: `prior_weight` does not scale it, it is in the objective whatever
+`priors` says, and every route reads it here. It has no curvature inside the
+bound, so `_ctsem_prior_precision` leaves it out.
+"""
+const _CTSEM_CORBOUND = 0.999
+const _CTSEM_CORBOUND_STEEPNESS = 100.0
+
+"""A block's raw lower triangle with unit scales."""
+function _ctsem_corbound_base(block::CTSEMCorBound, values::AbstractVector{T}) where {T}
+    k = block.k
+    base = zeros(T, k, k)
+    @inbounds for j in 1:k
+        base[j, j] = one(T)
+    end
+    c = 0
+    @inbounds for j in 1:k, i in (j + 1):k
+        c += 1
+        idx = block.index[c]
+        base[i, j] = idx == 0 ? T(block.fixed[c]) : values[idx]
+    end
+    return base
+end
+
+"""A block's raw lower triangle with unit scales, and the correlation matrix
+its own construction makes of it."""
+function _ctsem_corbound_matrix(block::CTSEMCorBound, values::AbstractVector{T}) where {T}
+    k = block.k
+    base = _ctsem_corbound_base(block, values)
+    buffer = _make_square_buffer(T, k)
+    _sdcovsqrt2cov_uncached!(buffer, base, block.code, k)
+    R = Matrix{T}(undef, k, k)
+    @inbounds for j in 1:k, i in 1:k
+        R[i, j] = buffer.out[i, j]
+    end
+    return base, R
+end
+
+"""`R`'s inverse through its Cholesky factor, or `nothing` where `R` is not
+positive definite. Hand loops: `k` is small and this is generic in the
+element type. For the correlation square root only: `'z'`'s `R` rounds to
+singular far out (`_ctsem_corbound_zterms`)."""
+function _ctsem_corbound_inverse(R::AbstractMatrix{T}) where {T}
+    k = size(R, 1)
+    U = copy(R)
+    _ctsem_cholesky!(U, k) || return nothing
+    # R = U'U with U upper triangular; its inverse by back substitution.
+    W = zeros(T, k, k)
+    @inbounds for j in 1:k
+        W[j, j] = inv(U[j, j])
+        for i in (j - 1):-1:1
+            s = zero(T)
+            for p in (i + 1):j
+                s += U[i, p] * W[p, j]
+            end
+            W[i, j] = -s / U[i, i]
+        end
+    end
+    M = zeros(T, k, k)
+    @inbounds for b in 1:k, a in 1:k
+        s = zero(T)
+        for p in max(a, b):k
+            s += W[a, p] * W[b, p]
+        end
+        M[a, b] = s
+    end
+    return M
+end
+
+@inline _ctsem_corbound_limit() = -log1p(-_CTSEM_CORBOUND^2)
+
+"""
+    _ctsem_corbound_zterms(block, values)
+
+`log((R^-1)_jj R_jj)` for each effect of a `'z'` block (code 2), and what its
+gradient needs: `(logs, Ap, An, Yp, Yn)`. There `R` is `exp(H)` normalised to a
+unit diagonal, `H` hollow from the coordinates, so `R^-1` is `exp(-H)`
+normalised back, and the log is `log exp(H)_jj + log exp(-H)_jj`, each a sum
+of positive terms. Nothing is inverted, and it is finite however far out the
+coordinates are. Through `R`'s Cholesky factor, `R` rounded to singular once a
+coordinate passed about 19 (`tanh` is 1 to the last bit) and the wall, with
+the objective, came back NaN at a point the filter evaluates. Both
+exponentials are shifted as the construction's are (`_fill_hollow!`: the same
+row-sum bound serves `-H`), so `Ap = H - cI`, `An = -H - cI`, and the shifts
+are added back.
+"""
+function _ctsem_corbound_zterms(block::CTSEMCorBound, values::AbstractVector{T}) where {T}
+    k = block.k
+    base = _ctsem_corbound_base(block, values)
+    Ap = Matrix{T}(undef, k, k)
+    _fill_hollow!(Ap, base, k, T)
+    An = Matrix{T}(undef, k, k)
+    @inbounds for j in 1:k, i in 1:k
+        An[i, j] = i == j ? Ap[i, j] : -Ap[i, j]
+    end
+    shift = -Ap[1, 1]
+    sc = _expm_cov_scratch(T, k)
+    Yp = Matrix{T}(undef, k, k)
+    Yn = Matrix{T}(undef, k, k)
+    my_exp!(Yp, Ap, sc.W1, sc.eb, k)
+    my_exp!(Yn, An, sc.W1, sc.eb, k)
+    logs = Vector{T}(undef, k)
+    @inbounds for j in 1:k
+        logs[j] = log(Yp[j, j]) + log(Yn[j, j]) + 2 * shift
+    end
+    return logs, Ap, An, Yp, Yn
+end
+
+"""Each effect's `log((R^-1)_jj R_jj)` in `block`, or `nothing` where its `R`
+does not factor."""
+function _ctsem_corbound_logs(block::CTSEMCorBound, values::AbstractVector{T}) where {T}
+    block.code == 2 && return first(_ctsem_corbound_zterms(block, values))
+    _, R = _ctsem_corbound_matrix(block, values)
+    M = _ctsem_corbound_inverse(R)
+    M === nothing && return nothing
+    return T[log(R[j, j]) + log(M[j, j]) for j in 1:block.k]
+end
+
+"""
+    _ctsem_corbound(objective, values)
+
+The wall on every bounded block, summed: `_CTSEM_CORBOUND`'s docstring. Zero
+for every model with no full-rank block of two or more random effects.
+"""
+function _ctsem_corbound(objective::CTSEMObjective, values::AbstractVector{T}) where {T}
+    isempty(objective.corbound) && return zero(T)
+    limit = _ctsem_corbound_limit()
+    kappa = _CTSEM_CORBOUND_STEEPNESS
+    total = zero(T)
+    for block in objective.corbound
+        logs = _ctsem_corbound_logs(block, values)
+        logs === nothing && return _ctsem_nan(T)
+        @inbounds for j in 1:block.k
+            excess = logs[j] - limit
+            excess > 0 && (total -= kappa * excess * excess * excess)
+        end
+    end
+    return total
+end
+
+"""
+    _ctsem_corbound_gradient!(gradient, objective, values)
+
+Add `_ctsem_corbound`'s gradient. On a `'z'` block, through
+`log exp(H)_jj + log exp(-H)_jj` (`_ctsem_corbound_zterms`): the cotangent of
+`H` is `w (L(H)[e_j e_j'] / exp(H)_jj - L(-H)[e_j e_j'] / exp(-H)_jj)`, `L`
+the exponential's Frechet derivative, self-adjoint at a symmetric matrix and
+blind to the shift. Otherwise the cotangent of `R` is the wall's derivative
+through `log R_jj + log (R^-1)_jj`, `e_j e_j' / R_jj - m_j m_j' / (R^-1)_jj`
+per effect past the bound, and the construction's own pullback
+(`_sdcovsqrt2cov_pullback!`) carries it to the coordinates.
+"""
+function _ctsem_corbound_gradient!(gradient::AbstractVector, objective::CTSEMObjective,
+    values::AbstractVector{T}) where {T}
+    isempty(objective.corbound) && return gradient
+    limit = _ctsem_corbound_limit()
+    kappa = _CTSEM_CORBOUND_STEEPNESS
+    for block in objective.corbound
+        k = block.k
+        if block.code == 2
+            _ctsem_corbound_zgradient!(gradient, block, values, limit, kappa)
+            continue
+        end
+        base, R = _ctsem_corbound_matrix(block, values)
+        M = _ctsem_corbound_inverse(R)
+        if M === nothing
+            for idx in block.index
+                idx == 0 || (gradient[idx] = _ctsem_nan(T))
+            end
+            continue
+        end
+        Rbar = zeros(T, k, k)
+        past = false
+        @inbounds for j in 1:k
+            excess = log(R[j, j]) + log(M[j, j]) - limit
+            excess > 0 || continue
+            past = true
+            w = -3 * kappa * excess * excess
+            Rbar[j, j] += w / R[j, j]
+            for b in 1:k, a in 1:k
+                Rbar[a, b] -= w * M[a, j] * M[j, b] / M[j, j]
+            end
+        end
+        past || continue
+        basebar = zeros(T, k, k)
+        _sdcovsqrt2cov_pullback!(basebar, base, Rbar, k; covmatcode=block.code)
+        c = 0
+        @inbounds for j in 1:k, i in (j + 1):k
+            c += 1
+            idx = block.index[c]
+            idx == 0 || (gradient[idx] += basebar[i, j])
+        end
+    end
+    return gradient
+end
+
+"""A `'z'` block's share of `_ctsem_corbound_gradient!`."""
+function _ctsem_corbound_zgradient!(gradient::AbstractVector, block::CTSEMCorBound,
+    values::AbstractVector{T}, limit, kappa) where {T}
+    k = block.k
+    logs, Ap, An, Yp, Yn = _ctsem_corbound_zterms(block, values)
+    Ep = zeros(T, k, k)
+    En = zeros(T, k, k)
+    past = false
+    @inbounds for j in 1:k
+        excess = logs[j] - limit
+        excess > 0 || continue
+        past = true
+        w = -3 * kappa * excess * excess
+        Ep[j, j] = w / Yp[j, j]
+        En[j, j] = -w / Yn[j, j]
+    end
+    past || return gradient
+    sc = _expm_cov_scratch(T, k)
+    Lp = Matrix{T}(undef, k, k)
+    Ln = Matrix{T}(undef, k, k)
+    Y = Matrix{T}(undef, k, k)
+    my_exp_frechet!(Y, Lp, Ap, Ep, sc.fb)
+    my_exp_frechet!(Y, Ln, An, En, sc.fb)
+    c = 0
+    @inbounds for j in 1:k, i in (j + 1):k
+        c += 1
+        idx = block.index[c]
+        idx == 0 || (gradient[idx] += Lp[i, j] + Lp[j, i] + Ln[i, j] + Ln[j, i])
+    end
+    return gradient
+end
+
+export CTSEMObjective, ctsem_objective, ctsem_evaluate, ctsem_optimize
+
+"""The substep policy for one subject's rows `r`: a rule is shared, a mesh is sliced."""
+_ctsem_subject_substeps(rule::Real, r) = rule
+_ctsem_subject_substeps(mesh::AbstractVector, r) = Int[Int(m) for m in view(mesh, r)]
+
+"""One subject's rows `r` of an iteration plan (`ctsem_relin_plan`); no plan
+stays none."""
+_ctsem_subject_relin(plan::AbstractVector, r) =
+    isempty(plan) ? Int[] : Int[Int(k) for k in view(plan, r)]
+
+function _ctsem_row_loglikelihood(objective::CTSEMObjective, values::AbstractVector)
+    contributions = Vector{eltype(values)}()
+    for subject_objective in objective.subject_objectives
+        previous = zero(eltype(values))
+        nrows = size(subject_objective.data, 2)
+        for row in 1:nrows
+            prefix = ContinuousEKFObjective(objective.params,
+                Matrix(subject_objective.data[:, 1:row]),
+                collect(subject_objective.timesteps[1:row]);
+                tdpreds=Matrix(subject_objective.tdpreds[:, 1:row]),
+                tipreds=subject_objective.tipreds, subject=subject_objective.subject,
+                max_timestep=_ctsem_subject_substeps(subject_objective.max_timestep, 1:row),
+                relin_steps=_ctsem_subject_relin(subject_objective.relin, 1:row))
+            current = prefix(values)
+            push!(contributions, current - previous)
+            previous = current
+        end
+    end
+    contributions
+end
+
+function _ctsem_subject_ranges(subject_starts::AbstractVector, timesteps::AbstractVector,
+    data::AbstractMatrix)
+    n = length(timesteps)
+    n > 0 || throw(ArgumentError("data must contain at least one observation"))
+    n == size(data, 2) || throw(DimensionMismatch("timesteps length must equal data columns"))
+    starts = Int.(subject_starts)
+    !isempty(starts) || throw(ArgumentError("subject_starts must contain the first observation"))
+    starts[1] == 1 || throw(ArgumentError("subject_starts must begin at one"))
+    all((1 .<= starts) .& (starts .<= n)) || throw(ArgumentError("subject_starts are outside the observation range"))
+    all(diff(starts) .> 0) || throw(ArgumentError("subject_starts must be strictly increasing"))
+    stops = vcat(starts[2:end] .- 1, n)
+    out = UnitRange{Int}[start:stop for (start, stop) in zip(starts, stops)]
+    for r in out
+        _validate_continuous_ekf_inputs(collect(view(timesteps, r)), Matrix(view(data, :, r)))
+    end
+    out
+end
+
+function CTSEMObjective(params::EKFParameters, subject_starts::AbstractVector,
+    timesteps::AbstractVector, data::AbstractMatrix,
+    tdpred_data::AbstractMatrix=zeros(eltype(data), 0, size(data, 2)),
+    tipred_data::AbstractMatrix=zeros(eltype(data), length(subject_starts), 0),
+    max_timestep=Inf; prior_index=Int[], prior_scale=Float64[],
+    prior_weight::Real=1.0,
+    # One entry per missing/sampled TI predictor cell, parallel arrays, empty
+    # for every model with none (the overwhelmingly common case). `subject`
+    # and `predictor` are consumed only here, to sort each cell into its
+    # subject's `TIMissingRecipe`; `parameter`/`mu`/`sigma`/`subject` are also
+    # kept flat on the returned objective for `_ctsem_ti_missing_loglik`.
+    ti_missing_subject=Int[], ti_missing_predictor=Int[], ti_missing_parameter=Int[],
+    ti_missing_mu=Float64[], ti_missing_sigma=Float64[], subject_weights=Float64[],
+    corbound_k=Int[], corbound_code=Int[], corbound_index=Int[], corbound_fixed=Float64[],
+    penalty_index=Int[], penalty_precision=Float64[], jacobian_index=Int[],
+    jacobian_value=String[], jacobian_slope=String[], relin_steps=Int[])
+    length(penalty_index) == length(penalty_precision) ||
+        throw(DimensionMismatch("penalty_index and penalty_precision differ in length"))
+    all(p -> isfinite(p) && p > 0, penalty_precision) ||
+        throw(ArgumentError("penalty_precision must be positive and finite"))
+    ranges = _ctsem_subject_ranges(subject_starts, timesteps, data)
+    (isempty(subject_weights) || length(subject_weights) == length(ranges)) ||
+        throw(DimensionMismatch("subject_weights needs one weight per subject"))
+    all(w -> isfinite(w) && w >= 0, subject_weights) ||
+        throw(ArgumentError("subject_weights must be finite and non-negative"))
+    all(s -> 1 <= s <= length(ranges), ti_missing_subject) ||
+        throw(ArgumentError("ti_missing_subject must name subjects of this objective"))
+    # A mesh (one substep count per row of the whole dataset) is sliced per
+    # subject exactly as `timesteps` is; a `maxtimestep` rule is shared.
+    max_timestep isa AbstractVector && length(max_timestep) != length(timesteps) &&
+        throw(DimensionMismatch("a substep mesh needs one entry per row of the data"))
+    # An iteration plan likewise (`ctsem_relin_plan`).
+    (isempty(relin_steps) || length(relin_steps) == length(timesteps)) ||
+        throw(DimensionMismatch("an iteration plan needs one entry per row of the data"))
+    size(tdpred_data, 2) == size(data, 2) || throw(DimensionMismatch("TD predictor columns must match observations"))
+    size(tipred_data, 1) == length(ranges) || throw(DimensionMismatch("TI predictor rows must match subjects"))
+    nmissing = length(ti_missing_subject)
+    (length(ti_missing_predictor) == nmissing && length(ti_missing_parameter) == nmissing &&
+        length(ti_missing_mu) == nmissing && length(ti_missing_sigma) == nmissing) ||
+        throw(DimensionMismatch("ti_missing_* vectors must all have equal length"))
+    # Group missing cells by subject once, rather than scanning all of them
+    # for every subject -- irrelevant at fit sizes seen so far, but O(n) not
+    # O(n^2) costs nothing to keep that way.
+    by_subject = Dict{Int,Vector{Int}}()
+    for k in 1:nmissing
+        push!(get!(() -> Int[], by_subject, Int(ti_missing_subject[k])), k)
+    end
+    # Copy each subject once. This avoids R proxy/view lifetime issues and makes
+    # the objective safe to retain in a Julia session.
+    #
+    # A plain comprehension, not `Any[...]`. Every per-subject call in the
+    # package goes through this vector, and an `Any` element type makes each of
+    # them a dynamic dispatch -- which boxes the log likelihood coming back and
+    # the `EKFParameters` going in, on every subject of every evaluation. The
+    # comprehension narrows to the concrete subject type whenever the subjects
+    # agree, which is every model whose subjects share a substep rule and none
+    # of whose TI predictor cells are sampled; where they do not agree it
+    # widens on its own and nothing is worse than it was.
+    objects = [
+        ContinuousEKFObjective(params, Matrix(view(data, :, r)), collect(view(timesteps, r));
+            tdpreds=Matrix(view(tdpred_data, :, r)),
+            # A subject absent from `by_subject` (i.e. every model with no
+            # missing TI predictor cells) takes exactly the path it always
+            # has: a plain `Vector{Float64}`, nothing wrapped around it.
+            tipreds=if haskey(by_subject, i)
+                ks = by_subject[i]
+                TIMissingRecipe(vec(tipred_data[i, :]), Int.(ti_missing_predictor[ks]),
+                    Int.(ti_missing_parameter[ks]))
+            else
+                vec(tipred_data[i, :])
+            end,
+            subject=i, max_timestep=_ctsem_subject_substeps(max_timestep, r),
+            relin_steps=_ctsem_subject_relin(relin_steps, r))
+        for (i, r) in enumerate(ranges)
+    ]
+    length(prior_index) == length(prior_scale) ||
+        throw(DimensionMismatch("prior index and scale vectors must have equal length"))
+    return CTSEMObjective(params, objects, nothing, Int.(prior_index),
+        Float64.(prior_scale), Float64(prior_weight), Int.(ti_missing_parameter),
+        Float64.(ti_missing_mu), Float64.(ti_missing_sigma), Int.(ti_missing_subject),
+        Float64.(subject_weights),
+        _ctsem_corbound_blocks(corbound_k, corbound_code, corbound_index, corbound_fixed),
+        Int.(penalty_index), Float64.(penalty_precision), Int.(jacobian_index),
+        _ctsem_natural_exprs(jacobian_value), _ctsem_natural_exprs(jacobian_slope))
+end
+
+"""The natural-scale prior's expressions, from the text R writes: each in the
+vocabulary of `CTSEMExpr`, or an error naming it."""
+function _ctsem_natural_exprs(texts)
+    out = CTSEMExpr[]
+    for text in texts
+        e = _ctsem_regular_expr(String(text))
+        e === nothing && throw(ArgumentError(
+            "a natural-scale prior term is outside the expression vocabulary: $(text)"))
+        push!(out, e)
+    end
+    return out
+end
+
+"""The bounded blocks from flat vectors, as the R side sends them: a size and
+a construction per block, and the blocks' lower-triangle cells concatenated."""
+function _ctsem_corbound_blocks(ks, codes, index, fixed)
+    length(ks) == length(codes) && length(index) == length(fixed) ||
+        throw(DimensionMismatch("corbound_* vectors do not describe whole blocks"))
+    blocks = CTSEMCorBound[]
+    at = 0
+    for b in eachindex(ks)
+        k = Int(ks[b])
+        n = k * (k - 1) ÷ 2
+        at + n <= length(index) ||
+            throw(DimensionMismatch("corbound_index is shorter than its blocks"))
+        push!(blocks, CTSEMCorBound(k, Int(codes[b]), Int.(index[(at + 1):(at + n)]),
+            Float64.(fixed[(at + 1):(at + n)])))
+        at += n
+    end
+    at == length(index) ||
+        throw(DimensionMismatch("corbound_index is longer than its blocks"))
+    return blocks
+end
+
+ctsem_objective(params::EKFParameters, subject_starts, timesteps, data,
+    tdpred_data=zeros(eltype(data), 0, size(data, 2)),
+    tipred_data=zeros(eltype(data), length(subject_starts), 0), max_timestep=Inf;
+    prior_index=Int[], prior_scale=Float64[], prior_weight::Real=1.0,
+    ti_missing_subject=Int[], ti_missing_predictor=Int[], ti_missing_parameter=Int[],
+    ti_missing_mu=Float64[], ti_missing_sigma=Float64[], subject_weights=Float64[],
+    corbound_k=Int[], corbound_code=Int[], corbound_index=Int[], corbound_fixed=Float64[],
+    penalty_index=Int[], penalty_precision=Float64[], jacobian_index=Int[],
+    jacobian_value=String[], jacobian_slope=String[], relin_steps=Int[]) =
+    CTSEMObjective(params, subject_starts, timesteps, data, tdpred_data, tipred_data,
+        max_timestep; prior_index=prior_index, prior_scale=prior_scale,
+        prior_weight=prior_weight, ti_missing_subject=ti_missing_subject,
+        ti_missing_predictor=ti_missing_predictor, ti_missing_parameter=ti_missing_parameter,
+        ti_missing_mu=ti_missing_mu, ti_missing_sigma=ti_missing_sigma,
+        subject_weights=subject_weights, corbound_k=corbound_k, corbound_code=corbound_code,
+        corbound_index=corbound_index, corbound_fixed=corbound_fixed,
+        penalty_index=penalty_index, penalty_precision=penalty_precision,
+        jacobian_index=jacobian_index, jacobian_value=jacobian_value,
+        jacobian_slope=jacobian_slope, relin_steps=relin_steps)
+
+################################################################################
+# Threading
+################################################################################
+#
+# The subject loop is the only parallelism here, and it is the natural one: the
+# log-likelihood is a sum over subjects, each subject's `ContinuousEKFObjective`
+# already owns its own primal and dual workspaces, and nothing is shared between
+# them but the read-only `EKFParameters`.
+#
+# Work is split into contiguous *blocks* of subjects that a few tasks pull from
+# a shared counter (`_ctsem_pull_blocks`), each task owning the workspace it
+# uses, rather than indexing workspaces by `threadid()`. That distinction
+# matters: a task can migrate between threads at any yield point, so
+# `threadid()` is not stable for the duration of a task and indexing mutable
+# scratch by it is a data race waiting to happen.
+#
+# Threading changes the summation order, so a threaded result differs from a
+# serial one at the last bits. `test_threading.jl` asserts agreement to 1e-12
+# rather than bitwise, which is the correct gate for a floating-point reduction.
+
+"""Cap on the number of chunks; 0 means "use `Threads.nthreads()`"."""
+const _CTSEM_MAX_CHUNKS = Ref(0)
+
+"""
+OpenBLAS's thread count when the session started, which LinearAlgebra sets to
+half the machine's hardware threads whatever `Threads.nthreads()` is. Read in
+`__init__`; 0 until then.
+"""
+const _CTSEM_BLAS_START = Ref(0)
+
+_ctsem_blas_start() = _CTSEM_BLAS_START[] > 0 ? _CTSEM_BLAS_START[] :
+    LinearAlgebra.BLAS.get_num_threads()
+
+export ctsem_set_max_chunks!, ctsem_max_chunks
+"""
+    ctsem_set_max_chunks!(n)
+
+Limit how many chunks the subject loop is split into. `0` (the default) means
+use `Threads.nthreads()`, i.e. whatever the Julia process was started with.
+Setting `1` forces the serial path, which is what the threading tests compare
+against; the process-level thread count cannot be changed after startup.
+
+OpenBLAS is held to the same ceiling, never above the count it started with,
+and put back to that count by `0`. Its pool is separate from Julia's threads
+and was 12 wide on a 24-thread machine at every `cores`, so a `cores = 1` call
+could still run BLAS on twelve. The subject loop does not call BLAS, but the
+Hessians and population-level algebra around it do, and so does every worker
+process that runs a restart or a chain.
+"""
+function ctsem_set_max_chunks!(n::Integer)
+    n >= 0 || throw(ArgumentError("max chunks must be non-negative"))
+    _CTSEM_MAX_CHUNKS[] = Int(n)
+    start = _ctsem_blas_start()
+    LinearAlgebra.BLAS.set_num_threads(n == 0 ? start : min(Int(n), start))
+    return Int(n)
+end
+
+"""Current chunk cap, the thread count it is resolved against, and OpenBLAS's."""
+ctsem_max_chunks() = (max_chunks=_CTSEM_MAX_CHUNKS[], nthreads=Threads.nthreads(),
+    blas_threads=LinearAlgebra.BLAS.get_num_threads())
+
+@inline function _ctsem_nchunks(nsubjects::Int)
+    requested = _CTSEM_MAX_CHUNKS[]
+    available = requested == 0 ? Threads.nthreads() : min(requested, Threads.nthreads())
+    return max(1, min(available, nsubjects))
+end
+
+# The subject loop runs on every worker the `cores` ceiling allows. A tuner used
+# to time widths from one up and pin the fastest, for a loop that was not
+# monotone in its width while it allocated -- one model measured 3.7x slower on
+# 23 threads than on one. Once the loop stopped allocating and the per-subject
+# workspaces and the BLAS and LAPACK locks went, every shape measured fastest at
+# the widest setting (2026-10-16, local AVX2, a 16-thread session, one gradient:
+# filter and Laplace routes, 30 to 1,000 subjects, a nested model of 10 studies;
+# 7 to 10 times one worker, each width faster than the one below it), while the
+# tuner's serial rungs cost a heavy model four single-threaded evaluations a
+# stage -- 2 h 45 min of every 24 h slot on the SNSF pilot's joint fit (697
+# parameters, 4,031 units, 64 threads, 2,476 s an evaluation), and again at
+# every resume.
+
+"""
+    _ctsem_chunk_assignment(weights, nchunks)
+
+Assign `1:length(weights)` to `nchunks` chunks, heaviest first into whichever
+chunk is currently lightest.
+
+Contiguous equal-count ranges are the right split when every element costs the
+same, which is true of subjects and false of *units*: with subjects nested in
+studies a unit is a study, and three studies of 200, 20 and 20 subjects split
+three ways leave one chunk doing five times the work of the others while they
+wait at the barrier. Sorting by cost first removes that, and for equal weights
+it reproduces the same balance the contiguous split gives.
+
+The chunks are returned as index vectors rather than ranges, since they are no
+longer contiguous. Summation order across chunks changes with the assignment,
+which is why `test_threading.jl` compares to a tolerance rather than bitwise.
+"""
+function _ctsem_chunk_assignment(weights::AbstractVector{<:Real}, nchunks::Int)
+    n = length(weights)
+    nchunks = max(1, min(nchunks, n))
+    chunks = [Int[] for _ in 1:nchunks]
+    nchunks == 1 && (append!(chunks[1], 1:n); return chunks)
+    load = zeros(Float64, nchunks)
+    for i in sortperm(weights; rev=true)
+        c = argmin(load)
+        push!(chunks[c], i)
+        load[c] += max(0.0, Float64(weights[i]))
+    end
+    # Ascending within a chunk, so that a chunk still walks its units in the
+    # order the serial loop would -- warm starts and diagnostics read better,
+    # and nothing downstream depends on the order.
+    for c in 1:nchunks; sort!(chunks[c]); end
+    return chunks
+end
+
+"""
+Blocks per worker in the subject loops (`_ctsem_pull_blocks`). One block per
+worker is the old fixed split; more let the workers that start promptly take
+the share of one that starts late, at the price of the per-block setup -- the
+shared parameter layer and the exponential table, once per block.
+"""
+const _CTSEM_BLOCKS_PER_WORKER = Ref(4)
+
+"""Set the subject loops' blocks per worker; returns the value now in force."""
+function ctsem_set_blocks_per_worker!(k::Integer)
+    k >= 1 || throw(ArgumentError("blocks per worker must be at least 1"))
+    _CTSEM_BLOCKS_PER_WORKER[] = Int(k)
+    return _CTSEM_BLOCKS_PER_WORKER[]
+end
+
+"""Blocks for `n` subjects over `nworkers` workers: one when there is one."""
+_ctsem_nblocks(n::Int, nworkers::Int) =
+    nworkers <= 1 ? 1 : max(1, min(n, nworkers * _CTSEM_BLOCKS_PER_WORKER[]))
+
+"""
+Scratch stores that outlive the tasks using them; see `_ctsem_scratch`.
+"""
+const _CTSEM_SCRATCH_POOL = IdDict{Any,Any}[]
+const _CTSEM_SCRATCH_LOCK = Threads.SpinLock()
+
+"""
+    _ctsem_scratch()
+
+The store the engine's per-task caches live in: the covariance and
+exponential caches (`_covcache`, `_expm_cov_scratch`), the transpose
+buffers (`_ctsem_transpose_buffer`), and the filter workspace subjects run in
+(`_get_or_init_objective_workspace!`). A worker spawned by a parallel region
+borrows one from a pool for its lifetime (`_ctsem_with_scratch`); any other
+task uses its own task-local storage.
+
+Per task because two running tasks must never share these buffers -- a task can
+migrate between threads, so a thread id does not name a private buffer. But
+not per *new* task: the parallel regions spawn their workers afresh on every
+evaluation, and a task's own storage dies with it, so every worker of every
+evaluation rebuilt its caches -- about 40 small matrices each. On gC8 that was
+most of what the filter's value allocated at eight chunks (139 KB an
+evaluation, against 21 KB at one).
+"""
+@inline function _ctsem_scratch()
+    tls = task_local_storage()
+    store = get(tls, :ctsem_scratch, nothing)
+    return (store === nothing ? tls : store)::IdDict{Any,Any}
+end
+
+"""
+    _ctsem_with_scratch(f)
+
+`f()` with a scratch store borrowed from the pool as this task's
+`_ctsem_scratch()`, returned when `f` finishes. The pool grows to the most
+workers ever running at once.
+"""
+function _ctsem_with_scratch(f)
+    lock(_CTSEM_SCRATCH_LOCK)
+    store = isempty(_CTSEM_SCRATCH_POOL) ? IdDict{Any,Any}() : pop!(_CTSEM_SCRATCH_POOL)
+    unlock(_CTSEM_SCRATCH_LOCK)
+    task_local_storage(:ctsem_scratch, store)
+    try
+        return f()
+    finally
+        delete!(task_local_storage(), :ctsem_scratch)
+        lock(_CTSEM_SCRATCH_LOCK)
+        push!(_CTSEM_SCRATCH_POOL, store)
+        unlock(_CTSEM_SCRATCH_LOCK)
+    end
+end
+
+"""
+    _ctsem_pull_blocks(work, nblocks, nworkers)
+
+Call `work(b, w)` once for each block `b` in `1:nblocks`, on `nworkers` tasks --
+the caller and `nworkers - 1` spawned -- each taking the next block from a
+shared counter until none are left. `w` in `1:nworkers` names the task, for
+scratch that must not be shared. Which blocks a task gets is not fixed, so
+anything summed over blocks is stored by `b` and summed in block order by the
+caller: the result depends on the block count, never on the threads.
+
+Not one fixed range per task, which is what the subject loops did: a task
+spawned onto a sleeping thread can start milliseconds late, and a fixed range
+waits for its slowest starter. Measured on dev1 under load, a 12-state
+augmented value of 100 subjects at eight chunks: two tasks started at once and
+six about 3 ms later, against 2.5 ms of work each, so the evaluation took
+twice as long as its arithmetic. The Laplace pool (`_laplace_parallel`) never
+had this, because its workers pull too; this is the same idea for the loops
+that do not run on the pool. The caller works rather than waits, so the region
+makes progress from the start whatever the threads are doing.
+
+A block that throws stops the others at their next block, and the exception
+is rethrown once they have finished.
+"""
+function _ctsem_pull_blocks(work, nblocks::Int, nworkers::Int)
+    nworkers = max(1, min(nworkers, nblocks))
+    if nworkers == 1
+        for b in 1:nblocks
+            work(b, 1)
+        end
+        return nothing
+    end
+    next = Threads.Atomic{Int}(0)
+    failed = Threads.Atomic{Bool}(false)
+    Threads.@sync begin
+        for w in 2:nworkers
+            Threads.@spawn _ctsem_with_scratch(() ->
+                _ctsem_pull!(work, nblocks, w, next, failed))
+        end
+        _ctsem_pull!(work, nblocks, 1, next, failed)
+    end
+    return nothing
+end
+
+function _ctsem_pull!(work, nblocks::Int, w::Int, next, failed)
+    try
+        while !failed[]
+            b = Threads.atomic_add!(next, 1) + 1
+            b > nblocks && break
+            work(b, w)
+        end
+    catch
+        failed[] = true
+        rethrow()
+    end
+    return nothing
+end
+
+"""Contiguous, near-equal partition of `1:n` into `nchunks` ranges."""
+function _ctsem_chunk_ranges(n::Int, nchunks::Int)
+    nchunks = max(1, min(nchunks, n))
+    base, extra = divrem(n, nchunks)
+    ranges = Vector{UnitRange{Int}}(undef, nchunks)
+    start = 1
+    @inbounds for c in 1:nchunks
+        len = base + (c <= extra ? 1 : 0)
+        ranges[c] = start:(start + len - 1)
+        start += len
+    end
+    return ranges
+end
+
+function (objective::CTSEMObjective)(values::AbstractVector)
+    subjects = objective.subject_objectives
+    nsubjects = length(subjects)
+    T = eltype(values)
+    nchunks = _ctsem_nchunks(nsubjects)
+    if nchunks <= 1
+        total = zero(T)
+        @inbounds for i in 1:nsubjects
+            w = _ctsem_subject_weight(objective, i)
+            w == 0 && continue
+            total += w * subjects[i](values)
+        end
+        return total + _ctsem_log_prior(objective, values)
+    end
+
+    nblocks = _ctsem_nblocks(nsubjects, nchunks)
+    ranges = _ctsem_chunk_ranges(nsubjects, nblocks)
+    partials = Vector{T}(undef, nblocks)
+    _ctsem_pull_blocks(nblocks, nchunks) do b, _
+        accumulator = zero(T)
+        @inbounds for i in ranges[b]
+            w = _ctsem_subject_weight(objective, i)
+            w == 0 && continue
+            accumulator += w * subjects[i](values)
+        end
+        partials[b] = accumulator
+    end
+    total = zero(T)
+    @inbounds for b in 1:nblocks
+        total += partials[b]
+    end
+    return total + _ctsem_log_prior(objective, values)
+end
+
+"""
+Evaluate a prepared objective and optionally return its gradient.
+
+`gradient_method` selects how the gradient is computed:
+
+  * `:adjoint` -- the reverse-mode pass in `adjoint.jl`, and the default. One
+    traced forward sweep plus one reverse sweep per subject, independent of
+    the parameter count.
+  * `:forward` -- ForwardDiff. Cost scales with the number of free parameters,
+    since ForwardDiff needs one dual pass per chunk of them. Kept for
+    cross-checking, and marginally quicker on very small nonlinear models.
+
+The two are checked against each other (and against finite differences) by
+`test/test_adjoint_gradient_validation.jl`. `:adjoint` never silently falls
+back to `:forward`: an unsupported model or an invalid trial point produces a
+non-finite gradient or a thrown error, not a quietly different answer.
+"""
+function ctsem_evaluate(objective::CTSEMObjective, values::AbstractVector;
+    gradient::Bool=true, contributions::Bool=false, gradient_method=:adjoint)
+    # Accepts a String as well as a Symbol: R passes this across the
+    # JuliaConnectoR boundary, which marshals character vectors to `String`.
+    method = Symbol(gradient_method)
+    method in (:forward, :adjoint) ||
+        throw(ArgumentError("gradient_method must be :forward or :adjoint, got :$(method)"))
+    # A sampled TI predictor value is fully covered by the reverse pass now:
+    # `_ctsem_ti_pullback!`'s `TIMissingRecipe` method (adjoint_parameters.jl)
+    # supplies the product-rule term through `_materialize_subject_values!`'s
+    # TI effect, and the prior (`_ctsem_log_prior_gradient!`) the term for the
+    # imputation log-density itself. See test_ti_missing_predictor.jl for the
+    # cross-checks against ForwardDiff and FiniteDiff this replaced a refusal
+    # with. `gradient_method=:forward` remains available, and identical.
+    if gradient && method === :adjoint
+        result = ctsem_adjoint_gradient(objective, collect(values))
+        value = result.value
+        grad = result.gradient
+    else
+        value = objective(values)
+        grad = gradient ? _ctsem_gradient(objective, values) : nothing
+    end
+    if contributions
+        subject = eltype(values) === Float64 ?
+            _ctsem_subject_logliks!(
+                Vector{Float64}(undef, length(objective.subject_objectives)),
+                objective, Vector{Float64}(values)) :
+            [obj(values) for obj in objective.subject_objectives]
+        return (value=value, gradient=grad, subject_loglik=subject,
+            row_loglik=_ctsem_row_loglikelihood(objective, values))
+    end
+    return (value=value, gradient=grad)
+end
+
+"""
+How many curvature pairs L-BFGS keeps.
+
+Optim's default is 10; ctsem's Stan path (`mize`) uses 100. Measured twice on a
+100-subject, 50-wave model, once through the engine from zero starts and once
+end to end through `ctFit`:
+
+    m     engine, s   iters   |g| at stop   met g_tol      ctFit, s   iters
+    10       4.08      42       3.5e-07        no            5.59      66
+    20       3.73      38       4.7e-10        yes           5.35      57
+    50       3.77      37       6.7e-10        yes           5.14      54
+    100      3.82      37       6.7e-10        yes            --       --
+
+Both runs reach the same optimum (log likelihood identical to four decimals)
+and both say the same thing about direction: more memory, fewer iterations,
+less time, and the gains flatten by twenty. They disagree about ten. The first
+run stopped there with a gradient of 3.5e-07 against a `g_tol` of 1e-8 --
+converged on the `f` test after the line search ran out, which is precisely the
+false "converged" this route used to report -- and the second run met the
+criterion at ten perfectly well. So "ten silently fails" is not a property of
+the setting; it is a thing that *can* happen at ten and did not happen twice.
+
+Twenty is the knee on both, and it is the floor: a model keeps as many pairs
+as it has parameters, at least 20 and at most `_CTSEM_LBFGS_MEMORY_MAX`
+(`_ctsem_lbfgs_memory`). On the optimiser bench's larger cells (dev1,
+2026-10-16, grids/lbfgsmem.txt) more memory than 20 took 5 to 19% fewer
+gradients to the same optimum -- 401 parameters with ECLS-K's moderation
+(growthm10) 16 to 19% at 500 pairs, 8% at 100; 307 (growth10) 10%; 66 (bigp)
+5 to 8% -- and changed nothing at 9 to 11 parameters but the path of one
+multi-basin cell. Pairs beyond the parameters or the iterations run add
+nothing, which is why the parameter count is the right scale; a pair costs
+O(npar) per iteration, nothing next to a gradient. The `lbfgs_memory` keyword
+overrides it, and R reaches that through `optimcontrol`.
+"""
+const _CTSEM_LBFGS_MEMORY = 20
+
+"""The most curvature pairs L-BFGS keeps by default, whatever the model's size
+(`_ctsem_lbfgs_memory`): 1000 pairs of 1000 parameters is 16 MB."""
+const _CTSEM_LBFGS_MEMORY_MAX = 1000
+
+"""
+    _ctsem_lbfgs_memory(npar)
+
+How many curvature pairs L-BFGS keeps for a model of `npar` parameters when
+the caller does not say: one per parameter, within `_CTSEM_LBFGS_MEMORY` and
+`_CTSEM_LBFGS_MEMORY_MAX` (see the first for the measurements).
+"""
+_ctsem_lbfgs_memory(npar::Integer) =
+    clamp(Int(npar), _CTSEM_LBFGS_MEMORY, _CTSEM_LBFGS_MEMORY_MAX)
+
+"""
+Which coordinates of a minimizer carry ctsem parameter transforms, and so can
+saturate. Every one of them, for the marginal objective; `state_sampling.jl`
+gives its own answer.
+"""
+_ctsem_saturation_range(::CTSEMOptimisable, minimizer) = eachindex(minimizer)
+
+"""
+The `EKFParameters` behind an optimisable objective -- what
+`_ctsem_saturated_parameters` (`parameter_transforms.jl`) needs to look up
+each raw coordinate's materialising transform. `state_sampling.jl` gives its
+own answer for `CTSEMJointObjective`, unwrapping to the same `CTSEMObjective`.
+"""
+_ctsem_params(o::CTSEMObjective) = o.params
+
+"""
+Which coordinates the overshoot probe pulls back.
+
+* `:magnitude` -- prefixes of the coordinates ordered by `|raw|`, pulled back
+  together. The default; see `_ctsem_overshot`.
+* `:saturation` -- each coordinate the saturation detector flagged, one at a
+  time. What this used to do, kept so the two can be compared.
+* `:off` -- no probe. `overshot` is then always false, and a fit that walked
+  into a flat region reports success, which is what the probe exists to stop.
+"""
+const _CTSEM_OVERSHOOT_PROBE = Ref(:magnitude)
+
+"""
+    ctsem_set_overshoot_probe!(mode)
+
+Set the overshoot probe to `:magnitude`, `:saturation` or `:off`. Returns the
+previous setting.
+"""
+function ctsem_set_overshoot_probe!(mode)
+    previous = _CTSEM_OVERSHOOT_PROBE[]
+    _CTSEM_OVERSHOOT_PROBE[] = _ctsem_overshoot_mode(mode)
+    return previous
+end
+
+"""
+    _ctsem_overshoot_mode(mode)
+
+`mode` as one of the three symbols, or an error naming them.
+
+Takes a string as well, because the R side passes one: a bare symbol does not
+survive the bridge and spelling it as `Symbol(...)` at each call site is one
+more place for `:magnitde` to be accepted silently.
+"""
+function _ctsem_overshoot_mode(mode)
+    symbol = mode isa Symbol ? mode : Symbol(mode)
+    symbol in (:magnitude, :saturation, :off) || throw(ArgumentError(
+        "overshoot probe must be :magnitude, :saturation or :off, got $(repr(mode))"))
+    return symbol
+end
+
+export ctsem_set_overshoot_probe!
+
+"""
+    _ctsem_probe_value(objective, x)
+
+The objective at a probe point, or `-Inf` where the route cannot use it.
+
+Untyped, because the fallback's contract is exactly "whatever answers
+`ctsem_evaluate`" -- which is what the probe called directly before, and what
+the mock objectives in `test_ctsem_backend.jl` supply. Anything that does not
+answer raises inside the `try` and is refused, `nothing` included.
+
+The laplace route overrides this: its value is only the objective at a mode, so
+a probe point whose inner solve did not converge has to be refused rather than
+compared. Without that the probe can be handed a number computed away from any
+mode, find it larger, and report a maximum as an overshoot.
+"""
+function _ctsem_probe_value(objective, x)
+    value = try
+        ctsem_evaluate(objective, x; gradient=false).value
+    catch
+        -Inf
+    end
+    isfinite(value) ? value : -Inf
+end
+
+export ctsem_evaluate_batch
+
+"""
+    ctsem_evaluate_batch(objective, values::AbstractMatrix)
+
+The objective's value at each column of `values`, with no gradient, in one
+bridge call.
+
+The batched counterpart of `_ctsem_probe_value`: a column the model cannot
+evaluate, or -- for a `CTSEMLaplaceObjective` -- whose inner Newton solve did
+not converge, comes back `-Inf` rather than raising, so a caller scanning many
+proposal points (an importance sampler's batch, a grid) can treat the whole
+column uniformly instead of catching an error per point. Dispatch is through
+the generic `ctsem_evaluate`, by way of `_ctsem_probe_value`, so
+`CTSEMObjective`, `CTSEMLaplaceObjective` and `CTSEMJointObjective` all work
+here without a batch method of their own -- add a route and this covers it
+too, the same way `_ctsem_probe_value` already does for the overshoot probe.
+
+This is `ctsem_particle_batch`'s shape without the particle filter: one number
+per column, nothing else. It exists for `imis_is` and similar scans that read
+only the value -- reading `ctsem_evaluate(...; gradient=true)` per draw and
+discarding the gradient measured at 3x the cost for nothing (see
+`.ctBackendLpgFunc` on the R side), and evaluating one draw per bridge round
+trip on top of that was the larger cost by far: about 41 ms per call over the
+JuliaConnectoR bridge on the machine this was measured on, almost independent
+of what the call computes, so 1000 draws cost 1000 round trips this collapses
+into one.
+
+`values` must have at least one column. An empty matrix must never cross the
+bridge -- JuliaConnectoR deadlocks marshalling a zero-length array in either
+direction, silently rather than with an error -- so a caller must never build
+one, and this refuses one that arrived anyway rather than returning an empty
+result the same hazard applies to on the way back.
+"""
+function ctsem_evaluate_batch(objective, values::AbstractMatrix)
+    ncol = size(values, 2)
+    ncol >= 1 || throw(ArgumentError("values must have at least one column"))
+    out = Vector{Float64}(undef, ncol)
+    @inbounds for j in 1:ncol
+        out[j] = _ctsem_probe_value(objective, Vector{Float64}(view(values, :, j)))
+    end
+    return out
+end
+
+"""
+    _ctsem_probe_value_gradient(objective, x)
+
+The objective's value and gradient at a probe point, or a value of `-Inf` and
+no gradient where the route cannot use it: `_ctsem_probe_value` with the
+gradient kept, the same refusal rule, and the same laplace override (a point
+whose inner solve did not converge is refused however finite its numbers).
+"""
+function _ctsem_probe_value_gradient(objective, x)
+    result = _ctsem_try_evaluate(() -> ctsem_evaluate(objective, x; gradient=true))
+    result === nothing && return (value=-Inf, gradient=nothing)
+    ok = isfinite(result.value) && result.gradient !== nothing &&
+        all(isfinite, result.gradient)
+    return ok ? (value=Float64(result.value), gradient=result.gradient) :
+        (value=-Inf, gradient=nothing)
+end
+
+export ctsem_evaluate_batch_gradient
+
+"""
+    ctsem_evaluate_batch_gradient(objective, values::AbstractMatrix)
+
+The objective's value and gradient at each column of `values`, in one bridge
+call: an `(n + 1) x ncol` matrix whose first row holds the values and the rest
+the gradients. A column the route cannot use comes back with value `-Inf` and
+a gradient of `NaN`, by the rule `ctsem_evaluate_batch` applies.
+
+For `imis_is`'s search along each parameter's profile path, which moves every
+path one Newton step at a time: without this each step of each path was a
+bridge round trip of its own, and those, rather than the gradients, were most
+of the search's cost. `values` must have at least one column, for the reason
+`ctsem_evaluate_batch` gives.
+"""
+function ctsem_evaluate_batch_gradient(objective, values::AbstractMatrix)
+    n, ncol = size(values)
+    ncol >= 1 || throw(ArgumentError("values must have at least one column"))
+    out = fill(NaN, n + 1, ncol)
+    for j in 1:ncol
+        probe = _ctsem_probe_value_gradient(objective, Vector{Float64}(view(values, :, j)))
+        out[1, j] = probe.value
+        probe.gradient === nothing || (out[2:end, j] .= probe.gradient)
+    end
+    return out
+end
+
+export ctsem_unit_terms
+
+"""
+    ctsem_unit_terms(objective::CTSEMObjective, draws::AbstractMatrix)
+
+Every subject's log likelihood, and the objective, at each column of `draws`,
+in one bridge call: `value` the objective (the log posterior the fit
+maximised), `unit_loglik` (`nsubjects x ndraws`) each subject's log likelihood
+-- its marginal over whatever random effects the filter carries as states --
+`converged` whether the column could be evaluated, and `unit` the unit each
+subject is: itself, since the filter's route has no level above the subject.
+A column the model cannot evaluate comes back `NaN`. The Laplace layer's
+method (laplace_loo.jl) returns the same fields for its units, so a caller
+asks for units' terms without asking which route it holds.
+
+For leave-one-subject-out by Pareto-smoothed importance sampling
+(`ctLOO(method = 'psis')` on the filter's route), which needs exactly these
+numbers at a few hundred draws -- of a proposal or of a sampled posterior: the
+objective to weight a proposal's draw to the posterior, a subject's own term
+to take that subject out. One pass per draw, threaded over subjects as the
+objective itself is, where a refit per subject costs a whole optimisation
+each.
+"""
+function ctsem_unit_terms(objective::CTSEMObjective, draws::AbstractMatrix)
+    ncol = size(draws, 2)
+    ncol >= 1 || throw(ArgumentError("draws must have at least one column"))
+    nsubjects = length(objective.subject_objectives)
+    value = fill(NaN, ncol)
+    terms = fill(NaN, nsubjects, ncol)
+    converged = fill(false, ncol)
+    for j in 1:ncol
+        _ctsem_interrupt_check()
+        v = Vector{Float64}(view(draws, :, j))
+        column = view(terms, :, j)
+        ok = try
+            _ctsem_subject_logliks!(column, objective, v)
+            value[j] = sum(column) + _ctsem_log_prior(objective, v)
+            isfinite(value[j])
+        catch err
+            _ctsem_must_propagate(err) && rethrow()
+            false
+        end
+        if ok
+            converged[j] = true
+        else
+            value[j] = NaN
+            column .= NaN
+        end
+    end
+    return (value=value, unit_loglik=terms, converged=converged,
+        unit=collect(1:nsubjects))
+end
+
+"""
+    _ctsem_subject_logliks!(column, objective, values)
+
+Each subject's term of `objective(values)`, written into `column`, over the
+same chunks and threads the objective's own evaluation uses. Shared by the
+batch above and `ctsem_evaluate(; contributions=true)`.
+"""
+function _ctsem_subject_logliks!(column::AbstractVector{Float64},
+    objective::CTSEMObjective, values::Vector{Float64})
+    subjects = objective.subject_objectives
+    nsubjects = length(subjects)
+    nchunks = _ctsem_nchunks(nsubjects)
+    if nchunks <= 1
+        @inbounds for i in 1:nsubjects
+            column[i] = subjects[i](values)
+        end
+        return column
+    end
+    nblocks = _ctsem_nblocks(nsubjects, nchunks)
+    ranges = _ctsem_chunk_ranges(nsubjects, nblocks)
+    _ctsem_pull_blocks(nblocks, nchunks) do b, _
+        @inbounds for i in ranges[b]
+            column[i] = subjects[i](values)
+        end
+    end
+    return column
+end
+
+"""
+What multiples of its current value each coordinate in a pulled-back set is
+tried at.
+
+Contractions and reflections. Contraction is what a saturated coordinate needs
+-- raw 12.1 at 0.25 is raw 3.0, which is where that transform came back to life
+and gained 142 nats -- but it can only ever reach zero, and zero is not a
+neutral place to reach: it is correlation 0, drift -0.693 and sd 0.693,
+depending entirely on the transform. So the ladder goes past it.
+
+The negative rungs are there because a contraction cannot change a sign, and on
+one measured fit the escape needed a population correlation to go from -2.358
+to +0.327. `-1.0` is a pure reflection, which is the move a correlation pinned
+at +1 needs if it belongs at -1.
+
+Cheap either way: these are value-only evaluations, and more rungs buy a better
+ranking at linear cost. See `_ctsem_overshot` for what the ranking is for.
+
+A set far out gets rungs between `0.1` and zero as well
+(`_CTSEM_PULLBACK_ABSOLUTE`): a relative ladder leaves the whole stretch from
+a tenth of the current value down to zero untried, which from raw 11 is raw
+1.1 to 0 -- exactly where a transform like the drift's still responds.
+"""
+const _CTSEM_PULLBACK_FRACTIONS = (0.5, 0.25, 0.1, 0.0, -0.1, -0.25, -0.5, -1.0)
+
+"""
+Raw magnitudes the largest coordinate of a pulled-back set is also tried at,
+when they lie below the ladder's `0.1` rung. Measured on a two-level Laplace
+model whose likelihood has a second maximum where the drift's transform caps
+it at zero (drift -1e-9, 22 nats below the one at -0.5): the fit stopped at raw
+11.2; the ladder tried raw 5.6, 2.8 and 1.1 (drift -0.20, in the valley between
+the two maxima, worse) and then 0 (drift -1.39, far worse), and reported a
+maximum. Raw 0.5 is drift -0.63, 21 nats better.
+"""
+const _CTSEM_PULLBACK_ABSOLUTE = (1.0, 0.5, 0.25)
+
+"""
+The fractions a set whose largest magnitude is `largest` is tried at: the
+ladder, with `_CTSEM_PULLBACK_ABSOLUTE`'s magnitudes as fractions of `largest`
+placed after its `0.1` rung where they fall below it.
+"""
+function _ctsem_pullback_fractions(largest::Real, fractions=_CTSEM_PULLBACK_FRACTIONS)
+    extra = [a / largest for a in _CTSEM_PULLBACK_ABSOLUTE
+        if isfinite(largest) && a / largest < 0.1]
+    isempty(extra) && return collect(Float64, fractions)
+    out = Float64[]
+    for f in fractions
+        push!(out, f)
+        f == 0.1 && append!(out, extra)
+    end
+    return out
+end
+
+"""
+Up to this many coordinates the magnitude probe tries every prefix; beyond it,
+prefixes of doubling size (`_ctsem_pullback_sets`).
+"""
+const _CTSEM_PULLBACK_DENSE = 16
+
+"""
+    _ctsem_pullback_sets(minimizer, flagged = Int[]; dense = _CTSEM_PULLBACK_DENSE)
+
+The coordinate sets the magnitude probe pulls back: every prefix of the
+coordinates sorted by `|raw|` descending, up to `dense` of them; then prefixes
+of `2 dense`, `4 dense`, ... and all `n`; and `flagged`, the coordinates a
+detector reported flat, as a set of its own when one of them is ranked beyond
+the dense prefixes, so a flat coordinate is never reached only as part of a
+pullback of dozens of others.
+
+There is no threshold in that, which is the point. A *cutoff* on raw magnitude
+is the heuristic `ctsem_optimize`'s saturation note explains was abandoned,
+because an identity transform never goes flat however large its coordinate. An
+*ordering* by magnitude claims nothing about any coordinate -- it only decides
+what to try first, and the objective decides whether it was right. A coordinate
+wrongly included costs one evaluation.
+
+Every prefix rather than a geometric ladder, and that is measured rather than
+cautious. Two local optima of one 50-subject model, each with a population
+scale collapsed and its correlations following it out:
+
+    dataset 13   escaping set {6,9,10,11}   +62.2   prefix of size 4
+    dataset 12   escaping set {6,9,10}      +53.7   prefix of size 3
+
+A ladder of 1, 2, 4, 8 finds the first and jumps over the second. In both, an
+exhaustive search over every subset of the six population coordinates found
+nothing better than the prefix -- so the ordering is doing the work and the
+only question was how finely to sample it.
+
+Dense only up to `dense`, because every prefix of every size costs
+`length(fractions)` evaluations each: on a 715-parameter model (341 covariate
+effects) the stall watch's probe ran 8 x 715 value-only evaluations, an hour at
+three threads, silent. The escaping sets on record are three and four
+coordinates, a collapsed scale and the correlations that follow it out; a
+prefix of hundreds is a move toward the origin, which the doubling sizes still
+try. A model of at most `dense` parameters gets every prefix, as before.
+
+At most `dense + log2(n / dense) + 2` sets of `length(fractions)` evaluations,
+and it stops at the first improvement.
+
+`among`, when given, is the pool the prefixes are taken over -- the
+coordinates the curvature or the transforms call flat
+(`_ctsem_overshoot_candidates`), with the flagged ones always in it -- and
+`n` above is then the pool's size. The end-of-run verdict passes it where a
+finish left a Hessian; the in-flight stall probe, which has none, searches
+every coordinate.
+"""
+function _ctsem_pullback_sets(minimizer, flagged=Int[];
+        dense::Integer=_CTSEM_PULLBACK_DENSE, among=nothing)
+    total = length(minimizer)
+    total == 0 && return Vector{Int}[]
+    extra = sort!(unique(Int[p for p in flagged if 1 <= p <= total]))
+    pool = among === nothing ? collect(1:total) :
+        sort!(unique(vcat(Int[p for p in among if 1 <= p <= total], extra)))
+    n = length(pool)
+    n == 0 && return Vector{Int}[]
+    x = collect(minimizer)
+    order = pool[sortperm(Float64[abs(x[p]) for p in pool]; rev=true)]
+    sets = Vector{Int}[order[1:k] for k in 1:min(n, dense)]
+    head = view(order, 1:min(n, dense))
+    any(p -> !(p in head), extra) && push!(sets, extra)
+    k = 2 * dense
+    while k < n
+        push!(sets, order[1:k])
+        k *= 2
+    end
+    n > dense && push!(sets, order)
+    return sets
+end
+
+"""
+    _ctsem_probe_baseline(objective, minimizer, value)
+
+What a probe's trial values are compared against: the objective's value at
+`minimizer`, which for most objectives is the `value` the optimiser ended
+with. A route whose probe values are not the optimiser's objective gives the
+same reading at the estimate, or the difference between the two is reported
+as an overshoot: the rounds' continuation, removed 2026-10-30, read its
+probes with its rules placed at the probed point where the optimiser climbed
+the frozen rules, and reported 0.0245 nats on the bench's anomS2 and a fit
+cycling through escapes at one point.
+"""
+_ctsem_probe_baseline(objective, minimizer, value) = value
+
+"""
+    _ctsem_overshot(objective, minimizer, saturated_parameters, value, tolerance)
+
+Whether the optimizer walked *past* an optimum into a flat region, rather than
+stopping at one.
+
+A transform gone flat, or a population scale collapsed to zero, covers two
+outcomes that look identical from the gradient, because a flat transform
+reports zero gradient in both:
+
+  1. The optimizer overstepped. Measured on a binary model: one L-BFGS
+     iteration to raw 20.9, log likelihood -730.7 where the profile peak is
+     -714.5. That fit did not converge, and the point it stopped at is not a
+     maximum.
+  2. The data do not identify that coordinate, so the optimizer correctly ran
+     it to the edge while every other parameter converged. A population
+     standard deviation with no individual differences behind it is the common
+     case, and it is a *finding*, not a failure -- one such fit stopped with a
+     largest gradient of 5e-10 and matched Stan's log likelihood to the digit.
+
+Treating both as "not converged" is what made the flag useless: over 64
+optimisation replications of a benchmark whose log likelihoods matched Stan's,
+45 reported `converged=false`, every one of them for a collapsed population
+scale and the correlation that goes with it.
+
+The two are told apart by asking the only question that separates them -- is
+this a maximum? At a maximum no move improves the objective. So coordinates are
+pulled back toward zero, into the region where their transforms still respond,
+and an improvement larger than `tolerance` means the reported point is not a
+maximum, which is case 1; no improvement is case 2. The probe is
+self-validating in a way the saturation *flag* is not: a coordinate wrongly
+included costs one evaluation, because zeroing a well-estimated parameter makes
+the objective worse and nothing is reported.
+
+## Why not one coordinate at a time
+
+Because the move out of a degenerate corner is not along a coordinate. Measured
+on a 50-subject model with three correlated random effects, at an optimum
+149 nats below the one two other starts reached, with the T0MEANS population
+scale collapsed to raw -15.6 and its correlation on the cap:
+
+    pulled back alone     popsd_T0m_eta1            -0.0001 to -771
+    pulled back alone     rawcor_drift__T0m_eta1      -18.7 to -657
+    the two flagged ones, together                    -18.7 to -2065
+    the four largest |raw|, together, to zero                 +62.2
+
+Every single-coordinate probe says maximum. It is not one: the scale and all
+three of its correlations have to come back at once, because a dimension with
+no variance leaves its correlations unconstrained, and any one of them alone
+still describes a degenerate covariance. Two of those four are what the
+saturation detector flags -- the other two have transforms that are merely
+unresponsive rather than flat -- so selecting the set from the flag cannot work
+either. See `_ctsem_pullback_sets` for what is selected instead.
+
+At most `length(fractions)` value-only evaluations per set of
+`_ctsem_pullback_sets` (three more for a set far out,
+`_ctsem_pullback_fractions`), and it stops at the first set that improves -- so
+`gain` is a lower bound on what is left rather than the best pullback
+available. The question it answers is whether the estimate is a maximum, and
+any improvement settles that. `progress`, when given, is called `(done, total)`
+before each set (`_ctsem_probe_progress`); each set passes an interrupt
+checkpoint, since the value calls themselves refuse every exception as an
+unusable point.
+
+It runs behind an inference barrier (`_ctsem_overshot_probe`), compiled for
+the types it is called with rather than for what inference makes of them at
+the end of an optimisation: there they widen to `Any`, a call dispatched on
+an abstract type has a backedge to every method of its function, and a
+package that adds one invalidates the caller. JuliaConnectoR's server loads
+Tables.jl before the engine, and its `Base.IteratorSize(::Type{DictRowTable})`
+invalidated this probe's compiled code and with it `ctsem_optimize` and
+`ctsem_laplace_optimize` above it, which each session's first fit then
+compiled again (`scripts/first-call-compile/invalidation_engine.jl` lists
+what a package invalidates; the Newton finish's saddle ladder was the same
+case, through the finish's own untyped state). The result's type is
+asserted, so nothing above sees an abstract value.
+"""
+function _ctsem_overshot(objective, minimizer, saturated_parameters, value,
+        tolerance; kwargs...)
+    return Base.inferencebarrier(_ctsem_overshot_probe)(objective, minimizer,
+        saturated_parameters, value, tolerance; kwargs...)::_CTSEMOvershot
+end
+
+const _CTSEMOvershot = @NamedTuple{overshot::Bool, gain::Float64,
+    coordinates::Vector{Int}, point::Vector{Float64}}
+
+# `_ctsem_overshot`'s body, which its barrier dispatches to at run time.
+function _ctsem_overshot_probe(objective, minimizer, saturated_parameters, value,
+        tolerance; fractions=_CTSEM_PULLBACK_FRACTIONS,
+        mode=_CTSEM_OVERSHOOT_PROBE[], progress=nothing, among=nothing)
+    gain = 0.0
+    empty_result = (overshot=false, gain=gain, coordinates=Int[], point=Float64[])
+    (!isfinite(value) || isempty(minimizer)) && return empty_result
+    mode = _ctsem_overshoot_mode(mode)
+    mode === :off && return empty_result
+    sets = if mode === :saturation
+        [[p] for p in saturated_parameters if 1 <= p <= length(minimizer)]
+    else
+        _ctsem_pullback_sets(minimizer, saturated_parameters; among=among)
+    end
+    isempty(sets) && return empty_result
+    value = _ctsem_probe_baseline(objective, minimizer, value)
+    isfinite(value) || return empty_result
+    keep = collect(Float64, minimizer)
+    probe = copy(keep)
+    # No ranking of the points that did not improve. Ordering them by how
+    # little they lost is a proxy for nothing: the least bad candidate is the
+    # one that disturbed the estimate least, which makes it the likeliest to
+    # fall straight back into the basin a caller is trying to leave. What to do
+    # when nothing improves is decided by which coordinate is on a boundary,
+    # not by which near miss was nearest -- see `.ctBackendStallEscape()`.
+    for (i, set) in enumerate(sets)
+        _ctsem_interrupt_check()
+        progress === nothing || progress(i - 1, length(sets))
+        for f in _ctsem_pullback_fractions(maximum(p -> abs(keep[p]), set), fractions)
+            for p in set; probe[p] = f * keep[p]; end
+            trial = _ctsem_probe_value(objective, probe)
+            isfinite(trial) && (gain = max(gain, trial - value))
+            if gain > tolerance
+                # The point as well as the verdict. It costs a copy and it is
+                # what a caller needs to *act* on an overshoot rather than only
+                # report it -- see `ctsem_pullback`.
+                return (overshot=true, gain=Float64(gain),
+                    coordinates=sort(Vector{Int}(set)), point=copy(probe))
+            end
+        end
+        for p in set; probe[p] = keep[p]; end
+    end
+    return (overshot=false, gain=Float64(gain), coordinates=Int[], point=Float64[])
+end
+
+"""
+    ctsem_pullback(objective, values; tolerance, probe)
+
+The pulled-back point that improves on `values`, or nothing to report.
+
+`_ctsem_overshot` answers "is this a maximum" and finds an improving point on
+the way to saying no. This hands that point back, so a fit that stopped in a
+degenerate corner can be resumed from somewhere better instead of only being
+told it is stuck. The improvement is measured, not predicted, so a resume from
+here cannot start worse than it stopped.
+
+Returned as a named tuple rather than `nothing` for the empty case, because a
+zero-length vector deadlocks the R bridge: `found` is the flag to read.
+"""
+function ctsem_pullback(objective, values::AbstractVector; tolerance::Real=1e-6,
+        probe=_CTSEM_OVERSHOOT_PROBE[])
+    x = collect(Float64, values)
+    nothing_found = (found=false, gain=0.0, point=x, coordinates=[0])
+    current = _ctsem_probe_value(objective, x)
+    isfinite(current) || return nothing_found
+    out = _ctsem_overshot(objective, x, Int[], current, tolerance; mode=probe)
+    out.overshot && !isempty(out.point) || return nothing_found
+    return (found=true, gain=out.gain, point=collect(Float64, out.point),
+        coordinates=isempty(out.coordinates) ? [0] : out.coordinates)
+end
+
+export ctsem_pullback
+
+"""
+The directional derivative `g'p` of the last step taken, which `_ctsem_lbfgs`
+writes as it accepts each step and the Newton finish overwrites with its own
+exact decrement. For a quasi-Newton direction `-dphi0 / 2` is the improvement
+that step was predicted to make, in objective units -- a stopping rule on the
+quantity that matters, for no arithmetic at all.
+
+It used to wrap Optim's line search and read `dphi0` off its arguments; since
+the optimiser became ctsem's own (optimiser.jl) nothing called the wrapped
+search, and it carried an unused `BackTracking` until 2026-09-25.
+
+`NaN`, no prediction, after a step taken on no curvature at all: the first of
+a run with no pairs or inverse to start from: its `g'p` is the gradient's,
+which says nothing of what is left.
+Read as the gain left, such a first step backed off to almost nothing along a
+stiff direction ended the affect pilot's 697-parameter fit after one
+iteration as converged, at |g| 0.47 (predicted gain 1e-17). Stricter rules --
+reading only steps taken whole, or whose gain confirmed the model's curvature
+-- kept runs walking where the prediction had been right: the continuation's
+correction stage took 7 times as long on the bench, and a flat ridge 1300
+iterations (dev1, 2026-10-18). A later step on a model too stiff along it
+still predicts too little; the finish and the certification are what catch
+that, from an exact Hessian.
+
+`discrepancy` is what the last accepted step's value change missed the
+trapezoid of its end gradients by, `|f1 - f0 - (g0 + g1)'s / 2|`, exact for a
+quadratic, so on a smooth objective it shrinks as the cube of the step while
+the gain shrinks as the square; NaN where the step was on a coreset or batch.
+`recent` holds the last `_CTSEM_RESOLUTION_STEPS` of them from steps on the
+full objective, which `_ctsem_step_resolution` reads. `refused` is the largest
+gain an exact Hessian at its own point promised and the finish's trust search
+could not find at any radius (`_ctsem_refused!`), 0 until one is refused.
+"""
+mutable struct CTSEMDirectional
+    dphi0::Float64
+    discrepancy::Float64
+    recent::Vector{Float64}
+    refused::Float64
+end
+
+CTSEMDirectional() = CTSEMDirectional(NaN, NaN, Float64[], 0.0)
+
+"""The improvement the last accepted step was predicted to make, or `Inf`."""
+function _ctsem_predicted_gain(ls::CTSEMDirectional)
+    isfinite(ls.dphi0) ? abs(ls.dphi0) / 2 : Inf
+end
+
+const _CTSEM_RESOLUTION_STEPS = 5
+
+"""
+    _ctsem_resolution_step!(ls, discrepancy, full)
+
+Records an accepted step's discrepancy (`CTSEMDirectional`), into the window
+`_ctsem_step_resolution` reads where the step was on the full objective.
+"""
+function _ctsem_resolution_step!(ls::CTSEMDirectional, discrepancy::Real, full::Bool)
+    ls.discrepancy = full ? Float64(discrepancy) : NaN
+    (full && isfinite(discrepancy)) || return ls
+    push!(ls.recent, Float64(discrepancy))
+    length(ls.recent) > _CTSEM_RESOLUTION_STEPS && popfirst!(ls.recent)
+    return ls
+end
+
+"""
+    _ctsem_step_resolution(ls)
+
+The smallest gain L-BFGS's steps suggest the objective resolves: the least
+discrepancy over the last `_CTSEM_RESOLUTION_STEPS` steps on the full
+objective, 0 before there are that many. A gap rule asks L-BFGS's predicted
+gain to fall below `gap_tol`, and that is a smooth objective's to meet. An
+objective whose value moves with where its inner solves stop, or with a rule's
+nodes, disagrees with its own gradients by more than that, and below its
+disagreement the line search accepts and refuses steps on that alone: L-BFGS
+then walks at about the size of it, never under `gap_tol` and never failing a
+search, to the iteration cap. The affect pilot's Laplace objective resolves
+about 1e-7 against the Laplace route's 1e-8. The least of five, so that a
+single step whose third-order terms were large does not raise it.
+
+It raises the gap rule alone (`_ctsem_gap_floor`), whose own prediction is of
+the same kind. Five long steps' third-order terms read as it too: the bench's
+ten-iteration prior warm-ups read 1e-3 to 3.3e-2 here
+(`review/bench/2026-11-01-gapfloor.md`), harmless against predictions of 0.3
+to 12 nats there, and no measure of what an exact model's gain can be
+certified to. No rule on the steps alone separates the two: one that counted
+only steps whose trapezoid missed their change by a quarter, entering others
+as 0, lost noise as large as the gains, which half the steps then meet.
+"""
+function _ctsem_step_resolution(ls::CTSEMDirectional)
+    length(ls.recent) < _CTSEM_RESOLUTION_STEPS && return 0.0
+    return minimum(ls.recent)
+end
+
+"""
+    _ctsem_resolution(ls)
+
+The smallest gain the run has shown the objective cannot resolve, 0 until it
+has (`refused`): an exact Hessian at its own point whose step the finish's
+trust search refused at every radius, down to where the model promised less
+than the value's roundoff. A smooth objective whose gradient is its slope
+cannot do that, whether the cause is noise as large as the gain, a term that
+is not smooth there, or a gradient that is not the value's. Every bar on a
+gain of the objective reads it (`_ctsem_tolerance`), so they rise together.
+
+On the affect pilot (2026-11-01) the certification's Hessian promised 6.1e-5
+nats and no step found any of it; held to 1e-6, the certification sent the run
+back to L-BFGS, whose line search then failed twice, and to a second
+five-hour Hessian. Kept for the run: what an objective cannot resolve at one
+point it does not resolve beside it, and the bars it raises are capped
+(`_CTSEM_RESOLUTION_CAP`).
+"""
+_ctsem_resolution(ls::CTSEMDirectional) = ls.refused
+
+"""
+    _ctsem_refused!(ls, gain)
+
+Records that the finish's trust search found none of `gain`, the gain an exact
+Hessian at its own point promised (`_ctsem_resolution`).
+"""
+function _ctsem_refused!(ls::CTSEMDirectional, gain::Real)
+    (isfinite(gain) && gain > ls.refused) && (ls.refused = Float64(gain))
+    return ls
+end
+_ctsem_refused!(::Nothing, gain::Real) = nothing
+
+"""
+    _ctsem_tolerance(base, ls)
+
+A bar on a gain of the objective: `base`, or what the run has shown the
+objective cannot resolve where that is more (`_ctsem_resolution`), up to
+`_CTSEM_RESOLUTION_CAP`. Every such bar in a run is this with its own base --
+the gap rule's `gap_tol` (through `_ctsem_gap_floor`), the certification's
+`converge_tol`, the finish's step bar, the escapes', the stall and overshoot
+probes', the mode rounds' -- so they rise together, to the same number, and
+R's certification reads the same (`converge_floor` in the result). A base of
+0, a bar turned off, stays off.
+"""
+_ctsem_tolerance(base::Real, ls::CTSEMDirectional) = base > 0 ?
+    max(Float64(base), min(_ctsem_resolution(ls), _CTSEM_RESOLUTION_CAP)) : Float64(base)
+_ctsem_tolerance(base::Real, ::Nothing) = Float64(base)
+
+"""
+    _ctsem_gap_floor(gap_tol, ls)
+
+The gap rule's tolerance, L-BFGS's and the coreset stages': every bar's
+(`_ctsem_tolerance`), or what L-BFGS's own steps suggest the objective
+resolves where that is more (`_ctsem_step_resolution`), up to the same cap.
+"""
+_ctsem_gap_floor(gap_tol::Real, ls::CTSEMDirectional) = gap_tol > 0 ?
+    max(_ctsem_tolerance(gap_tol, ls),
+        min(_ctsem_step_resolution(ls), _CTSEM_RESOLUTION_CAP)) : Float64(gap_tol)
+
+"""
+The most any bar rises to (`_ctsem_tolerance`, `_ctsem_gap_floor`): 0.005
+nats, a tenth of a standard error from the maximum (`sqrt(2 * 0.005)`), where
+an estimate's error stops being negligible against its uncertainty. An
+objective that resolves nothing finer is not certified by raising its bars
+further. The gap rule's floor was capped at `newton_switch`, 0.1 nats, until
+2026-11-01, when it was that rule's alone.
+"""
+const _CTSEM_RESOLUTION_CAP = 0.005
+
+"""
+The per-objective pieces of the shared optimiser.
+
+`ctsem_optimize` drives every route. What the routes differ by is here, as one
+small generic function each, so that anything added to the optimiser is added
+once. Three things were not, and each cost a bug: the convergence verdict was
+fixed on one route and left on the other, the saturation guard had to be copied
+across afterwards, and `gap_tol` went into one and every laplace fit died with a
+MethodError.
+
+The defaults are the marginal and joint routes' behaviour, so those two need no
+methods at all; `laplace.jl` supplies the differences.
+
+* `_ctsem_optimise_label` names the route in its messages.
+* `_ctsem_optimise_setup!` resets whatever per-run state the route keeps.
+* `_ctsem_optimise_log` returns a mutable accumulator for the route's own call
+  accounting, or `nothing` when it keeps none. It is told `verbose`, because a
+  route that narrates its accounting as it goes has to know whether anyone
+  asked.
+* `_ctsem_optimise_trace_keys` and `_ctsem_optimise_trace_values` are the
+  columns the per-iteration trace carries: keys are fixed at construction so the
+  vectors stay type-stable, values are read each iteration.
+* `_ctsem_optimise_progress_extra` is anything further the progress line should
+  carry, already formatted.
+* `_ctsem_optimise_trial` evaluates a trial point and says whether it may be
+  used. This is the one hook with real semantics rather than plumbing: on the
+  laplace route a point where a unit's inner Newton did not reach its tolerance
+  is *invalid* even though its value is finite, because the objective is only
+  defined at the mode -- accepting it lets the outer optimiser follow a function
+  of something other than theta.
+* `_ctsem_saturated_for` detects a flat transform, which the laplace route does
+  differently: a level of correlations can saturate together, which the per-cell
+  check cannot see.
+* `_ctsem_optimise_result_extra` adds the route's own result fields.
+* `_ctsem_optimise_verbose_shape` and `_ctsem_optimise_verbose_report` are the
+  route's own `verbose` lines, before the run and after it: what is about to be
+  fitted, and what the run did. The second is where the call accounting in its
+  log gets read.
+"""
+_ctsem_optimise_label(::CTSEMOptimisable) = "ctsem_optimize"
+_ctsem_optimise_setup!(::CTSEMOptimisable) = nothing
+_ctsem_optimise_log(::CTSEMOptimisable, verbose::Bool) = nothing
+_ctsem_optimise_trace_keys(::CTSEMOptimisable) = (:objective, :gradient_norm)
+_ctsem_optimise_trace_values(::CTSEMOptimisable) = ()
+_ctsem_optimise_progress_extra(::CTSEMOptimisable) = ()
+
+"""
+Why the route refused the point it last evaluated, as a clause for an error
+message, or `""`. The laplace route names the units whose inner solve did not
+converge.
+"""
+_ctsem_optimise_refusal(::CTSEMOptimisable) = ""
+_ctsem_optimise_verbose_shape(::CTSEMOptimisable) = nothing
+_ctsem_optimise_verbose_report(::CTSEMOptimisable, log) = nothing
+
+_ctsem_saturated_for(o::CTSEMOptimisable, minimizer) =
+    _ctsem_saturated_parameters(_ctsem_params(o), minimizer,
+        _ctsem_saturation_range(o, minimizer))
+
+"""The row-wise contributions only the filter routes can decompose."""
+_ctsem_optimise_result_extra(::CTSEMOptimisable, final, log) =
+    (row_loglik=final.row_loglik,)
+
+"""
+    _ctsem_optimise_trial(objective, x, want_gradient, gradient_method, limit, log)
+
+One trial point: what it evaluated to, and whether the optimiser may use it.
+
+`nothing` for the evaluation, or `valid == false`, both mean the same thing to
+the caller -- hand back the sentinel objective and a zero gradient so the line
+search shrinks. Deliberately not the last valid gradient: that feeds L-BFGS a
+secant pair whose gradient never belonged to the point, which corrupts the
+curvature history.
+"""
+function _ctsem_optimise_trial(o::CTSEMOptimisable, x, want_gradient::Bool,
+        gradient_method, limit::Real, log)
+    evaluated = _ctsem_try_evaluate(() -> ctsem_evaluate(o, x; gradient=want_gradient,
+        gradient_method=gradient_method))
+    valid = evaluated !== nothing && isfinite(evaluated.value) &&
+        (!want_gradient || _ctsem_gradient_usable(evaluated.gradient, limit))
+    return (evaluated=evaluated, valid=valid)
+end
+
+"""
+    ctsem_start_usable(objective, start; gradient_method=:adjoint)
+
+Whether `ctsem_optimize` would take `start`: its first trial, by the route's own
+rule (`_ctsem_optimise_trial`, with the gradient), from the state a run begins
+in (`_ctsem_optimise_setup!`). For a caller with a start of its own to try
+before a fallback: R's data-derived starting values are kept only where this
+holds.
+"""
+function ctsem_start_usable(objective::CTSEMOptimisable, start::AbstractVector;
+        gradient_method=:adjoint)
+    x = collect(Float64, start)
+    _ctsem_optimise_setup!(objective)
+    trial = _ctsem_optimise_trial(objective, x, true, Symbol(gradient_method),
+        sqrt(floatmax(Float64)), _ctsem_optimise_log(objective, false))
+    return trial.valid
+end
+
+export ctsem_start_usable
+
+"""
+    CTSEMScoreStore(nunits, npar)
+
+The per-unit scores at the last point an optimiser evaluated with a gradient,
+for R's `lbfgs_scores` control and the coreset stages: `x` the point, `S` its
+units' scores without the prior (units by parameters), `u` each unit's term
+there (unweighted, NaN for a unit of weight zero on the marginal route),
+`valid` whether they describe `x`.
+"""
+mutable struct CTSEMScoreStore
+    x::Vector{Float64}
+    S::Matrix{Float64}
+    u::Vector{Float64}
+    valid::Bool
+end
+CTSEMScoreStore(nunits::Integer, npar::Integer) =
+    CTSEMScoreStore(fill(NaN, npar), zeros(nunits, npar), fill(NaN, nunits), false)
+
+"""Whether a route can give the optimiser per-unit scores with its gradient:
+the marginal and Laplace routes, without a sampled TI predictor (whose
+imputation density is not a unit's)."""
+_ctsem_scores_supported(o::CTSEMObjective) = isempty(o.ti_missing_parameter)
+_ctsem_scores_supported(o) = false
+
+"""
+    _ctsem_optimise_trial_scores(objective, x, gradient_method, limit, log, store)
+
+`_ctsem_optimise_trial` with a gradient, taken as the sum of the units' scores
+(and the prior's gradient), the scores kept in `store` for the structured
+model of the curvature (`CTSEMStructured`). The same validity rule.
+"""
+function _ctsem_optimise_trial_scores(o::CTSEMObjective, x, gradient_method,
+        limit::Real, log, store::CTSEMScoreStore)
+    store.valid = false
+    xv = collect(Float64, x)
+    # Each subject's term too, which a coreset stage reads its value from
+    # (`_ctsem_coreset_anchor!`); NaN for a subject of weight zero.
+    fill!(store.u, NaN)
+    r = _ctsem_try_evaluate(() -> ctsem_subject_gradients(o, xv; prior=false,
+        sink=store.u))
+    (r === nothing || !isfinite(r.value) || !all(isfinite, r.scores)) &&
+        return (evaluated=nothing, valid=false)
+    g = vec(sum(r.scores; dims=1))
+    _ctsem_log_prior_gradient!(g, o, xv)
+    valid = _ctsem_gradient_usable(g, limit)
+    if valid
+        copyto!(store.S, r.scores); copyto!(store.x, xv); store.valid = true
+    end
+    return (evaluated=(value=r.value, gradient=g), valid=valid)
+end
+
+"""
+    CTSEMStructured(store, precision, npar)
+
+The second model of the curvature that R's `lbfgs_scores` control gives
+L-BFGS: the centred outer product of the units' scores at the current point
+plus the prior's precision (`B`), and a learned correction to the Hessian
+(`A`), updated by SR1 from each step's secant residual -- the structured
+quasi-Newton of Dennis, Gay and Welsch (NL2SOL), with the score outer product
+in Gauss-Newton's place. Near the optimum `B` carries most of the curvature's
+conditioning (eigenvalue spreads of 2-30 left after it on the bench, against
+10-1000 after per-parameter scaling; dev1, 2026-10-17) and starting L-BFGS from
+it took 2-5 times fewer iterations; far from it, `B` misstates the curvature
+and a run on it stopped hundreds of nats short. So the two models run side by
+side and each step is taken on whichever predicted the last step's actual gain
+better (`_ctsem_structured_update!`), with no distance to choose.
+
+And only near the optimum, which is where `B` is the information: there
+`g' (B + A)^-1 g / 2` is the log likelihood still to gain, about a confidence
+region's chi-square with `npar` degrees of freedom, and the model steps only
+while that is at most `npar`. Further away `B` extrapolates, and accurately
+predicted steps can still lead somewhere plain L-BFGS does not go: on
+test-poprank.R's full-rank fit from its start, steps whose gains it predicted
+to 3% drove a population sd's raw value from 0 to -23, the flat end of its
+transform, where the fit stopped saturated 0.62 below the maximum (dev2). Its
+step is also at most twice the last accepted step's length, a trust region
+that doubles while the model keeps predicting.
+
+`B` itself, units times parameters squared, is formed only for a step the model
+takes. Comparing its prediction with L-BFGS's and learning `A` need only `B`
+times the step, which the scores give in units times parameters
+(`_ctsem_structured_Bmul`); the scores at the step's start are kept for that
+(`S0`, `x0`). Formed at every iteration, `B` cost the bench about 2 per cent a
+gradient (dev1, 2026-10-18), most of it while the model was too far from the
+optimum to step.
+"""
+mutable struct CTSEMStructured
+    store::CTSEMScoreStore
+    precision::Vector{Float64}
+    A::Matrix{Float64}
+    B::Matrix{Float64}
+    Bx::Vector{Float64}
+    haveB::Bool
+    active::Bool
+    steps::Int
+    last::Float64
+    S0::Matrix{Float64}
+    x0::Vector{Float64}
+    have0::Bool
+end
+CTSEMStructured(store::CTSEMScoreStore, precision::AbstractVector, n::Integer) =
+    CTSEMStructured(store, collect(Float64, precision), zeros(n, n), zeros(n, n),
+        fill(NaN, n), false, false, 0, NaN, zeros(size(store.S)), fill(NaN, n),
+        false)
+
+"""`B v` from the units' scores `S` at a point, without forming `B`: `S' (S v)`
+less the centring `g (g' v) / units`, plus the prior's precision times `v`.
+Two matrix-vector products, units times parameters."""
+function _ctsem_structured_Bmul(S::AbstractMatrix, precision::AbstractVector,
+        v::AbstractVector)
+    out = transpose(S) * (S * v)
+    g = vec(sum(S; dims=1))
+    c = dot(g, v) / size(S, 1)
+    @inbounds for i in eachindex(out)
+        out[i] += precision[i] * v[i] - c * g[i]
+    end
+    return out
+end
+
+"""`B` at `x` from the store's scores there, centred: the outer product of the
+units' scores about their mean, without the mean's own `g g' / units`, which
+dominates far from the optimum; plus the prior's precision. `false` when the
+store does not describe `x`. Formed for a step the model takes, never per
+row."""
+function _ctsem_structured_B!(m::CTSEMStructured, x::AbstractVector)
+    st = m.store
+    (st.valid && st.x == x) || return false
+    _ctsem_score_information!(m.B, st.S, m.precision)
+    copyto!(m.Bx, x)
+    m.haveB = true
+    return true
+end
+
+"""The structured model's step at `x`, `-(B + A) \\ G` shortened to twice the
+last accepted step's length, when it is the model in use, positive definite
+there, and predicts no more than `npar` still to gain; `nothing` otherwise."""
+function _ctsem_structured_direction(m::CTSEMStructured, x::AbstractVector,
+        G::AbstractVector)
+    m.active || return nothing
+    (m.haveB && m.Bx == x) || _ctsem_structured_B!(m, x) || return nothing
+    F = cholesky!(Symmetric(m.B .+ m.A); check=false)
+    issuccess(F) || return nothing
+    d = -(F \ G)
+    -dot(G, d) / 2 <= length(G) || return nothing
+    if isfinite(m.last) && m.last > 0
+        len = norm(d)
+        len > 2 * m.last && (d .*= 2 * m.last / len)
+    end
+    return d
+end
+
+"""
+    _ctsem_structured_update!(m, x0, x1, G0, G1, f0, f1, step, alpha, structured_step)
+
+After an accepted step from `x0` to `x1` (minimised values `f0`, `f1`): each
+model's predicted gain for that step against the gain it made, the correction
+`A` updated from the secant residual at `x1`'s `B` (so that `(B + A) step =
+G1 - G0`), and which model takes the next step. `B` times the step comes from
+`B` where it was formed at `x0`, otherwise from the scores kept there and at
+`x1` (`_ctsem_structured_Bmul`). Plain L-BFGS's prediction is
+read off its own step (`step = alpha d` with `d = -H^-1 G0`, so `step' H step =
+-alpha G0' step`); after a structured step it has none, and the structured
+model keeps the next one while it predicted within a factor of two.
+"""
+function _ctsem_structured_update!(m::CTSEMStructured, x0, x1, G0, G1, f0, f1,
+        step, alpha, structured_step::Bool)
+    actual = f0 - f1
+    predicted = NaN
+    Bs = (m.haveB && m.Bx == x0) ? m.B * step :
+        (m.have0 && m.x0 == x0) ? _ctsem_structured_Bmul(m.S0, m.precision, step) :
+        nothing
+    if Bs !== nothing
+        Hs = Bs .+ m.A * step
+        predicted = -dot(G0, step) - dot(step, Hs) / 2
+    end
+    plain = structured_step ? NaN : -dot(G0, step) * (1 - alpha / 2)
+    st = m.store
+    m.have0 = false
+    if st.valid && st.x == x1
+        r = (G1 .- G0) .- (_ctsem_structured_Bmul(st.S, m.precision, step) .+
+            m.A * step)
+        den = dot(r, step)
+        if abs(den) > 1e-8 * norm(r) * norm(step)
+            m.A .+= (r * transpose(r)) ./ den
+        end
+        copyto!(m.S0, st.S)
+        copyto!(m.x0, x1)
+        m.have0 = true
+    end
+    miss(p) = (isfinite(p) && p > 0 && actual > 0) ? abs(log(actual / p)) : Inf
+    m.active = structured_step ? miss(predicted) <= log(2) :
+        miss(predicted) < miss(plain)
+    structured_step && (m.steps += 1)
+    m.last = norm(step)
+    return nothing
+end
+
+"""
+    CTSEMPinnedObjective(objective, index, value)
+
+`objective` with the coordinates in `index` held at `value`.
+
+A profile point and an escape attempt are the same operation, which is why this
+exists once and has two callers. Both fix a coordinate somewhere other than
+where the optimiser left it and re-optimise everything else; the difference is
+only what the answer is used for. Profiling reads the constrained maximum as a
+statement about identification; escaping releases the coordinate afterwards and
+keeps the result if it beats where the fit was.
+
+Pinning is what separates this from resuming a fit from a displaced point,
+which the escape loop already does. An unpinned resume can slide straight back
+down the direction it was pushed along -- measured on this package at -3721.05
+against -2950.59 -- because nothing stops the coordinate returning to the basin
+while the rest of the model stays put. Holding it still forces the other
+parameters to accommodate the displaced value first, and only then is it let
+go.
+
+The parameter vector keeps its full length and the pinned entries are
+overwritten on the way in, rather than optimising a shorter vector. Every index
+in the engine -- `matsetup` rows, transform lookups, saturation and pullback
+coordinate sets, the preconditioner -- is positional in the full vector, so a
+reduced vector would need all of them remapped, and a missed one would not
+error. It would return a number.
+
+The gradient comes back zero in the pinned entries, which is what actually
+holds them: L-BFGS builds its direction from gradients and secant pairs, and a
+coordinate contributing zero to both keeps whatever it started with. The caller
+should still overwrite the pinned entries of the minimizer, because "cannot
+move in exact arithmetic" is not the same claim as "did not move".
+"""
+struct CTSEMPinnedObjective{O} <: CTSEMOptimisable
+    objective::O
+    index::Vector{Int}
+    value::Vector{Float64}
+end
+
+"""
+    ctsem_pin(objective, index, value)
+
+`objective` with `index` pinned at `value`; see `CTSEMPinnedObjective`.
+
+Validated here rather than at the first evaluation: a misspelled index should
+cost nothing, not a whole optimisation that silently pinned the wrong
+coordinate.
+"""
+function ctsem_pin(objective::CTSEMOptimisable, index::AbstractVector,
+        value::AbstractVector)
+    idx = collect(Int, index)
+    val = collect(Float64, value)
+    length(idx) == length(val) ||
+        throw(ArgumentError("ctsem_pin: index and value must be the same length"))
+    allunique(idx) ||
+        throw(ArgumentError("ctsem_pin: each coordinate may be pinned only once"))
+    all(isfinite, val) ||
+        throw(ArgumentError("ctsem_pin: a pinned value must be finite"))
+    all(>=(1), idx) ||
+        throw(ArgumentError("ctsem_pin: coordinates are 1-based"))
+    return CTSEMPinnedObjective(objective, idx, val)
+end
+
+export ctsem_pin
+
+"""The trial point as the inner objective sees it: pinned entries restored."""
+function _ctsem_pin_expand(p::CTSEMPinnedObjective, x::AbstractVector)
+    y = collect(x)
+    @inbounds for (position, i) in enumerate(p.index)
+        1 <= i <= length(y) || continue
+        y[i] = p.value[position]
+    end
+    return y
+end
+
+"""An evaluation with the pinned coordinates' gradient entries removed."""
+function _ctsem_pin_project(p::CTSEMPinnedObjective, evaluated)
+    evaluated === nothing && return nothing
+    hasproperty(evaluated, :gradient) || return evaluated
+    gradient = evaluated.gradient
+    gradient === nothing && return evaluated
+    g = collect(gradient)
+    @inbounds for i in p.index
+        1 <= i <= length(g) || continue
+        g[i] = zero(eltype(g))
+    end
+    return merge(evaluated, (gradient=g,))
+end
+
+# Everything else is the inner objective's. The laplace route overrides most of
+# this protocol -- its own trial validity, its own trace columns, its own
+# verbose report -- and wrapping it must not quietly return any of that to the
+# generic default. In particular `_ctsem_optimise_trial` is forwarded rather
+# than reimplemented, so a pinned laplace fit still refuses a point whose inner
+# Newton did not converge.
+_ctsem_optimise_label(p::CTSEMPinnedObjective) =
+    string(_ctsem_optimise_label(p.objective), " (pinned)")
+_ctsem_optimise_setup!(p::CTSEMPinnedObjective) = _ctsem_optimise_setup!(p.objective)
+_ctsem_pinned_point(p::CTSEMPinnedObjective, x) =
+    (y = collect(Float64, x); y[p.index] .= p.value; y)
+_ctsem_anchor_start!(p::CTSEMPinnedObjective, x; kwargs...) =
+    _ctsem_anchor_start!(p.objective, _ctsem_pinned_point(p, x); kwargs...)
+_ctsem_anchor_here!(p::CTSEMPinnedObjective) = _ctsem_anchor_here!(p.objective)
+_ctsem_anchor_modes(p::CTSEMPinnedObjective; kwargs...) =
+    _ctsem_anchor_modes(p.objective; kwargs...)
+_ctsem_anchor_finish!(p::CTSEMPinnedObjective, x) =
+    _ctsem_anchor_finish!(p.objective, _ctsem_pinned_point(p, x))
+_ctsem_take_search_modes!(p::CTSEMPinnedObjective, x, found) =
+    _ctsem_take_search_modes!(p.objective, _ctsem_pinned_point(p, x), found)
+ctsem_laplace_clear_anchors!(p::CTSEMPinnedObjective) =
+    ctsem_laplace_clear_anchors!(p.objective)
+_ctsem_optimise_log(p::CTSEMPinnedObjective, verbose::Bool) =
+    _ctsem_optimise_log(p.objective, verbose)
+_ctsem_optimise_trace_keys(p::CTSEMPinnedObjective) =
+    _ctsem_optimise_trace_keys(p.objective)
+_ctsem_optimise_trace_values(p::CTSEMPinnedObjective) =
+    _ctsem_optimise_trace_values(p.objective)
+_ctsem_optimise_refusal(p::CTSEMPinnedObjective) = _ctsem_optimise_refusal(p.objective)
+_ctsem_optimise_progress_extra(p::CTSEMPinnedObjective) =
+    _ctsem_optimise_progress_extra(p.objective)
+_ctsem_optimise_verbose_shape(p::CTSEMPinnedObjective) =
+    _ctsem_optimise_verbose_shape(p.objective)
+_ctsem_optimise_verbose_report(p::CTSEMPinnedObjective, log) =
+    _ctsem_optimise_verbose_report(p.objective, log)
+_ctsem_optimise_result_extra(p::CTSEMPinnedObjective, final, log) =
+    _ctsem_optimise_result_extra(p.objective, final, log)
+_ctsem_params(p::CTSEMPinnedObjective) = _ctsem_params(p.objective)
+
+"""
+A pinned coordinate cannot saturate, overshoot or stall, because it cannot
+move. Leaving it in the range would let the pullback probe pick it up and
+report a gain from moving something this objective is holding still.
+"""
+_ctsem_saturation_range(p::CTSEMPinnedObjective, minimizer) =
+    [i for i in _ctsem_saturation_range(p.objective, minimizer) if !(i in p.index)]
+
+"""
+Forwarded rather than left to the generic default, which would rebuild the
+answer from `_ctsem_params` and the range. The laplace route overrides this and
+its override is not reconstructible from those: it is the only thing that knows
+a population correlation has reached its cap, which is exactly the state that
+stalled the fit the stall check was written for. Falling back here would have
+lost that silently on every pinned laplace stage.
+"""
+_ctsem_saturated_for(p::CTSEMPinnedObjective, minimizer) =
+    [i for i in _ctsem_saturated_for(p.objective, minimizer) if !(i in p.index)]
+
+function _ctsem_optimise_trial(p::CTSEMPinnedObjective, x, want_gradient::Bool,
+        gradient_method, limit::Real, log)
+    trial = _ctsem_optimise_trial(p.objective, _ctsem_pin_expand(p, x),
+        want_gradient, gradient_method, limit, log)
+    return (evaluated=_ctsem_pin_project(p, trial.evaluated), valid=trial.valid)
+end
+
+_ctsem_probe_value(p::CTSEMPinnedObjective, x) =
+    _ctsem_probe_value(p.objective, _ctsem_pin_expand(p, x))
+
+ctsem_evaluate(p::CTSEMPinnedObjective, x::AbstractVector; kwargs...) =
+    _ctsem_pin_project(p, ctsem_evaluate(p.objective, _ctsem_pin_expand(p, x);
+        kwargs...))
+
+"""
+    _ctsem_metric(precondition, n)
+
+A diagonal metric for L-BFGS, or `nothing` to leave it alone.
+
+L-BFGS starts with a *scalar* initial inverse Hessian and takes a first step of
+unit length in the raw coordinates, so it has no per-coordinate scaling until
+secant pairs accumulate. When one coordinate maps to model quantities ten times
+faster than the others -- which a `meanscale` of 10 against 1 is exactly -- the
+step that suits the rest is ten times too long for it, and the line search has
+to shrink the *whole* step to accommodate the worst one. Measured on a
+40-subject count model's laplace route: gradient components spanning 210:1
+across coordinates, 30 function evaluations spent on 4 iterations, stopping with
+303 nats still available and not one trial point rejected. At 26:1 the same fit
+converges.
+
+`precondition[i]` is `|d value / d raw|` for coordinate `i`, so `P` is its
+square: `P` stands in for the Hessian, and a transform with factor `s`
+multiplies second derivatives by `s^2`. A step is then the same amount of model
+in every coordinate, which is the metric L-BFGS would have built for itself
+after enough iterations to be worth having.
+
+Non-finite or non-positive entries become 1 -- no preconditioning for that
+coordinate -- rather than disqualifying the whole metric, since a single
+un-differentiable transform should not cost every other parameter its scaling.
+"""
+function _ctsem_metric(precondition, n::Integer)
+    precondition === nothing && return nothing
+    scale = collect(Float64, precondition)
+    length(scale) == n || return nothing
+    @inbounds for i in eachindex(scale)
+        (isfinite(scale[i]) && scale[i] > 0) || (scale[i] = 1.0)
+    end
+    all(isequal(1.0), scale) && return nothing
+    Diagonal(scale .^ 2)
+end
+
+"""
+    _ctsem_lbfgs_inverse(inverse, n)
+
+A caller's initial inverse Hessian for L-BFGS (`_ctsem_lbfgs`'s `inverse`),
+symmetrised, or `nothing` where it is not one: not `n` by `n`, not finite, or
+not positive definite, since a direction it gives would then not descend. The
+optimiser then learns its curvature from the pairs, as without one.
+"""
+function _ctsem_lbfgs_inverse(inverse, n::Integer)
+    inverse === nothing && return nothing
+    H = Matrix{Float64}(inverse)
+    (size(H) == (n, n) && all(isfinite, H)) || return nothing
+    H = (H .+ transpose(H)) ./ 2
+    isposdef(Symmetric(H)) || return nothing
+    H
+end
+
+"""What the last `window` iterations gained, for reporting; `_ctsem_stalled`
+reads the trace the same way.
+"""
+function _ctsem_window_gain(trace::CTSEMTrace, window::Integer)
+    values = get(trace.values, :objective, Float64[])
+    length(values) > window ? values[end] - values[end - window] : 0.0
+end
+
+"""
+What the final iteration gained, in objective units.
+
+`Inf` when there is no pair of iterations to compare, so a run that recorded one
+row or none cannot satisfy a convergence test with it. Read from the trace
+rather than tracked separately because the trace already records every
+iteration's objective and a second accumulator of the same numbers is a second
+thing to keep in step.
+"""
+function _ctsem_last_gain(trace::CTSEMTrace)
+    values = get(trace.values, :objective, Float64[])
+    length(values) < 2 && return Inf
+    abs(values[end] - values[end - 1])
+end
+
+"""
+    _ctsem_stalled(trace, window, bar)
+
+Whether the last `window` iterations gained `bar` nats or less.
+
+Half of a conjunction, and deliberately the weak half. On its own it cannot
+tell a fit that is stuck from one that is converging slowly, and those want
+opposite treatment -- a slow fit should be left alone, because the estimate has
+to settle properly before its curvature is worth anything. So on a first stage
+this only decides *when to look*, and `_ctsem_flat_coordinates` decides whether
+there is anything to find. A false positive here costs one cheap derivative
+pass.
+
+A bar in nats, read off the window alone. A nat of log likelihood means the
+same in any model -- the certification, the gap rule and the escapes all
+judge in nats -- and what the window gained is the stage's own, whatever the
+start. Until 2026-11-08 the bar was a share (1e-2, tightened to 1e-3 and 1e-4)
+of everything the fit had gained, earlier stages included: a fit started far
+off looked at a creep of tens of nats a window, one started near its optimum
+almost never looked, and a resumed stage had to be handed its predecessors'
+progress to have a bar at all (Charles: "that will differ lots based on start
+values"). `1/2 g'Bg`, what L-BFGS predicts is left, is not the measure either:
+on the fit the watch was written for it decayed nine orders and then bounced
+back two, because a direction going flat sends the gradient to zero and `B` to
+infinity together.
+
+`false` before there is a window to look at.
+"""
+function _ctsem_stalled(trace::CTSEMTrace, window::Integer, bar::Real)
+    values = get(trace.values, :objective, Float64[])
+    window >= 1 || return false
+    length(values) > window || return false
+    gained = values[end] - values[end - window]
+    isfinite(gained) || return false
+    return gained <= bar
+end
+
+"""
+How little a stage's last `window` iterations may gain, in nats, for the stall
+watch to look for a flat coordinate (`_ctsem_stalled`): half a nat, the gap of
+a point one standard error from its maximum. A window that gains less is
+creeping at under 1/160 of that an iteration, where any fit that is going to
+converge by its own rule within the iteration cap has little left to gain,
+and a look costs a derivative pass. A bar on when to *look*, so generous on
+purpose: the stop needs a flat coordinate and a better point behind it too.
+"""
+const _CTSEM_STALL_LOOK = 0.5
+
+"""
+The conjunction that decides a fit has stopped for a reason, and the hysteresis
+that keeps it from asking the same question every iteration.
+
+`_ctsem_stalled` says the fit is not getting anywhere. `_ctsem_flat_coordinates`
+says whether a transform has gone flat, which is the structural reason a fit
+stops getting anywhere. Either alone is a mistake this codebase has already
+made: saturation alone reported 45 of 64 good fits as failures, because a
+population scale with no individual differences behind it saturates early and
+legitimately while the fit goes on to a perfectly good optimum; and a progress
+test alone cannot tell stuck from slow.
+
+The progress test is that the stage's last `window` iterations gained no more
+than `look` nats (`_CTSEM_STALL_LOOK`). When it fires and nothing is flat, the
+fit is not asked again for `cooldown` iterations. A fit that is merely slow
+costs a derivative pass every `cooldown` iterations while it creeps, which is
+what a long careful optimisation can afford.
+
+## Stalled and flat is not enough
+
+It was, and `test_state_sampling.jl`'s count model over the joint density is
+why it is not. That fit *correctly* ends saturated: its drift arrives at raw
+-18.5 where `-log1p_exp` is flat, the objective is at its supremum there, and
+pulling the coordinate back finds nothing better. Stalled-and-flat is exactly
+what a fit looks like while it converges *into* a flat region, so the two
+halves alone stopped it before it arrived and turned a converged fit into a
+failed one.
+
+What separates them is already being computed: whether a pullback finds
+anything. The runaway drift this was built for gains 142 nats on the spot; the
+count model gains nothing. So the third condition is that there is somewhere
+better to go, and the fit is only stopped when all three hold -- which is also
+what makes stopping safe, because the point to resume from is in hand.
+
+A fit that is stalled and flat with nothing better nearby is treated as the
+slow case: a cooldown. If it is nonetheless in the wrong place, the
+zero-and-refit escape after the fit is what finds out, because only a refit
+can.
+
+## A resumed stage may stop on progress alone
+
+`alone = true`, which `.ctBackendCorrectResult()` sets on a stage it resumes
+because the certification found the point short of a maximum. There "stuck
+versus slow" is exactly the question left: a resumed stage whose window gains
+no more than `stop` nats, `_CTSEM_RESOLUTION_CAP`, the most any bar on a gain
+rises to (a tenth of a standard error), with nothing flat to pull back and
+nothing diverging, is stuck, and it stops (`exhausted`). At that pace the
+iteration cap leaves it a few hundredths of a nat to find. This is the one
+no-progress rule for a resume; it replaced switching the predicted-gain stop
+off and quadrupling the cap, which is how a resume on AnomAuth came to run for
+hours.
+
+## Walking off to a limit
+
+A fit can stall with nothing flat for a reason the slow case does not cover:
+its supremum lies at a limit the parameters reach only at infinity, so every
+step gains a little less while some coordinates keep growing. A second-order
+process the data do not need does this -- it approaches the first-order model
+only as its damping and restoring coefficient go to minus infinity -- and the
+transform there, `-log1p_exp(-2 param)`, is linear, not flat, so the
+conjunction above never completes. On the adequacy tutorial's randomdrift
+search the refit gained a nat over its iterations 30-180 while its largest
+coordinate went from 1.8 to 17, then 0.01 over 180-330 while it went to 17,146,
+geometrically; each iteration slowed from half a second to minutes as the
+dynamics stiffened, and the runs hit their 8-hour limits. So at a trigger
+that finds nothing flat, coordinates beyond `_CTSEM_DIVERGE_RAW` that have at
+least doubled since the previous trigger, with the same sign, are diverging:
+the watch stops the run (`diverged`, `stop_reason` "diverged") and names them.
+A slow fit converges, so its coordinates settle between triggers 30 iterations
+apart rather than double ten prior sds out. Replayed on that walk's record
+under the progress share the watch then used (triggers at iterations 99, 129
+and 178), the run stops at iteration 208, its largest coordinate -43.8 against
+-15.6 at the trigger before, 0.005 nats short of where the walk ended. Under
+the window's half nat its first trigger comes at iteration 260 at the latest
+(the walk gained 0.01 nats over 180-330, its coordinates doubling about every
+15 iterations), and the second stops it.
+
+## Provenance
+
+The window of 80 iterations, the cooldown of 30 and the flat ratio of 1e-3
+that `ctsem_optimize` passes to `_ctsem_flat_coordinates` were set by hand on
+the flat-transform fixtures the watch was built for (fcae6459, 2026-09-14): a
+drift started inside `-log1p_exp`'s flat region, now the slow tier of
+`test-julia-convergence.R`, and `test_state_sampling.jl`'s count model for the
+case the conjunction must leave alone. The bars in nats replaced a share of the
+fit's progress on 2026-11-08 (`_ctsem_stalled`). No sweep over any of them is
+on record, and the bench cannot give one: over 2,659 bench fits recorded from
+2026-10-24 to 10-31, categorical and multilevel among them, the watch fired
+twice and stopped none (`review/bench/2026-10-31-defaults-jf-f979c331.md`).
+Its numbers matter only on fits long enough to creep for a window.
+"""
+mutable struct CTSEMStallWatch
+    window::Int
+    look::Float64
+    stop::Float64
+    cooldown::Int
+    quiet_until::Int
+    triggers::Int
+    flat::Vector{Int}
+    point::Vector{Float64}
+    gain::Float64
+    alone::Bool
+    exhausted::Bool
+    # The point at the last trigger that found nothing, and whether the run is
+    # walking off to a limit (see "Walking off to a limit" above).
+    previous::Vector{Float64}
+    diverged::Bool
+end
+
+CTSEMStallWatch(; window::Integer=80, look::Real=_CTSEM_STALL_LOOK,
+    stop::Real=_CTSEM_RESOLUTION_CAP, cooldown::Integer=30,
+    alone::Bool=false) =
+    CTSEMStallWatch(Int(window), Float64(look), Float64(stop), Int(cooldown),
+        0, 0, Int[], Float64[], 0.0, alone, false, Float64[], false)
+
+"""
+How far past its N(0, 1) prior, in raw units, a coordinate must be for the
+stall watch to read its doubling between triggers as a walk to infinity
+(`_ctsem_diverging`): ten prior sds, past where any default transform is
+anywhere but asymptotic, and past where a slow fit's coordinates are still
+moving. On the walk that set it the largest coordinate passed 10 at iteration
+121 and went from -15.6 to -43.8 between the triggers at 178 and 208.
+"""
+const _CTSEM_DIVERGE_RAW = 10.0
+
+"""The coordinates of `x` beyond `_CTSEM_DIVERGE_RAW` that have at least
+doubled, sign kept, since `previous`; none where there is no previous point."""
+function _ctsem_diverging(previous::AbstractVector, x::AbstractVector)
+    length(previous) == length(x) || return Int[]
+    return [j for j in eachindex(x) if abs(x[j]) >= _CTSEM_DIVERGE_RAW &&
+        sign(x[j]) == sign(previous[j]) && abs(x[j]) >= 2 * abs(previous[j])]
+end
+
+"""
+    _ctsem_stall_verdict!(watch, trace, iteration, params, values, range, ratio)
+
+Whether to stop: the progress test fired *and* something is flat -- or, on a
+resumed stage (`watch.alone`), the window gained no more than `watch.stop`.
+
+Mutates `watch` with the hysteresis, and records which coordinates were flat so
+the caller can say what ended the run. `params === nothing`, or a range with
+nothing in it, means there is no transform layer to ask -- the conjunction can
+then never complete, which is the right answer rather than half of one; a
+resumed stage can still stop on progress alone.
+"""
+function _ctsem_stall_verdict!(watch::CTSEMStallWatch, trace::CTSEMTrace,
+        iteration::Integer, objective, params, values, range, ratio::Real;
+        tolerance::Real=1e-6, progress=nothing, report=nothing)
+    watch.window >= 1 || return false
+    params === nothing && !watch.alone && return false
+    iteration >= watch.quiet_until || return false
+    _ctsem_stalled(trace, watch.window, watch.look) || return false
+    watch.triggers += 1
+    if params !== nothing
+        # Two detectors, because neither sees what the other does.
+        # `_ctsem_flat_coordinates` measures a transform against its own live
+        # value and so is scale free, but it walks `regular_transforms` and the
+        # population scales and correlations are not in it.
+        # `_ctsem_saturated_for` is the route's own, and on the laplace route it
+        # is the only thing that knows a correlation has reached its cap --
+        # which is exactly the state that stalled the fit this was measured on.
+        # Missing it meant the conjunction never fired on that fit at all.
+        # Guarded separately, not as one expression. A detector that cannot
+        # answer for this objective must not take the other one down with it:
+        # wrapping both in a single `try` meant one `MethodError` reported
+        # nothing flat anywhere, which is the failure mode that reads as "no
+        # problem found".
+        relative = try
+            _ctsem_flat_coordinates(params, values, range; ratio=ratio)
+        catch
+            Int[]
+        end
+        route = try
+            _ctsem_saturated_for(objective, values)
+        catch
+            Int[]
+        end
+        flat = sort!(unique(vcat(relative, route)))
+        if !isempty(flat)
+            # And the third condition: somewhere better to go. Without it a fit
+            # converging into a flat region is stopped before it arrives.
+            #
+            # The value is taken at `values` rather than from the trace's last
+            # row, even though the trace has one and this costs an evaluation.
+            # They are not the same point: the trace records completed
+            # iterations, and the point handed in here is the last one the
+            # objective accepted, which may be a line-search trial taken after
+            # that row was written. A gain measured against the wrong baseline
+            # is not a gain.
+            value = _ctsem_probe_value(objective, values)
+            out = if isfinite(value)
+                try
+                    _ctsem_overshot(objective, values, flat, value, tolerance;
+                        progress=progress)
+                catch err
+                    _ctsem_must_propagate(err) && rethrow()
+                    nothing
+                end
+            else
+                nothing
+            end
+            report === nothing || report(iteration, flat,
+                out === nothing ? NaN : Float64(out.gain))
+            if out !== nothing && out.overshot && !isempty(out.point)
+                watch.flat = flat
+                watch.point = collect(Float64, out.point)
+                watch.gain = Float64(out.gain)
+                return true
+            end
+        end
+    end
+    # Coordinates walking off to a limit: no maximum to converge to, so no
+    # amount of rope helps. See "Walking off to a limit" above.
+    diverging = _ctsem_diverging(watch.previous, values)
+    if !isempty(diverging)
+        watch.flat = diverging
+        watch.diverged = true
+        return true
+    end
+    watch.previous = collect(Float64, values)
+    # On a resumed stage, a window that gained nothing the certification
+    # could use: stuck, not slow. See `CTSEMStallWatch`.
+    if watch.alone && _ctsem_stalled(trace, watch.window, watch.stop)
+        watch.exhausted = true
+        return true
+    end
+    # Stalled with nothing flat, or flat with nothing better nearby: slow
+    # rather than stuck. Wait before asking again.
+    watch.quiet_until = Int(iteration) + watch.cooldown
+    return false
+end
+
+"""
+Below this `|raw|` on every coordinate the end-of-run overshoot probe is not
+run (`_ctsem_overshoot_skippable`).
+
+The probe asks whether pulling coordinates back toward zero improves the fit,
+which is how a fit that stepped into a transform's flat region is told from one
+at a maximum; a coordinate that is already near zero is not where a standard
+transform goes flat. Measured on the optimiser bench at juliaFit 908b068d (dev1,
+2026-09-26; review/bench/2026-09-26-baseline.md): of 102 end-of-run probes on
+94 fits, the 77 at end points with every coordinate below 2 found nothing, and
+the two that found a gain were at 6.0 and 10.6. A probe that finds nothing
+changes no verdict, so skipping those moves no end point; the probe cost 3% to
+38% of a fit on the cells measured with it off.
+
+Not skipped while the saturation detector flags anything, whatever the
+magnitude: a custom transform can be flat near zero (`exp(20 * param)` at raw
+-1) where none of the standard ones is.
+"""
+const _CTSEM_OVERSHOOT_MIN_RAW = 2.0
+
+"""
+The share of the curvature's flat subspace a coordinate must carry for the
+end-of-run probe to pull it back: R's `.ctNullMassBar()`, the one rule for
+"this coordinate lies in a flat subspace", which the certification's
+intervals and the identifiability report apply to the same Hessian.
+"""
+const _CTSEM_NULL_MASS_BAR = 1e-3
+
+"""
+    _ctsem_flat_loaded(hessian; rtol, bar)
+
+The coordinates carrying at least `bar` of the flat subspace of `hessian`,
+the Hessian of the MAXIMISED objective: the directions
+`_ctsem_information_split` neither trusts nor calls negative, and a
+coordinate's share of them is the squared length of its unit vector's
+projection there (the diagonal of the projector). `nothing` when the
+Hessian cannot be split, which a caller reads as unknown.
+"""
+function _ctsem_flat_loaded(hessian::AbstractMatrix; rtol::Real=_CTSEM_FLAT_RTOL,
+        bar::Real=_CTSEM_NULL_MASS_BAR)
+    split = _ctsem_information_split(-Matrix{Float64}(hessian); rtol=rtol)
+    split === nothing && return nothing
+    flat = findall(.!split.trusted .& .!split.negative)
+    isempty(flat) && return Int[]
+    Q = split.vectors[:, flat]
+    share = vec(sum(abs2, Q; dims=2))
+    return findall(s -> s >= bar, share)
+end
+
+"""
+    _ctsem_overshoot_candidates(objective, minimizer, saturated_parameters,
+                                hessian, flat_rtol, stall_ratio)
+
+Which coordinates the end-of-run probe pulls back, or `nothing` where that
+cannot be told. An overshoot into a flat transform is a direction with no
+curvature, so with the finish's Hessian in hand the candidates are the
+coordinates that lie in its flat subspace (`_ctsem_flat_loaded`), together
+with those whose transform the route flags as saturated or that have lost
+all but `stall_ratio` of its live responsiveness (`_ctsem_flat_coordinates`,
+the stall watch's own rule). A collapsed population scale brings its
+correlations in through the first: their curvature goes with its variance,
+whatever their transforms still do. A coordinate with curvature behind it is
+estimated, and pulling it back is a move the quadratic model already prices;
+measured on the bench the full search over every coordinate was 5 per cent
+of a fit and up to half of an ordinal Laplace one, and it found an
+overshoot only where a coordinate was flat. Without a Hessian the search is
+over every coordinate, as before (`_ctsem_pullback_sets`), and so is it where
+this pool held something flat and its pullbacks found nothing: the way out
+can need a coordinate with curvature beside the flat one
+(`_ctsem_optimise_verdict`).
+
+After the iteration cap (`capped`) the pool is the transforms' alone, the
+saturated and the relatively flat, and the verdict does not widen it. The cap
+is the caller's budget and the fit is reported unconverged whatever the probe
+finds, which is why no finish runs there either; what is still worth a probe
+is a coordinate run into a flat transform, which a resume should not start
+from. The search over every coordinate cost 26 minutes a set, 22 sets, after
+a one-iteration fit of 1324 Laplace units.
+"""
+function _ctsem_overshoot_candidates(objective, minimizer, saturated_parameters,
+        hessian, flat_rtol::Real, stall_ratio::Real; capped::Bool=false)
+    n = length(minimizer)
+    usable = hessian !== nothing && size(hessian, 1) == n &&
+        size(hessian, 2) == n && all(isfinite, hessian)
+    loaded = usable ? _ctsem_flat_loaded(hessian; rtol=flat_rtol) : nothing
+    loaded === nothing && !capped && return nothing
+    # An objective with no transform layer (`_ctsem_params`) has nothing to
+    # ask about responsiveness; the stall watch reads the same absence.
+    relative = if hasmethod(_ctsem_params, Tuple{typeof(objective)}) &&
+            _ctsem_params(objective) !== nothing
+        _ctsem_flat_coordinates(_ctsem_params(objective),
+            collect(Float64, minimizer),
+            _ctsem_saturation_range(objective, minimizer); ratio=stall_ratio)
+    else
+        Int[]
+    end
+    return sort!(unique(vcat(something(loaded, Int[]), relative,
+        [p for p in saturated_parameters if 1 <= p <= n])))
+end
+
+"""
+    _ctsem_overshoot_skippable(minimizer, saturated_parameters, candidates=nothing)
+
+Whether the end-of-run overshoot probe can be skipped: nothing flagged as
+saturated, and either no candidate to pull back (`candidates` known and
+empty, `_ctsem_overshoot_candidates`) or, where the candidates are unknown,
+every coordinate finite and below `_CTSEM_OVERSHOOT_MIN_RAW` in magnitude.
+"""
+function _ctsem_overshoot_skippable(minimizer, saturated_parameters,
+        candidates=nothing)
+    isempty(saturated_parameters) || return false
+    isempty(minimizer) && return false
+    all(isfinite, minimizer) || return false
+    candidates === nothing || return isempty(candidates)
+    return all(x -> abs(x) < _CTSEM_OVERSHOOT_MIN_RAW, minimizer)
+end
+
+"""
+    _ctsem_optimise_verdict(objective, minimizer, start_values, value, gradient_norm,
+                            predicted_gain, last_gain, saturated_parameters,
+                            g_tol, converge_tol; label, verbose)
+
+Whether an optimiser arrived at a maximum, in one place for every route.
+
+Optim's own `converged` is the disjunction of three criteria, and a line search
+that fails on its first try satisfies the `f` one trivially: the objective did
+not change because nothing was accepted. Measured on a 100-subject model, that
+route stopped with `g_converged=false` and a largest gradient of 3.5e-07
+against `g_tol=1e-8` and reported success. So convergence is judged on what is
+still available, and on three separate ways of not being at a maximum.
+
+`stalled` is an optimiser that never left its starting values while the
+gradient there is not zero -- a fit that has not fitted anything, whatever its
+flags say. `overshot` is an optimiser that stepped into the flat region of a
+parameter's transform, where the gradient underflows to zero and every
+tolerance passes: `_ctsem_overshot` separates that from a coordinate the data
+simply do not identify by pulling the coordinate back and asking whether the
+objective improves. Saturation on its own is a finding and not a failure, and
+only the overshoot disqualifies the fit.
+
+The L-BFGS's `g_tol` is an *absolute* gradient bound, and a log likelihood of
+order 1e3 puts 1e-8 out of reach however good the fit is -- L-BFGS runs out of
+line search first and reports nothing converged -- so its `g_converged` is kept
+only as a sufficient condition, never a necessary one. `finite_gradient` is
+tested explicitly because it can be true at a point whose gradient is NaN, set
+on an earlier iterate, and `NaN <= tolerance` is false: one draw in ten reported
+convergence with a NaN gradient. The failure that shaped all of this is still
+the one to beat -- a 12-subject model stopping after a single iteration with a
+gradient of 1.2e9 and a log likelihood of -7.7e6, reporting success -- and a
+point like that has an enormous predicted gain, so it fails this criterion the
+way it failed the last one.
+
+## The criterion is not a gradient
+
+`converge_tol` is in *nats*, and what is compared against it is
+`predicted_gain` -- `1/2 g' B g` from the L-BFGS metric, recorded by the line
+search in `CTSEMDirectional`. Both sides are objective differences, which is the
+only comparison here that survives its own units.
+
+A gradient does not. Under a reparameterisation `theta -> A theta` it becomes
+`A^-T g`, so `|g| < c` says something different in every parameterisation, and
+there is no divisor that repairs it: `max(1, |value|)`, the worst gradient the
+run saw, and `sum(abs, subject_loglik)` were each tried here, and the best of
+them is only the least arbitrary. An objective *difference*, by contrast, is a
+log likelihood ratio: the likelihood's additive constants cancel, the
+reparameterisation cancels, and 0.005 nats is negligible with six subjects or
+six thousand while 10 nats matters with either. That is why `gaptol` is an
+absolute number and correctly so, and this is the same number.
+
+`1/2 g' B g` is the same quantity `.ctBackendOptimGap()` certifies with,
+`1/2 g' H^-1 g`, under a weaker metric: `B` is L-BFGS's approximation and
+depends on the retained secant pairs and the initial scaling, so it is affine
+invariant only as far as that approximation is good. It can therefore stop a fit
+and not certify one -- which is the division of labour already in place. When a
+Hessian is computed, `.ctBackendCertifiedVerdict()` replaces this verdict with
+the exact one; what is left here is the fits that certify nothing (`estonly`,
+`certify = FALSE`).
+
+`last_gain` -- the objective change over the final iteration -- is the second
+sufficient condition, and it is here because `1/2 g'Bg` alone is not enough.
+Measured on five fits against the exact gap:
+
+    fit                    1/2 g'Bg    last step    exact gap
+    saturated, converged      1.002            0     2.1e-15
+    iteration cap 2           0.061        0.093       0.312
+    iteration cap 8         1.5e-14            0     1.4e-15
+    clean, converged        4.4e-15            0     3.4e-15
+    clean, cap 3            3.0e-15      2.8e-14     2.3e-21
+
+The metric fails twice. On the saturated fit it reports a whole nat where the
+truth is 2e-15: a transform gone flat has a gradient underflowing to zero and a
+`B` blowing up in the same direction, and `0 * Inf` is not a measurement.
+`.ctBackendOptimGap()` handles that case by excluding flat directions from the
+trusted subspace and *probing* them; nothing available here can. And on the
+capped fit it reports a fifth of the truth, so it does not even err in the safe
+direction.
+
+What `last_gain` claims is weaker -- that no further progress was achievable,
+not that nothing is left -- and it can be satisfied by a fit that stopped for a
+reason other than being at a maximum. `stalled` and `overshot` are what stand
+against the two ways that happens here. But it is in objective units and it
+cannot be corrupted by the metric, which is where the other one breaks, so the
+two together cover what neither does alone.
+
+The overshoot bar is the same `converge_tol`, for the same reason: what
+`_ctsem_overshot` measures is an objective gain, so it belongs against an
+objective tolerance. One number, one unit, two uses it is dimensionally entitled
+to. The probe is not run where every coordinate is small and nothing is
+flagged; see `_CTSEM_OVERSHOOT_MIN_RAW`.
+
+`saturated_parameters` arrives as an argument because the routes detect it
+differently: the marginal and joint ones ask `_ctsem_saturated_parameters` over
+`_ctsem_saturation_range`, and the laplace one adds the levels whose
+correlations saturate together (`_laplace_saturated_parameters`).
+"""
+function _ctsem_optimise_verdict(objective, minimizer, start_values, value,
+        gradient_norm, predicted_gain, last_gain, saturated_parameters,
+        g_tol, converge_tol;
+        label::AbstractString="ctsem_optimize", verbose::Bool=false,
+        overshoot_probe=_CTSEM_OVERSHOOT_PROBE[], progress=nothing,
+        candidates=nothing, widen::Bool=true)
+    moved =isempty(minimizer) ? 0.0 : maximum(abs, minimizer .- start_values)
+    saturated = !isempty(saturated_parameters)
+    stalled = moved == 0 && (!isfinite(value) || gradient_norm > max(g_tol, 1e-6))
+    finite_gradient = isfinite(gradient_norm)
+    # Both `Inf` before there is anything to report, so a fit that never took a
+    # step cannot pass here on an uninitialised number.
+    converged_enough = isfinite(value) && finite_gradient &&
+        (predicted_gain <= converge_tol || last_gain <= converge_tol)
+    overshoot = _ctsem_overshoot_skippable(minimizer, saturated_parameters,
+            candidates) ?
+        (overshot=false, gain=0.0, coordinates=Int[], point=Float64[]) :
+        _ctsem_overshot(objective, minimizer, saturated_parameters,
+            value, converge_tol; mode=overshoot_probe, progress=progress,
+            among=candidates)
+    # The curvature's pool settles "not a maximum" when it finds a gain, but
+    # not "a maximum" when it finds none: the way out can need a coordinate
+    # the curvature does not call flat beside one it does. A drift that went
+    # to a random walk to stand in for a collapsed intercept variance, on a
+    # 12-subject model, had to come back with it; the pool held the variance
+    # alone and the fit stopped 2.95 nats below its maximum
+    # (review/UNCERTAINTY-checked-improper-2026-10-24.md). So where the pool
+    # had something flat and found nothing, the search over every coordinate
+    # decides, once; a fit with nothing flat never pays for it. Only in the
+    # default `:magnitude` mode: in `:saturation` the sets are the saturated
+    # coordinates whatever the pool, so a second search repeats the first.
+    # Not after the iteration cap (`widen`; `_ctsem_overshoot_candidates`).
+    if widen && !overshoot.overshot && candidates !== nothing && !isempty(candidates) &&
+            _ctsem_overshoot_mode(overshoot_probe) === :magnitude
+        wider = _ctsem_overshot(objective, minimizer, saturated_parameters,
+            value, converge_tol; mode=overshoot_probe, progress=progress)
+        overshoot = wider.overshot ? wider : (overshot=false,
+            gain=max(overshoot.gain, wider.gain), coordinates=Int[], point=Float64[])
+    end
+    overshot = overshoot.overshot
+    verbose && stalled && println(_console(), label, ": the optimizer made no ",
+        "progress from its starting values; reporting this as not converged")
+    verbose && overshot && println(_console(), label, ": pulling raw ",
+        "parameter(s) ", overshoot.coordinates, " back toward zero improves ",
+        "the objective by ", overshoot.gain, ", so the estimate is not a ",
+        "maximum; reporting this as not converged")
+    verbose && saturated && !overshot && println(_console(), label,
+        ": raw parameter(s) ", saturated_parameters, " have a materialising ",
+        "transform that is flat to machine precision at the estimate, but no ",
+        "pullback improves the objective, so this is a maximum with those ",
+        "coordinates unidentified rather than a failed fit")
+    (moved=moved, saturated=saturated, stalled=stalled,
+        finite_gradient=finite_gradient,
+        converged_enough=converged_enough, overshoot=overshoot,
+        overshot=overshot)
+end
+
+"""
+How many times one optimisation takes modes it finds and carries on
+(`ctsem_optimize`: `_ctsem_take_jump_modes!`, `_ctsem_take_search_modes!`).
+Each round adds a mode the objective did not know or moves the objective by
+more than `_CTSEM_MODE_RESUME_TOL`, so this bounds a run whose units keep
+growing maxima; past it, a jump ends the run as it did before.
+"""
+const _CTSEM_MODE_ROUNDS = 8
+
+# One line on the progress stream, for modes a run took on its way.
+function _ctsem_mode_note(reporter, label::AbstractString, text::AbstractString)
+    _progress_break(reporter)
+    println(_console(), label, ": ", text, ".")
+    flush(_console())
+    return nothing
+end
+
+"""
+    ctsem_optimize(objective, start; ...)
+
+Optimize a prepared likelihood entirely within Julia: L-BFGS, then, where the
+route has one, the endgame (`_ctsem_newton_finish`).
+
+The endgame's controls: `newton` turns it on; `certify` says a certification
+will read what it returns, which adds the flat-direction probe and, on a route
+whose Hessian is expensive (Laplace), is what the finish runs for at all;
+`newton_curvature` is `:auto` (the route's own, `_ctsem_finish_curvature`),
+`:exact`, `:chord`, `:subset` or `:krylov`; `newton_switch` is the predicted gain at which L-BFGS hands over
+once the stage has spent at least a Hessian's cost (`_ctsem_hessian_cost`),
+and a finish whose first step shows that hand-over was early gives the point
+back to L-BFGS, which runs on to its own stopping rule before the finish runs
+again; `newton_maxit` is the finish's shortest walk on one Hessian, and the exact
+variant's step budget; `newton_reuse` and
+`flat_rtol`
+are the finish's rules, passed from R so one number serves both sides.
+`coreset` runs stretches of the L-BFGS stage on a weighted few of the units
+where the objective is a sum over units (`_ctsem_coreset_plan`) and a
+coreset is expected to save, each stretch checked by a full gradient. Off here;
+R's default for it, `'auto'`, sends it for large data (`.ctJuliaCoresetOn()`).
+Neither the finish nor a budget stage sees one.
+`lbfgs_inverse` is an initial inverse Hessian for L-BFGS (`_ctsem_lbfgs`'s
+`inverse`), as a fit's covariance is for refitting it to part of its data; one
+that is not positive definite is not used (`_ctsem_lbfgs_inverse`).
+`lbfgs_pairs` is the curvature L-BFGS starts from (`_ctsem_lbfgs`'s `pairs`):
+`nothing`, none; a `CTSEMLBFGSMemory`; or `:objective` (`"objective"` from R),
+what the objective holds from its last run on this argument
+(`_ctsem_lbfgs_held`), where this run's is then left -- a rescued fit's stages
+on one hybrid, each after a placement of its draws, so that a stage does not
+learn again the curvature its predecessor ended with. An objective that holds
+none starts cold. After a finish hands the point back, L-BFGS goes on from the
+pairs it had whatever this says.
+`newton_hessian`, the Hessian of the maximised objective at
+`newton_hessian_at`, is one the caller already holds, for the finish to walk
+on rather than form again where Hessians are dear (`_ctsem_newton_finish`'s
+`hessian0`). The stall watch's `stall_alone`, and with it these two, are set
+only on a stage resumed after a certification (see `CTSEMStallWatch`).
+`newton_final = :walked` has the finish return the matrix its last walk stepped
+on (`newton_walked`) instead of forming the exact Hessian where it ends, for a
+stage whose objective the caller is about to change again (`_ctsem_newton_finish`'s
+`final`); `:dear` does so only where the walk was on the Krylov model.
+`hessian_callback(at, hessian)` is handed each exact Hessian of the maximised
+objective the finish forms, at the point it was formed at (`_ctsem_newton_finish`'s
+`on_hessian`): R's checkpoint keeps it, for a resume to pass back as
+`newton_hessian`. On the affect pilot a run lost after forming its
+certification's Hessian formed it again on resuming, 8 hours at the same point.
+
+Provenance of the defaults: the stall watch's constants are documented at
+`CTSEMStallWatch`, the batching's at `_ctsem_batch_plan`, and the finish's
+hand-over (0.1) and step cap (30) at the head of the endgame in optimiser.jl.
+"""
+function ctsem_optimize(objective::CTSEMOptimisable, start::AbstractVector;
+    maxiter::Integer=1000, g_tol::Real=1e-8, f_tol::Real=0.0,
+    x_tol::Real=0.0, verbose::Bool=false, gradient_method=:adjoint,
+    lbfgs_memory::Union{Nothing,Integer}=nothing,
+    lbfgs_diagonal::Bool=true, lbfgs_nonmonotone::Real=0.0,
+    lbfgs_gll::Integer=0, sgd::Bool=false, sgd_maxiter::Integer=2000, sgd_progress::Real=1e-3,
+    saem::Bool=false, saem_maxiter::Integer=10000, saem_seed::Integer=1,
+    saem_proposal::AbstractString="rw",
+    progress_overwrite::Bool=true, progress_sink=nothing,
+    progress_callback=nothing, callback_every::Real=0.4, stop=nothing,
+    checkpoint_every::Real=0.0, resume_units=nothing, resume_values=nothing,
+    progress::Bool=verbose, progress_label::AbstractString="optimise",
+    progress_budget::Bool=false, progress_every::Real=0.0,
+    gap_tol::Real=0.0, converge_tol::Real=1e-6,
+    precondition=nothing, lbfgs_inverse=nothing, lbfgs_scores::Bool=false,
+    lbfgs_local::Bool=false, local_builds_carried::Integer=0,
+    lbfgs_pairs=nothing, initial_alpha::Real=0.1,
+    overshoot_probe=_CTSEM_OVERSHOOT_PROBE[],
+    stall_window::Integer=80, stall_cooldown::Integer=30,
+    stall_ratio::Real=1e-3, stall_alone::Bool=false,
+    batch::Bool=false, batch_theta::Real=0.25,
+    coreset::Bool=false,
+    newton::Bool=false, newton_switch::Real=0.1, newton_maxit::Integer=30,
+    newton_curvature=:auto, certify::Bool=false,
+    newton_reuse::Real=_CTSEM_HESSIAN_REUSE_SE,
+    flat_rtol::Real=_CTSEM_FLAT_RTOL, newton_hessian=nothing,
+    newton_hessian_at=nothing, newton_final=:exact, hessian_callback=nothing)
+    start_values = collect(start)
+    # What the line search saw of a jump, for the route to name its cause
+    # (`_ctsem_jump_units`), on a route that can.
+    jump = CTSEMJump()
+    watch_jump = _ctsem_jump_capable(objective)
+    lbfgs_m = lbfgs_memory === nothing ?
+        _ctsem_lbfgs_memory(length(start_values)) : Int(lbfgs_memory)
+    # Where L-BFGS's curvature starts, and whether the objective keeps where it
+    # ends: see `lbfgs_pairs` above.
+    carry = lbfgs_pairs isa AbstractString ? Symbol(lbfgs_pairs) : lbfgs_pairs
+    (carry === nothing || carry === :objective || carry isa CTSEMLBFGSMemory) ||
+        throw(ArgumentError(string("lbfgs_pairs must be nothing, :objective or ",
+            "a CTSEMLBFGSMemory, not ", repr(lbfgs_pairs))))
+    pairs0 = carry === :objective ? _ctsem_lbfgs_held(objective) :
+        carry isa CTSEMLBFGSMemory ? carry : nothing
+    # Here, not where L-BFGS starts: a phase before it can be long.
+    pairs0 === nothing || _ctsem_lbfgs_check(pairs0, length(start_values))
+    # Validated here rather than at the probe, which runs after the fit: a
+    # misspelled mode should cost nothing, not a whole optimisation.
+    overshoot_probe = _ctsem_overshoot_mode(overshoot_probe)
+    invalid_objective = floatmax(eltype(start_values)) / 1e8
+    gradient_limit = sqrt(floatmax(eltype(start_values)))
+    label = _ctsem_optimise_label(objective)
+    _ctsem_optimise_setup!(objective)
+    # Each unit's inner solve anchored at its mode at the last accepted point,
+    # from a search here, which also starts from a checkpoint's modes where a
+    # resume brings them; see `_ctsem_anchor_start!`.
+    _ctsem_anchor_start!(objective, start_values; resume_units=resume_units,
+        resume_values=resume_values)
+    # The route's own call accounting, or `nothing` where it keeps none. Passed
+    # to every trial so the counting happens where the validity is decided.
+    call_log = _ctsem_optimise_log(objective, verbose)
+    # `evaluated`, not `result`: see `ctsem_laplace_optimize`. A closure's
+    # assignment binds to the enclosing local of the same name, and the outer
+    # L-BFGS result below is called `result`.
+    # Where the fit currently is. The L-BFGS's callback is handed convergence
+    # numbers, not the point they describe, and the stall conjunction has to ask
+    # the transforms what they are doing *at this point*. `fg!` sees every
+    # trial, so the last one it accepted is recorded there and read here.
+    # Made before the closure that writes it: a capture of a local assigned
+    # later is a `Core.Box`.
+    current_x = copy(start_values)
+    # Over whichever objective is in force: the fit's own, or a batch of its
+    # units (see `_ctsem_batch_plan`), which is the same route over fewer.
+    # Per-unit scores for the structured curvature (`lbfgs_scores`), kept
+    # from every full-data trial with a gradient. Made before the closure that
+    # writes it.
+    # And for coreset stages (`coreset`), whose training points they are.
+    # And for the local curvature (`lbfgs_local`), which reads which units
+    # read each parameter from them.
+    score_store = (lbfgs_scores || (lbfgs_local && !progress_budget) ||
+            (coreset && !progress_budget)) &&
+        _ctsem_scores_supported(objective) ?
+        CTSEMScoreStore(_ctsem_nunits(objective), length(start_values)) : nothing
+    # Gradients of the whole objective the trials took, which is what a batch
+    # or a coreset stage saves; a Hessian's columns are not trials.
+    full_gradients = Ref(0)
+    trial_fg! = function (target, F, G, x)
+        # The route decides what a usable trial point is: see
+        # `_ctsem_optimise_trial`. On the laplace route a finite value at a
+        # point whose inner Newton did not converge is *not* usable, because the
+        # objective is only defined at the mode.
+        (G !== nothing && target === objective) && (full_gradients[] += 1)
+        trial = score_store !== nothing && G !== nothing && target === objective ?
+            _ctsem_optimise_trial_scores(target, x, gradient_method,
+                gradient_limit, call_log, score_store) :
+            _ctsem_optimise_trial(target, x, G !== nothing,
+                gradient_method, gradient_limit, call_log)
+        evaluated = trial.evaluated
+        valid = trial.valid
+        if !valid
+            # NaN, never zero: a zero gradient reads as a stationary point.
+            # The optimisers' value-only line searches accept a step and then
+            # fetch its gradient; when that fetch was refused -- an inner solve
+            # that did not converge, a gradient over the limit -- zeros here
+            # ended a laplace fit as converged thousands of nats from a maximum
+            # (the SNSF pilot, 2026-10-05). Each caller of a gradient-only
+            # evaluation checks for a non-finite one.
+            G !== nothing && fill!(G, eltype(G)(NaN))
+            return F === nothing ? nothing : invalid_objective
+        end
+        if G !== nothing
+            G .= -evaluated.gradient
+        end
+        # The point the callback will be asked about; see `current_x`.
+        copyto!(current_x, x)
+        return F === nothing ? nothing : -evaluated.value
+    end
+    fg! = (F, G, x) -> trial_fg!(objective, F, G, x)
+    # A batch only where it can mean something: a route with a subset, no
+    # sampled TI predictor, and enough units (a prior is separated out and does
+    # not stop it; see `_ctsem_batch_plan`). Otherwise `nothing`, and the run
+    # below is ordinary L-BFGS on the whole data.
+    # With `lbfgs_scores` too: a batch's trials are not the objective's, so
+    # they keep no scores, and the structured model takes no step until the
+    # batch is the whole data.
+    batcher = batch ?
+        _ctsem_batch_plan(objective, trial_fg!; theta=batch_theta) : nothing
+    # Only where there are scores: a pinned objective, which a profile or an
+    # escape optimises, has no prior of its own to ask.
+    structured = (!lbfgs_scores || score_store === nothing) ? nothing :
+        CTSEMStructured(score_store, _ctsem_prior_precision(
+            _ctsem_prior_objective(objective), length(start_values)),
+            length(start_values))
+    batching() = batcher !== nothing && !_ctsem_batch_full(batcher)
+    # The last iteration whose value was not the full objective's -- a batch
+    # still growing, or a coreset stage in force: the stall watch judges only
+    # windows of full iterations after it. A window holding a stage's
+    # iterations measures the coreset's path, and one holding a stage that was
+    # sent back reads as no progress near the optimum: that ended fits as
+    # stalled and ran the stall escape's refits there, on the full sum. A
+    # window reaching back into the batch compared the full objective with the
+    # batch's value scaled up to every unit, which read as a loss of 80 nats
+    # over the window on the book's quadratic trend model and stopped its
+    # first stage four iterations after a window was first possible, for a
+    # pullback worth 6e-4.
+    subset_last = Ref(typemin(Int) >> 1)
+    # Coreset stages (`_ctsem_coreset_plan`): stretches of the L-BFGS stage on
+    # a weighted few of the units, each checked by a full gradient. `nothing`
+    # on an objective that is no sum over units, with too few units, off, or on a
+    # budget stage (the prior warm-up), whose few iterations are its plan and
+    # leave no stage room to pay.
+    coreseter = coreset && !progress_budget ?
+        _ctsem_coreset_plan(objective, trial_fg!, score_store) :
+        nothing
+    coreseter === nothing || (coreseter.gap_tol = Float64(gap_tol))
+    # The endgame (`_ctsem_newton_finish`), on a route that has one. Where a
+    # Hessian costs a few gradients it runs whenever there is a stopping rule
+    # for it to finish. Where it costs `2 npar` gradients (Laplace) it runs
+    # only when a certification will read it, so the finish's Hessian is the
+    # one the certification would have formed anyway. Either way L-BFGS hands
+    # over once its predicted gain is below `newton_switch` and the stage has
+    # spent a Hessian's cost (`handover`, below).
+    cheap = _ctsem_cheap_hessian(objective)
+    route_curvature = _ctsem_finish_curvature(objective)
+    hessian_cost = _ctsem_hessian_cost(objective, length(start_values))
+    finishing = newton && gap_tol > 0 && route_curvature !== nothing &&
+        (certify || cheap)
+    # A Ref: the callback reads it and the resumed stage below lowers it.
+    #
+    # The early hand-over, on L-BFGS's predicted gain below `newton_switch`,
+    # is taken only once the stage has spent at least what a Hessian costs
+    # (the callback below): forming one then, and throwing it away if its
+    # first step shows the hand-over was early, at most doubles the fit. A
+    # Hessian dearer than that is formed where L-BFGS stops by its own rule.
+    # Judged by a size until 2026-10-17 -- within `newton_maxit` parameters,
+    # and before that on the marginal route at any size -- a 529-parameter
+    # fit (ECLS-K, dev2) handed over with 140 nats still to climb while
+    # L-BFGS was gaining 2.5 nats a minute. On the Laplace route too: a stage
+    # creeping at 0.01 nats an iteration predicts gains far above any gap
+    # tolerance the objective can resolve, and runs on until its own rule
+    # stops it; the affect pilot's ran about 175 iterations from its first
+    # stop to that hand-over, about two minutes each (dev2, 2026-11-01).
+    handover = Ref(finishing ?
+        max(Float64(gap_tol), Float64(newton_switch)) : Float64(gap_tol))
+    # A callback rather than Optim's `show_trace`, which prints one dense line
+    # per iteration whatever the model costs -- thousands on a fast one, and on
+    # a slow one nothing for minutes. The objective and the gradient norm are
+    # what say whether this is going anywhere: a log posterior that has stopped
+    # moving while the gradient is still large is a fit in trouble, and that is
+    # visible here long before the convergence flags are set.
+    # Progress is not verbosity. Someone watching a fit wants to know it is
+    # going somewhere; they do not thereby want the model-shape summary that
+    # `verbose` also turns on. Separating them is
+    # what lets progress be the default without making the default noisy.
+    reporter = _ctsem_progress_reporter(progress, progress_label,
+        progress_overwrite, progress_sink, progress_every)
+    # L-BFGS's initial inverse Hessian, exact where parameters are read by few
+    # units (`CTSEMLocalCurvature`), on a route that can difference a column
+    # over its units alone; not on a budget stage (the prior warm-up), whose
+    # few iterations could not pay for it.
+    local_curvature = (lbfgs_local && !progress_budget && score_store !== nothing &&
+            _ctsem_local_capable(objective)) ?
+        CTSEMLocalCurvature(objective, score_store, _ctsem_prior_precision(
+            _ctsem_prior_objective(objective), length(start_values));
+            progress=_ctsem_local_progress(reporter)) : nothing
+    # A run that resumes another of the same fit -- a jump's, with its modes
+    # known -- starts from that run's local curvature as `lbfgs_inverse`, and
+    # its schedule counts that run's builds: built again from scratch, it cost
+    # the affect pilot 26-44 minutes at every resume.
+    local_curvature === nothing || (local_curvature.builds = Int(local_builds_carried))
+    # Explosive filter passes (`_CTSEM_EXPLOSIVE_GROWTH`) and forward-mode
+    # subject gradients (`_CTSEM_ADJOINT_GROWTH`) this run takes, counted from
+    # here so a stage reports its own.
+    forward0 = ctsem_forward_gradients()
+    explosive0 = ctsem_explosive_passes()
+    # The trace records every iteration whatever `verbose` says: it costs a
+    # push onto a vector, and a fit that turns out to have gone somewhere odd
+    # is exactly the one nobody thought to turn reporting on for.
+    # `predicted_gain` and `discrepancy` (`CTSEMDirectional`, NaN on the
+    # finish's steps) sit between the two fixed columns and the route's own,
+    # so `_ctsem_optimise_trace_keys` keeps naming only what a route adds.
+    trace = CTSEMTrace(:objective, :gradient_norm, :predicted_gain, :discrepancy,
+        _ctsem_optimise_trace_keys(objective)[3:end]...)
+    # `callback_every` is its cadence in seconds; a test sets 0 to hear every
+    # iteration.
+    watcher = CTSEMCallback(progress_callback; every=callback_every)
+    # A checkpoint every `checkpoint_every` seconds (0: none): the callback is
+    # then forced, and handed the anchored modes beside the point
+    # (`_ctsem_checkpoint_modes`).
+    checkpoint_last = Ref(time())
+    # How far this run has come toward the nearest of its stopping rules; see
+    # `CTSEMConvergence`. Fed every iteration rather than every printed line,
+    # because the scales it interpolates on are the worst gradient and the
+    # largest objective change the fit ever had, and the printed lines are a
+    # time-sampled subset.
+    convergence = CTSEMConvergence(g_tol, Int(maxiter))
+    # Where the line search records each accepted step's directional
+    # derivative, and the finish its exact decrement.
+    directional = CTSEMDirectional()
+    # The iteration count is taken from what this callback saw, which is the
+    # same number however the run ends. (Optim's own `iterations`, `f_calls`
+    # and `g_calls` did not survive a callback stop: four runs on a two-latent
+    # model that stopped after 4, 8 and 10 iterations all reported 1 iteration.
+    # `_ctsem_lbfgs` counts exactly; the callback's count stays the record.)
+    seen_iterations = Ref(0)
+    stopped_by_gap = Ref(false)
+    stopped_by_stall = Ref(false)
+    # The route's own stop (`stop`, a predicate of the iterate): the refined
+    # fit's run ends where its frozen draws have drifted
+    # (`ctsem_laplace_placed_optimize`).
+    stopped_by_stop = Ref(false)
+    stopped_by_progress = Ref(false)
+    # Walking off to a limit (`CTSEMStallWatch`): no finish, no resume.
+    stopped_by_divergence = Ref(false)
+    # The window is not scaled to L-BFGS's memory: on a large model that made
+    # the watch, the one thing that ends a creeping stage, answer up to twelve
+    # times later, and progress does not wait for the memory to turn over.
+    stall = CTSEMStallWatch(window=stall_window, cooldown=stall_cooldown,
+        alone=stall_alone)
+    # Under `verbose`, each stall check that found a flat coordinate says which,
+    # and what pulling back gained -- a check that does not stop the fit
+    # otherwise leaves no trace of having run.
+    stall_report = verbose ? function (iteration, flat, gain)
+        _progress_break(reporter)
+        println(_console(), label, ": stall check at iteration ", iteration,
+            ": raw parameter(s) ", flat, " flat, raw ",
+            round.(current_x[flat]; digits=2), "; pulling back gains ", gain)
+        flush(_console())
+    end : nothing
+    # True while `_ctsem_sgd` runs: its iterations are recorded and reported by
+    # `watch` like any other, but the two stopping rules below are L-BFGS's --
+    # the predicted gain is its quadratic model's, and the stall watch's pullback
+    # is for a quasi-Newton walk stuck in a flat corner -- and the sgd phase has
+    # its own.
+    in_sgd = Ref(false)
+    watch = function (state)
+        latest = state isa AbstractVector ? last(state) : state
+        # After an accepted step, whose point the last evaluation was.
+        _ctsem_anchor_here!(objective)
+        _record!(trace, latest.iteration, -latest.value, latest.g_norm,
+            _ctsem_predicted_gain(directional), directional.discrepancy,
+            _ctsem_optimise_trace_values(objective)...)
+        seen_iterations[] = max(seen_iterations[], Int(latest.iteration))
+        percent = _convergence_percent!(convergence, latest.g_norm,
+            latest.value, Int(latest.iteration))
+        if _due(reporter)
+            # Never on a budget stage: its own fraction is exact, and an
+            # estimate would replace a correct denominator with a guess.
+            # While a batch is still growing the value is its estimate of the
+            # fit's log posterior from that many units, scaled up, and it moves
+            # with the batch as well as with the step: on the SNSF pilot the
+            # first ten such lines read up to 25,000 above the optimum the fit
+            # certified, so the line says which it is.
+            _progress_optimise(reporter, latest.iteration, Int(maxiter),
+                @sprintf("logpost %11.2f", -latest.value),
+                @sprintf("|g| %9.2e", latest.g_norm),
+                (batching() ? (@sprintf("batch %d/%d units", batcher.m, batcher.nunits),) : ())...,
+                (_ctsem_coreset_live(coreseter) ? (@sprintf("coreset %d/%d units",
+                    length(coreseter.target.coreset.units), length(coreseter.sampling)),) : ())...,
+                _ctsem_optimise_progress_extra(objective)...,
+                _ctsem_forward_progress(forward0, explosive0)...;
+                budget=progress_budget,
+                percent=progress_budget ? NaN : percent)
+        end
+        # Its own cadence, so passing a callback with `verbose = 0` -- the
+        # obvious combination for a front end that draws rather than prints --
+        # still reports.
+        # The point comes with the numbers. Without it a caller can watch a
+        # multi-hour fit and still have nothing to restart from when it is
+        # interrupted, because nothing is written until the fit returns --
+        # which has cost a run here. `current_x` is the last accepted trial,
+        # the same point the reported objective and gradient describe.
+        ck_modes = _ctsem_checkpoint_modes(watcher, objective, checkpoint_last,
+            checkpoint_every)
+        _invoke_callback(watcher, latest.iteration, Int(maxiter),
+            -latest.value, latest.g_norm, current_x,
+            _ctsem_checkpoint_args(ck_modes)...; force=ck_modes !== nothing)
+        in_sgd[] && return false
+        if stop !== nothing && stop(latest) === true
+            stopped_by_stop[] = true
+            return true
+        end
+        # Stop when the step just taken was predicted to gain less objective
+        # than asked for. The predicted gain of the *next* step is not knowable
+        # here, and the last one is the standard stand-in: a quasi-Newton
+        # direction that has stopped promising anything is not about to start.
+        #
+        # A proxy, and treated as one -- `B` is limited memory and carries its
+        # own scaling, so this is not the invariant decrement. The exact check
+        # after the fit is what certifies, and what resumes with a tightened
+        # rule when this stopped too early.
+        # The coreset stages' gap rule is L-BFGS's (`_ctsem_gap_floor`).
+        coreseter === nothing || (coreseter.gap_tol = _ctsem_gap_floor(gap_tol, directional))
+        # Neither rule while a batch is still growing: its objective is not the
+        # fit's, and a batch that has gone quiet is a batch about to grow.
+        # Nor in a coreset stage, whose model and value are the coreset's.
+        if batching() || _ctsem_coreset_live(coreseter)
+            subset_last[] = Int(latest.iteration)
+            return false
+        end
+        if handover[] > 0
+            predicted = _ctsem_predicted_gain(directional)
+            if predicted < _ctsem_gap_floor(gap_tol, directional) ||
+                    (predicted < handover[] && latest.iteration >= hessian_cost)
+                stopped_by_gap[] = true
+                return true
+            end
+        end
+        # And stop when the fit has stopped getting anywhere *and* a transform
+        # has gone flat, which is the structural reason it stopped. Neither
+        # half is a stopping rule on its own -- see `_ctsem_stall_verdict!` for
+        # why, and for the cooldown that keeps a merely slow fit from being
+        # asked over and over.
+        if latest.iteration - subset_last[] > stall.window &&
+                _ctsem_stall_verdict!(stall, trace, latest.iteration, objective,
+                _ctsem_params(objective), current_x,
+                _ctsem_saturation_range(objective, current_x), stall_ratio;
+                tolerance=_ctsem_tolerance(converge_tol, directional),
+                progress=_ctsem_probe_progress(reporter), report=stall_report)
+            # Stuck on progress alone (a resumed stage), walking off to a
+            # limit, or stalled and flat with somewhere better to go: different
+            # findings, and only the last hands back a point to resume from.
+            stall.exhausted ? (stopped_by_progress[] = true) :
+                stall.diverged ? (stopped_by_divergence[] = true) :
+                (stopped_by_stall[] = true)
+            return true
+        end
+        return false
+    end
+    verbose && _ctsem_optimise_verbose_shape(objective)
+    # A first step of unit *length*, not of unit alpha.
+    #
+    # L-BFGS has no curvature history on its first iteration, so it takes the
+    # steepest-descent direction with whatever the initial step guess gives.
+    # Optim's default is `InitialStatic()`, an unscaled alpha of one -- which
+    # means the first step is as long as the gradient, and ctsem's gradients
+    # are routinely of magnitude tens. Watched on a binary model: one step from
+    # raw 0 to raw 20.9. That step *improved* the objective, so the line search
+    # was right to take it, but it overshot the optimum at raw ~1 and landed
+    # where every ctsem transform is flat to machine precision, and a zero
+    # gradient ends the optimisation.
+    #
+    # `scaled=true` divides alpha by the gradient norm, so the first step has
+    # length one in parameter space regardless of how steep the objective is.
+    # That is the standard remedy and it is what the saturation guard below
+    # would otherwise spend its life reporting.
+    #
+    # Backtracking, not Hager-Zhang. A Wolfe line search needs the directional
+    # derivative at every trial point, so every trial costs a full adjoint;
+    # Armijo needs only the objective, and on this engine that is genuinely
+    # cheaper -- `ctsem_evaluate(..., gradient=false)` takes the forward-only
+    # branch, with no reverse pass and no Frechet blocks, those existing solely
+    # for derivatives. Armijo imposes no curvature condition and so stops
+    # polishing sooner, which was the reason it was not the default: measured
+    # here, 47 iterations against 36, finishing near 1e-5 where Hager-Zhang
+    # reaches 1e-9. Both halves of that objection have gone. It counted
+    # iterations rather than their cost, and the precision it was protecting
+    # was protecting a *gradient* convergence test -- where the estimate stands
+    # relative to the optimum is now measured exactly after the fit, in
+    # objective units, and the fit continues when it matters.
+    linesearch = "backtracking"
+    # `sgd`: the early phase for large, ill-conditioned models (`_ctsem_sgd`),
+    # on the whole data, until its own progress rule says steps of the
+    # curvature's size will do better; L-BFGS carries on from its best point,
+    # its iterations counted on from the phase's.
+    lbfgs_start = start_values
+    # `saem`: on a Laplace objective, SAEM first (saem.jl) -- the exact
+    # marginal posterior mode by stochastic approximation, which never sees the
+    # Laplace term and so cannot climb its failures -- and L-BFGS polishes from
+    # its averaged point on the Laplace objective, with the finish and the
+    # certification after it unchanged. Its iterations are its own count and
+    # its own progress line: an SAEM iteration is a different unit of work, and
+    # its complete-data log posterior is not on the Laplace objective's scale.
+    saem_result = nothing
+    if saem
+        saem_result = _ctsem_saem_phase(objective, start_values;
+            maxiter=Int(saem_maxiter), seed=Int(saem_seed),
+            proposal=Symbol(saem_proposal), progress=progress,
+            progress_overwrite=progress_overwrite, progress_sink=progress_sink,
+            progress_every=progress_every, callback=progress_callback)
+        if saem_result !== nothing
+            lbfgs_start = saem_result.minimizer
+            copyto!(current_x, lbfgs_start)
+        end
+    end
+    sgd_result = nothing
+    if sgd
+        in_sgd[] = true
+        sgd_result = _ctsem_sgd(fg!, lbfgs_start;
+            maxiter=min(Int(sgd_maxiter), Int(maxiter)), progress=sgd_progress,
+            callback=watch)
+        in_sgd[] = false
+        lbfgs_start = sgd_result.minimizer
+    end
+    sgd_iterations = sgd_result === nothing ? 0 : sgd_result.iterations
+    # See optimiser.jl for why this is not Optim any more.
+    inverse = _ctsem_lbfgs_inverse(lbfgs_inverse, length(start_values))
+    result = _ctsem_lbfgs(fg!, lbfgs_start; memory=lbfgs_m, pairs=pairs0,
+        diagonal=lbfgs_diagonal, nonmonotone=lbfgs_nonmonotone, gll=Int(lbfgs_gll),
+        metric=_ctsem_metric(precondition, length(start_values)),
+        inverse=inverse, structured=structured,
+        initial_alpha=Float64(initial_alpha),
+        maxiter=max(0, Int(maxiter) - sgd_iterations),
+        g_tol=g_tol, f_tol=f_tol, x_tol=x_tol, callback=watch,
+        directional=directional, batch=batcher, iteration0=sgd_iterations,
+        coreset=coreseter, jump=watch_jump ? jump : nothing,
+        local_curvature=local_curvature)
+    if sgd_result !== nothing
+        result = CTSEMLBFGSResult(result.minimizer, result.minimum,
+            result.gradient, sgd_iterations + result.iterations,
+            sgd_result.f_calls + result.f_calls, sgd_result.g_calls + result.g_calls,
+            result.g_converged, result.f_converged, result.x_converged,
+            result.linesearch_failed, result.stopped_by_callback,
+            result.batch_sizes, result.batch_iterations, result.memory)
+    end
+    # No rescue stage. The one that stood here existed because Hager-Zhang can
+    # run out of line search and return the iterate it had reached while Optim
+    # reports a finished optimisation -- measured on a binary model: two
+    # iterations, 68 objective evaluations, a final gradient of 475, and the
+    # last step uphill. It answered by restarting with backtracking, which is
+    # now what runs in the first place, and over the eight fits that reproduced
+    # that stall backtracking converged every one.
+    #
+    # A stop that is short for any other reason is not the line search's
+    # problem to solve twice: the finish below takes Newton steps on the
+    # curvature, and the certification after the fit measures what the estimate
+    # still has to gain and resumes this optimiser when it falls short. Two
+    # mechanisms for one job, where the second can only act in cases the first
+    # did not fix, is a way to be surprised rather than a safety net.
+    # A start the route refuses is not a point to stop at. L-BFGS accepts only
+    # usable points, so ending on the sentinel means the start was refused --
+    # and it took no step from it, having no gradient to step along. This used
+    # to fall through to the finish and the Hessian at that point, silently
+    # (the SNSF pilot, restarting from another build's checkpoint).
+    if !(isfinite(result.minimum) && result.minimum < invalid_objective)
+        throw(ErrorException(string(
+            "The objective cannot be evaluated at the point the optimiser starts from",
+            _ctsem_optimise_refusal(objective), ". Try other starting values.")))
+    end
+    # Before the final evaluation, so what it reports is the run rather than
+    # the extra call: see `_ctsem_optimise_verbose_report`.
+    minimizer = collect(result.minimizer)
+    # A jump the line search saw, named by the route: the units whose terms
+    # jumped and where their inner solves stopped either side
+    # (`_ctsem_jump_units`). A run whose jump the route names takes those
+    # modes and goes on (below); where they add none it stops there ("jump"),
+    # with no finish: Newton steps across a discontinuity are no better than
+    # L-BFGS's. A jump the route cannot name is a failed line search, as it
+    # always was.
+    jumped_units = Ref{Any}(nothing)
+    if result.linesearch_failed && jump.seen
+        named = try
+            _ctsem_jump_units(objective, jump)
+        catch err
+            _ctsem_must_propagate(err) && rethrow()
+            nothing
+        end
+        if named !== nothing && !isempty(named.units)
+            jumped_units[] = named
+            verbose && println(_console(), label, ": the objective jumped by ",
+                jump.excess, " along the last search direction, between steps of ",
+                jump.alpha_lo, " and ", jump.alpha_hi, "; unit(s) ", named.units,
+                " moved with where their inner solve stopped")
+        end
+    end
+    # Why L-BFGS stopped, in one word, since the finish depends on it and the
+    # certification reads it.
+    reason_for(r) = stopped_by_stop[] ? "stopped" :
+        stopped_by_gap[] ? "gap" : stopped_by_divergence[] ? "diverged" :
+        stopped_by_stall[] ? "stall" :
+        stopped_by_progress[] ? "progress" :
+        (r.linesearch_failed && jumped_units[] !== nothing) ? "jump" :
+        r.linesearch_failed ? "linesearch" :
+        r.g_converged ? "gradient" :
+        ((r.f_converged && f_tol > 0) || (r.x_converged && x_tol > 0)) ?
+            "tolerance" :
+        r.iterations >= Int(maxiter) ? "cap" : "other"
+    stop_reason = reason_for(result)
+    # The endgame, after every stop that means "as far as L-BFGS goes" -- the
+    # cheap rule, a line search with nowhere to go, a gradient already at its
+    # bar, a resumed stage that stopped gaining. Not after the iteration cap,
+    # which is the caller's budget and may be far from any optimum, nor after a
+    # stall, which hands back a point to resume from instead: for those the
+    # certification asks `ctsem_endgame` for its numbers. Recorded in the trace
+    # like any other iteration, with the exact predicted gain.
+    finish = nothing
+    # What a finish that gave the point back to L-BFGS had spent, carried into
+    # the totals below: its steps, Hessians and calls, and its history.
+    spent = (steps=Ref(0), fcalls=Ref(0), gcalls=Ref(0), hessians=Ref(0),
+        subset=Ref(0), krylov_models=Ref(0), krylov_products=Ref(0), history=(kind=String[], gain=Float64[], alpha=Float64[],
+        value=Float64[]))
+    handed_back = false
+    # Mirrors `watch` above: every step the finish takes -- a damped Newton
+    # step, the exact-Hessian clean-up, a saddle escape -- feeds the same
+    # `CTSEMConvergence` and prints through the same line, rather than only
+    # appending to the trace as this did before. That is the fix for the
+    # progress line freezing at "93 iter | 61% est." while the finish ran on
+    # for another 80s: it was not that nothing printed during the finish, it
+    # was that the finish's own progress had nowhere to go, so the last line
+    # L-BFGS printed just sat there, correct and stale. A finish typically
+    # takes small, converging steps -- it only starts once L-BFGS's own
+    # progress proxy says there is little left -- so this also raises the
+    # percentage honestly, rather than leaving it frozen at whatever L-BFGS
+    # last reported while the fit finishes the rest of its work.
+    record = function (state)
+        _ctsem_anchor_here!(objective)
+        _record!(trace, state.iteration, -state.value, state.g_norm,
+            state.gain, NaN, _ctsem_optimise_trace_values(objective)...)
+        seen_iterations[] = max(seen_iterations[], Int(state.iteration))
+        percent = _convergence_percent!(convergence, state.g_norm, state.value,
+            Int(state.iteration))
+        if _due(reporter)
+            _progress_optimise(reporter, state.iteration, Int(maxiter),
+                @sprintf("logpost %11.2f", -state.value),
+                @sprintf("|g| %9.2e", state.g_norm),
+                _ctsem_optimise_progress_extra(objective)...,
+                _ctsem_forward_progress(forward0, explosive0)...;
+                budget=progress_budget, percent=progress_budget ? NaN : percent)
+        end
+        # And the caller's callback, with the finish's own iterate: without
+        # this a checkpointing callback stopped at the stall that started the
+        # finish, and on the SNSF pilot the finish was the next five hours.
+        ck_modes = _ctsem_checkpoint_modes(watcher, objective, checkpoint_last,
+            checkpoint_every)
+        _invoke_callback(watcher, state.iteration, Int(maxiter), -state.value,
+            state.g_norm, state.x === nothing ? current_x : state.x,
+            _ctsem_checkpoint_args(ck_modes)...; force=ck_modes !== nothing)
+        return false
+    end
+    # Modes the run finds go into its objective as it finds them, and L-BFGS
+    # carries on from where it stopped with its curvature pairs: a jump's, at
+    # its named units (`_ctsem_take_jump_modes!`), and a search's where L-BFGS
+    # stopped by its own rule and again where the finish ends, before the probe
+    # and the certification read the point (`_ctsem_take_search_modes!`), up
+    # to `_CTSEM_MODE_ROUNDS` times; reported for the caller to keep with the
+    # specification (`CTSEMFoundModes`). Until 2026-10-30 a jump ended the run
+    # and the search came after the finish, the probe and the certification's
+    # Hessian, either one sending the caller to start a new run (R's
+    # `.ctJuliaOptimise()`): on the affect pilot a search that found six
+    # units' better modes threw away nine hours of finishing.
+    found = CTSEMFoundModes()
+    mode_rounds = 0
+    # A finish's Hessian, walked by the next finish where a search sent the run
+    # back to L-BFGS from its point (`hessian0`): the objective has changed
+    # only in the units whose maxima did. The caller's for the first finish,
+    # and none after a hand-back, which moved the point on.
+    held_hessian = newton_hessian
+    held_hessian_at = newton_hessian_at
+    may_finish = finishing
+    finished = false
+    # Where the last search found nothing to go on with: the closing search
+    # below does not search there again.
+    searched_at = Float64[]
+    while true
+        took = false
+        if mode_rounds < _CTSEM_MODE_ROUNDS
+            if stop_reason == "jump"
+                took = _ctsem_take_jump_modes!(objective, minimizer, jumped_units[], found)
+                took && progress && _ctsem_mode_note(reporter, label, string(
+                    "the objective jumped at unit(s) ", join(jumped_units[].units, ", "),
+                    " (a term moved with where its inner solve stopped); their modes ",
+                    "there are kept as starts and the run goes on"))
+            elseif stop_reason in ("gap", "linesearch", "gradient", "progress")
+                taken = _ctsem_take_search_modes!(objective, minimizer, found)
+                took = isfinite(taken.change) &&
+                    abs(taken.change) > _ctsem_tolerance(_CTSEM_MODE_RESUME_TOL, directional)
+                took || (searched_at = copy(minimizer))
+                took && progress && _ctsem_mode_note(reporter, label, @sprintf(
+                    "a search where the run stopped found other maxima for %d unit(s), moving the objective by %+.3g; they are kept and the run goes on",
+                    taken.units, taken.change))
+            end
+        end
+        if took
+            mode_rounds += 1
+            if finish !== nothing
+                spent.steps[] += finish.steps
+                spent.fcalls[] += finish.fcalls
+                spent.gcalls[] += finish.gcalls
+                spent.hessians[] += finish.full_hessians
+                spent.subset[] += finish.subset_hessians
+                spent.krylov_models[] += finish.krylov_models
+                spent.krylov_products[] += finish.krylov_products
+                append!(spent.history.kind, finish.history.kind)
+                append!(spent.history.gain, finish.history.gain)
+                append!(spent.history.alpha, finish.history.alpha)
+                append!(spent.history.value, finish.history.value)
+                if finish.hessian !== nothing
+                    held_hessian = finish.hessian
+                    held_hessian_at = finish.hessian_at
+                end
+                finish = nothing
+            end
+            finished = false
+            jump.seen = false
+            jumped_units[] = nothing
+            stopped_by_gap[] = false
+            stopped_by_progress[] = false
+            result = _ctsem_lbfgs_on(fg!, minimizer, result,
+                result.iterations + spent.steps[],
+                Int(maxiter) - result.iterations - spent.steps[];
+                memory=lbfgs_m, diagonal=lbfgs_diagonal,
+                nonmonotone=lbfgs_nonmonotone, gll=Int(lbfgs_gll),
+                metric=_ctsem_metric(precondition, length(start_values)),
+                inverse=inverse, structured=structured,
+                initial_alpha=Float64(initial_alpha), g_tol=g_tol, f_tol=f_tol,
+                x_tol=x_tol, callback=watch, directional=directional,
+                jump=watch_jump ? jump : nothing, local_curvature=local_curvature)
+            minimizer = collect(result.minimizer)
+            if result.linesearch_failed && jump.seen
+                named = try
+                    _ctsem_jump_units(objective, jump)
+                catch err
+                    _ctsem_must_propagate(err) && rethrow()
+                    nothing
+                end
+                (named !== nothing && !isempty(named.units)) && (jumped_units[] = named)
+            end
+            stop_reason = reason_for(result)
+            continue
+        end
+        finished && break
+        (may_finish && stop_reason in ("gap", "linesearch", "gradient", "progress")) ||
+            break
+        # From the full objective. A batch still short of the data when L-BFGS
+        # stopped -- a line search can fail inside one -- left its own value
+        # and gradient in the result.
+        f0 = result.minimum
+        G0 = collect(Float64, result.gradient)
+        if batcher !== nothing && !_ctsem_batch_full(batcher)
+            f0 = fg!(0.0, G0, minimizer)
+        end
+        # A hand-over on L-BFGS's proxy rather than at its stopping rule, which
+        # the finish checks with its first step (`handback`) where its Hessian
+        # cost no more than the stage had spent.
+        early = handover[] > gap_tol
+        affordable = hessian_cost <= result.iterations
+        finish_curvature = Symbol(newton_curvature) === :auto ?
+            route_curvature : Symbol(newton_curvature)
+        # The Krylov model where the route chose it, only where the exact
+        # Hessian is dear; where the caller named it, wherever it can be made.
+        krylov_min_cost = Symbol(newton_curvature) === :auto ?
+            Float64(_CTSEM_KRYLOV_MIN_COST) : 0.0
+        finish = _ctsem_newton_finish(objective, minimizer, f0, G0, fg!;
+            tol=gap_tol, maxit=newton_maxit, callback=record,
+            iteration0=result.iterations + spent.steps[],
+            curvature=finish_curvature, probe=certify, reuse_se=newton_reuse,
+            flat_rtol=flat_rtol, handback=early && affordable,
+            certify_tol=Float64(converge_tol), flat_escape=_ctsem_flat_escape(objective),
+            flat_allowed=(from, to) -> _ctsem_flat_allowed(objective, from, to,
+                _ctsem_tolerance(converge_tol, directional)),
+            # Its bars rise with the run's (`_ctsem_tolerance`), and a step it
+            # cannot find on an exact Hessian raises them (`_ctsem_refused!`).
+            resolution=directional,
+            reporter=reporter,
+            hessian0=held_hessian, hessian0_at=held_hessian_at,
+            krylov_min_cost=krylov_min_cost, final=Symbol(newton_final),
+            jump=watch_jump ? jump : nothing,
+            # The local curvature's last build, as the Krylov model's
+            # preconditioner: exact where it was cheap.
+            krylov_base=(local_curvature === nothing ||
+                isempty(local_curvature.P)) ? nothing : local_curvature.P,
+            on_hessian=hessian_callback)
+        minimizer = collect(finish.x)
+        # A jump the finish's steps confirmed and the route named: its modes
+        # in and L-BFGS on from the finish's point, as on L-BFGS's (above), or
+        # where they add nothing the run ends there, with no Hessian.
+        if finish.jumped !== nothing
+            jumped_units[] = finish.jumped
+            stop_reason = "jump"
+            verbose && println(_console(), label, ": the objective jumped by ",
+                jump.excess, " along the finish's step; unit(s) ",
+                finish.jumped.units, " moved with where their inner solve stopped")
+            continue
+        end
+        # The finish's own gain replaces L-BFGS's metric proxy: it is the exact
+        # decrement, which is what the verdict below should be judging. A
+        # finish with no Hessian has none (`Inf`), and the proxy stays: put
+        # there, it made the report read "stopped with Inf still available".
+        isfinite(finish.gain) && (directional.dphi0 = -2 * finish.gain)
+        # Ended: a search at its point (above) before the run does.
+        if !(early && (finish.handback || finish.hessian === nothing))
+            finished = true
+            continue
+        end
+        # L-BFGS carries on from where the finish left the point, to the
+        # ordinary stopping rule, rather than the fit ending short: either the
+        # hand-over was early (`handback`), or there is no usable Hessian --
+        # measured on a censored model, whose exact Hessian comes back
+        # non-finite -- and so no finish either, then or after.
+        again = finish.handback
+        handed_back |= again
+        spent.steps[] += finish.steps
+        spent.fcalls[] += finish.fcalls
+        spent.gcalls[] += finish.gcalls
+        spent.hessians[] += finish.full_hessians
+        spent.subset[] += finish.subset_hessians
+        spent.krylov_models[] += finish.krylov_models
+        spent.krylov_products[] += finish.krylov_products
+        append!(spent.history.kind, finish.history.kind)
+        append!(spent.history.gain, finish.history.gain)
+        append!(spent.history.alpha, finish.history.alpha)
+        append!(spent.history.value, finish.history.value)
+        finish = nothing
+        handover[] = Float64(gap_tol)
+        stopped_by_gap[] = false
+        held_hessian = nothing
+        held_hessian_at = nothing
+        # From the pairs the stage ended with: the objective is the same, the
+        # point a step or so on, and a cold memory spent its first iterations
+        # learning again what they hold.
+        result = _ctsem_lbfgs_on(fg!, minimizer, result,
+            result.iterations + spent.steps[],
+            Int(maxiter) - result.iterations - spent.steps[];
+            memory=lbfgs_m, diagonal=lbfgs_diagonal,
+            nonmonotone=lbfgs_nonmonotone, gll=Int(lbfgs_gll),
+            metric=_ctsem_metric(precondition, length(start_values)),
+            inverse=inverse, structured=structured,
+            initial_alpha=Float64(initial_alpha), g_tol=g_tol, f_tol=f_tol,
+            x_tol=x_tol, callback=watch, directional=directional,
+            jump=watch_jump ? jump : nothing, local_curvature=local_curvature)
+        minimizer = collect(result.minimizer)
+        if result.linesearch_failed && jump.seen && jumped_units[] === nothing
+            named = try
+                _ctsem_jump_units(objective, jump)
+            catch err
+                _ctsem_must_propagate(err) && rethrow()
+                nothing
+            end
+            (named !== nothing && !isempty(named.units)) && (jumped_units[] = named)
+        end
+        stop_reason = reason_for(result)
+        # With no usable Hessian, no finish after either.
+        again || (may_finish = false)
+    end
+    carry === :objective && _ctsem_lbfgs_hold!(objective, result.memory)
+    # The finish's totals, a finish that handed back included.
+    newton_steps = spent.steps[] + (finish === nothing ? 0 : finish.steps)
+    newton_history = finish === nothing ? spent.history :
+        (kind=vcat(spent.history.kind, finish.history.kind),
+         gain=vcat(spent.history.gain, finish.history.gain),
+         alpha=vcat(spent.history.alpha, finish.history.alpha),
+         value=vcat(spent.history.value, finish.history.value))
+    verbose && _ctsem_optimise_verbose_report(objective, call_log)
+    # Which subjects are explosive at the estimate, recorded only when some
+    # evaluation of the run had an explosive pass -- none did otherwise, and
+    # the final point's gradient was among them.
+    forward_gradients = ctsem_forward_gradients() - forward0
+    explosive_passes = ctsem_explosive_passes() - explosive0
+    final, explosive = if explosive_passes > 0 || forward_gradients > 0
+        ctsem_explosive_subjects(let minimizer = minimizer
+            () -> ctsem_evaluate(objective, minimizer; gradient=true,
+                contributions=true, gradient_method=gradient_method)
+        end)
+    else
+        ctsem_evaluate(objective, minimizer; gradient=true, contributions=true,
+            gradient_method=gradient_method), Int[]
+    end
+
+    # A `converged` that is the disjunction of the L-BFGS's three flags (Optim's
+    # definition) is wrong here: a line search that fails on its first try
+    # satisfies the `f` one trivially: the
+    # objective did not change because nothing was accepted. Measured on a
+    # 100-subject model, this route stopped with `g_converged=false` and a
+    # largest gradient of 3.5e-7 against `g_tol=1e-8` and reported success.
+    #
+    gradient_norm = isempty(final.gradient) ? 0.0 : maximum(abs, final.gradient)
+    # `max(shown, ...)`: the closing line closes what was on screen, which is
+    # never fewer iterations than the user already watched go past.
+    iterations = max(reporter.shown, result.iterations + newton_steps)
+    # Running out of iterations is a different outcome from converging, and the
+    # closing line used to report both as a bare count. On a stage whose cap is
+    # the plan (`budget`) reaching it is not news; anywhere else it is the one
+    # thing about the fit the user most needs to know. The cap is L-BFGS's: the
+    # finish's steps are counted in the line but have a budget of their own,
+    # as many as its Hessian cost where that is dear, so on a large model they
+    # alone can pass `maxiter` in a fit that converged. So the line says what
+    # the stop reason says.
+    capped = !progress_budget && stop_reason == "cap"
+    progress && _progress_done(reporter,
+        @sprintf("%d iterations%s", iterations,
+            capped ? " -- ITERATION CAP REACHED, not converged" : ""),
+        @sprintf("logpost %.4f", final.value),
+        @sprintf("|g| %.2e", gradient_norm))
+    # Forced, whatever the cadence says: a rate-limited callback on a fit that
+    # finishes inside one interval would otherwise never fire at all, and the
+    # final state is the one a live plot most needs.
+    _invoke_callback(watcher, iterations, Int(maxiter),
+        final.value, gradient_norm, minimizer,
+        _ctsem_checkpoint_args(_ctsem_checkpoint_modes(watcher, objective,
+            checkpoint_last, checkpoint_every; force=true))...; force=true)
+    # A saturated transform reports a zero gradient, and a zero gradient is
+    # indistinguishable from an optimum.
+    #
+    # This used to be judged on the raw coordinate's *magnitude* -- flagged
+    # once |raw| >= 20, on the reasoning that every transform ctsem writes is
+    # flat to machine precision by then. That reasoning is only half right: it
+    # is a statement about how far a transform's *derivative* has collapsed,
+    # and raw magnitude is a proxy for that which fails in both directions. An
+    # identity transform (`MANIFESTMEANS`, `T0MEANS` with no scale) has
+    # derivative exactly 1 at any raw magnitude and never saturates, so a
+    # model fit to data with a mean of 25 or 100 -- an unremarkable fit --
+    # reported not converged purely because its mean landed past 20 on the raw
+    # scale it is never transformed away from. And different transforms go
+    # flat at different raw magnitudes in the first place: a drift diagonal's
+    # `-(1e-6 + 2log1p_exp(-2x))` is already down to derivative 8e-9 by raw 10,
+    # while a correlation's `2/(1+exp(-x))-1` is still at 9e-5 there. No single
+    # cutoff on the raw value fits both, and precomputing one per parameter
+    # (per transform, per state-dependent case) is the tedium the derivative
+    # check below avoids entirely.
+    #
+    # So saturation is judged directly on the transform's own derivative at
+    # the estimate -- see `_ctsem_saturated_parameters`
+    # (`parameter_transforms.jl`) -- which is the one quantity that actually
+    # says whether a raw coordinate still does anything: an optimiser that
+    # oversteps into the flat region finds `gradient_norm` underflowing to
+    # zero there, satisfies any tolerance, and reports success. Observed on a
+    # binary model: one L-BFGS iteration to raw 20.9, declared converged, log
+    # likelihood -730.7 where the profile peak is -714.5.
+    #
+    # `stalled` does not catch it, because the optimiser did move -- it moved
+    # too far. So saturation is its own verdict: at a flagged coordinate the
+    # parameter is not identified by the data but by the transform's
+    # floating-point limit, and calling that converged is the wrong answer
+    # confidently delivered.
+    # Over the *transformed* coordinates only. Saturation is a statement about
+    # ctsem's parameter transforms going flat, and the joint target's vector
+    # also carries state innovations, which have no transform and no flat
+    # region -- a trajectory five standard deviations out is unusual data, not
+    # an unidentified parameter, and reading it as saturation would report
+    # every such fit as failed.
+    saturated_parameters = _ctsem_saturated_for(objective, minimizer)
+    # Before the verdict, because the verdict probes. A route's own result
+    # fields can be live per-run state -- the laplace route's `inner_converged`,
+    # `inner_iterations` and the rest are -- and every probe point overwrites
+    # them, so read after the probe they describe wherever it went last rather
+    # than the estimate.
+    result_extra = _ctsem_optimise_result_extra(objective, final, call_log)
+    # And the verdict itself, which every route reaches the same way and in one
+    # place: see `_ctsem_optimise_verdict`. Against the bar the run's
+    # resolution set (`_ctsem_tolerance`), as R's certification reads it.
+    converge_floor = _ctsem_tolerance(converge_tol, directional)
+    verdict = _ctsem_optimise_verdict(objective, minimizer, start_values,
+        final.value, gradient_norm, _ctsem_predicted_gain(directional),
+        _ctsem_last_gain(trace), saturated_parameters, g_tol, converge_floor;
+        # A stage asked for no iterations has not stalled.
+        # Not after a jump the route named: the run is handed on from there,
+        # and the probe's pullbacks cost minutes on the fit this was built for.
+        # Nor after a walk off to a limit, which the watch measured climbing
+        # outward: pulling back cannot gain, and cost the second-order refit
+        # 75 s of its 3 minutes.
+        # Nor where the finish ended on its walk (`newton_final`), as the
+        # finish's own probe does not: the stage is not certified, its
+        # objective is about to change, and the certified stage after it
+        # probes on its exact Hessian. Without one the probe searches every
+        # coordinate: 22 sets, 1.5 hours, after the affect pilot's smoothing
+        # pass.
+        label=label, verbose=verbose && maxiter > 0,
+        overshoot_probe=(stop_reason in ("jump", "diverged") ||
+            (finish !== nothing && finish.walked !== nothing)) ? :off : overshoot_probe,
+        progress=_ctsem_probe_progress(reporter),
+        # What the probe pulls back, read off the finish's Hessian where
+        # there is one, and only the flat transforms after the iteration cap
+        # (`_ctsem_overshoot_candidates`).
+        candidates=_ctsem_overshoot_candidates(objective, minimizer,
+            saturated_parameters,
+            (finish === nothing || finish.hessian === nothing) ? nothing :
+                finish.hessian,
+            flat_rtol, stall_ratio; capped=stop_reason == "cap"),
+        widen=stop_reason != "cap")
+    saturated = verdict.saturated
+    stalled = verdict.stalled
+    # The modes the run ends with, for the fit (`_ctsem_fit_modes`): its
+    # anchored maxima, before the clearing below, and what the closing search
+    # adds.
+    held_modes = _ctsem_anchor_modes(objective; known=false)
+    # The run's anchored modes against a search at the estimate, and the
+    # anchors cleared (`_ctsem_anchor_finish!`): where the run's own last
+    # search was at the estimate and found nothing to go on with, only the
+    # clearing, its findings being in `found` already.
+    anchored = if searched_at == minimizer
+        ctsem_laplace_clear_anchors!(objective)
+        nothing
+    else
+        _ctsem_anchor_finish!(objective, minimizer)
+    end
+    fit_modes = _ctsem_fit_modes(held_modes, anchored)
+    finite_gradient = verdict.finite_gradient
+    converged_enough = verdict.converged_enough
+    overshoot = verdict.overshoot
+    overshot = verdict.overshot
+    verbose && stopped_by_stall[] && println(_console(), label, ": the last ",
+        stall.window, " iterations gained ",
+        _ctsem_window_gain(trace, stall.window), ", no more than ", stall.look,
+        ", and raw ",
+        "parameter(s) ", stall.flat, " have lost all but ", stall_ratio,
+        " of what their transform does when live, and pulling them back gains ",
+        stall.gain, " -- so the fit has stopped getting anywhere, this is why, ",
+        "and there is somewhere better to go. Stopping here rather than ",
+        "running to the iteration cap")
+    verbose && stopped_by_divergence[] && println(_console(), label, ": the last ",
+        stall.window, " iterations gained ", _ctsem_window_gain(trace, stall.window),
+        " while raw parameter(s) ", stall.flat, " at least doubled, past ",
+        _CTSEM_DIVERGE_RAW, ", since the check before -- walking off to a limit ",
+        "with no maximum to reach; stopping rather than running to the iteration cap")
+    verbose && stopped_by_progress[] && println(_console(), label, ": the last ",
+        stall.window, " iterations gained ", _ctsem_window_gain(trace, stall.window),
+        ", no more than ", stall.stop, " -- a resumed stage that has stopped ",
+        "getting anywhere; stopping rather than running to the iteration cap")
+    verbose && !stalled && !(finite_gradient &&
+        (result.g_converged || converged_enough)) &&
+        println(_console(), label, ": the optimizer stopped with an estimated ",
+            _ctsem_predicted_gain(directional), " log likelihood still ",
+            "available and ", _ctsem_last_gain(trace),
+            " gained on its last iteration, against a tolerance of ",
+            converge_floor, " (largest gradient ", gradient_norm,
+            "); reporting this as not converged")
+    return (
+        minimizer=minimizer,
+        maximum_loglik=final.value,
+        # Modes the anchored run reached that a search at the estimate does not
+        # (`anchor_kept_*`), and better ones the search found that the run
+        # missed (`anchor_missed_*`, worth `anchor_missed_gain`), for the
+        # caller's known modes; `[0]` where none or not anchored. Whether that
+        # gain is worth resuming the run for (`anchor_missed_resume`) is the
+        # bar the run's own rounds use, `_CTSEM_MODE_RESUME_TOL`, so the caller
+        # holds no second one.
+        anchor_kept_units=anchored === nothing ? [0] : anchored.kept_units,
+        anchor_kept_values=anchored === nothing ? zeros(1, 1) : anchored.kept_values,
+        anchor_missed_units=anchored === nothing ? [0] : anchored.missed_units,
+        anchor_missed_values=anchored === nothing ? zeros(1, 1) :
+            anchored.missed_values,
+        anchor_missed_gain=anchored === nothing ? 0.0 : anchored.missed_gain,
+        anchor_missed_resume=anchored !== nothing && isfinite(anchored.missed_gain) &&
+            abs(anchored.missed_gain) > _ctsem_tolerance(_CTSEM_MODE_RESUME_TOL, directional),
+        # Modes the run put in its objective's known modes on its way, and how
+        # many times it took some and carried on (`CTSEMFoundModes`), for the
+        # caller's known modes; `[0]` where none.
+        found_mode_units=_ctsem_found_columns(found)[1],
+        found_mode_values=_ctsem_found_columns(found)[2],
+        found_mode_rounds=mode_rounds,
+        # Every unit's maxima at the estimate, the run's anchored ones and any
+        # better the closing search found (`_ctsem_fit_modes`), for the fit to
+        # hold wherever it is read afterwards (`ctsem_laplace_hold_modes!`);
+        # `[0]` where the run anchored none.
+        fit_mode_units=fit_modes.units,
+        fit_mode_values=fit_modes.values,
+        gradient=collect(final.gradient),
+        subject_loglik=collect(final.subject_loglik),
+        result_extra...,
+        # Explosive filter passes and forward-mode subject gradients over the
+        # run, and the subjects whose filter grows past `_CTSEM_EXPLOSIVE_GROWTH`
+        # at the estimate (`[0]` for none, for the bridge's sake).
+        forward_gradients=forward_gradients,
+        explosive_passes=explosive_passes,
+        explosive_subjects=isempty(explosive) ? [0] : explosive,
+        # The larger of the two, which agree since the L-BFGS became ctsem's
+        # own; kept because the callback's count is the one the trace shows.
+        iterations=max(iterations, seen_iterations[]),
+        # As the L-BFGS counts them, with the later stages' calls added.
+        f_calls=result.f_calls + spent.fcalls[] +
+            (finish === nothing ? 0 : finish.fcalls),
+        g_calls=result.g_calls + spent.gcalls[] +
+            (finish === nothing ? 0 : finish.gcalls),
+        # The batch sizes the run grew through and the iterations it grew at,
+        # `[0]` when it did not batch -- never empty, for the bridge's sake.
+        batch_sizes=isempty(result.batch_sizes) ? [0] : result.batch_sizes,
+        batch_iterations=isempty(result.batch_iterations) ? [0] :
+            result.batch_iterations,
+        # The endgame (`_ctsem_newton_finish`): how many steps, escapes from a
+        # saddle included, and the Hessian of the objective it ended on -- the
+        # certification's matrix, handed over so it is not computed twice.
+        # `[0.0;;]` when there was no finish (a 1x1 zero, since an empty matrix
+        # would hang the bridge).
+        newton_steps=newton_steps,
+        # L-BFGS steps taken on the structured model (`lbfgs_scores`).
+        structured_steps=structured === nothing ? 0 : structured.steps,
+        # The local curvature (`lbfgs_local`): how often it was built, the
+        # gradients that cost, and how many parameters it took exactly.
+        local_builds=local_curvature === nothing ? 0 :
+            local_curvature.builds - Int(local_builds_carried),
+        local_gradients=local_curvature === nothing ? 0.0 : local_curvature.spent,
+        local_columns=local_curvature === nothing ? 0 :
+            length(local_curvature.columns),
+        # Its inverse, for a resume to start from (a 1x1 zero where none was
+        # built: an empty matrix would hang the bridge).
+        local_inverse=(local_curvature === nothing || isempty(local_curvature.inverse)) ?
+            zeros(1, 1) : local_curvature.inverse,
+        # The coreset stages (`coreset`): each stage's units, share of a full
+        # evaluation's work, iterations, and what the full objective gained
+        # over what the coreset predicted; the iteration each run of stages
+        # began after; how many full gradients checked them and how many sent
+        # the point back; the coreset fits tried, and the seconds choosing them
+        # took. `[0]` for none, for the bridge's sake.
+        coreset_sizes=_ctsem_coreset_report(coreseter, :sizes),
+        coreset_shares=_ctsem_coreset_report(coreseter, :shares),
+        coreset_bought=_ctsem_coreset_report(coreseter, :bought),
+        coreset_stage_iterations=_ctsem_coreset_report(coreseter, :stage_iterations),
+        coreset_entered=_ctsem_coreset_report(coreseter, :entered),
+        coreset_starts=_ctsem_coreset_report(coreseter, :starts),
+        coreset_iterations=coreseter === nothing ? 0 : coreseter.total_iterations,
+        coreset_checks=coreseter === nothing ? 0 : coreseter.checks,
+        coreset_reverted=coreseter === nothing ? 0 : coreseter.reverted,
+        coreset_attempts=coreseter === nothing ? 0 : coreseter.attempts,
+        coreset_seconds=coreseter === nothing ? 0.0 : coreseter.select_seconds,
+        full_gradients=full_gradients[],
+        newton_hessians=spent.hessians[] +
+            (finish === nothing ? 0 : finish.full_hessians),
+        newton_subset_hessians=spent.subset[] +
+            (finish === nothing ? 0 : finish.subset_hessians),
+        # The Krylov models the finish stepped on and the gradients they took
+        # (`CTSEMKrylov`): their Hessian-vector products and the evaluation
+        # each extension starts from.
+        newton_krylov_models=spent.krylov_models[] +
+            (finish === nothing ? 0 : finish.krylov_models),
+        newton_krylov_products=spent.krylov_products[] +
+            (finish === nothing ? 0 : finish.krylov_products),
+        # Whether a finish found the hand-over early and gave the point back to
+        # L-BFGS (see `_ctsem_newton_finish`); its steps and Hessians are in the
+        # counts above.
+        newton_handback=handed_back,
+        hessian=(finish === nothing || finish.hessian === nothing) ?
+            zeros(1, 1) : finish.hessian,
+        # Where that Hessian was evaluated, and how far `minimizer` is from
+        # there in the standard errors it implies: a chord Hessian the steps
+        # converged on within `newton_reuse` of a standard error is kept as the
+        # final one. `[0.0]` and `NaN` when there is no Hessian.
+        hessian_evaluated_at=(finish === nothing || finish.hessian === nothing) ?
+            [0.0] : finish.hessian_at,
+        hessian_distance=(finish === nothing || finish.hessian === nothing) ?
+            NaN : finish.distance,
+        # Under `newton_final = :walked`, the matrix the finish's last walk
+        # stepped on, of the maximised objective, at the point it returned
+        # (`minimizer`): an approximation, never the certification's.
+        # `zeros(1, 1)` otherwise.
+        newton_walked=(finish === nothing || finish.walked === nothing) ?
+            zeros(1, 1) : finish.walked,
+        # The saddle record: whether the final point still has a direction of
+        # negative curvature, whether the ladder was tried at it, how many
+        # escapes the ladder made on the way, and what they gained; and at the
+        # final point, how many negative directions the ladder measured and the
+        # most it found along them, which `.ctBackendCertify()` reads.
+        newton_saddle=finish === nothing ? false : finish.saddle,
+        newton_ladder_tried=finish === nothing ? false : finish.ladder_tried,
+        newton_escapes=finish === nothing ? 0 : finish.escapes,
+        newton_escape_gain=finish === nothing ? 0.0 : finish.ladder_gain,
+        newton_saddle_walked=finish === nothing ? 0 : finish.saddle_walked,
+        newton_saddle_gain=finish === nothing ? NaN : finish.saddle_gain,
+        # What the directions the final Hessian does not trust are worth, by
+        # the route's own predicate: the probe `.ctBackendCertify()` reads.
+        # `probe_ran` false and a `[0.0]` direction when there was nothing to
+        # probe, or no certification asked for one.
+        probe_ran=finish !== nothing && !isempty(finish.probe.direction),
+        probe_gain=finish === nothing ? 0.0 : finish.probe.gain,
+        probe_length=finish === nothing ? 0.0 : finish.probe.length,
+        probe_longest=finish === nothing ? 0.0 : finish.probe.longest,
+        probe_direction=(finish === nothing || isempty(finish.probe.direction)) ?
+            [0.0] : finish.probe.direction,
+        # One entry per step the finish took, in order: its kind ("newton",
+        # "exact" or "saddle"), predicted gain, step length (a signed raw length
+        # for an escape) and the objective after it. `newton_steps` says how
+        # many entries are real; with none, one placeholder, for the bridge.
+        newton_history_kind=isempty(newton_history.kind) ? ["none"] :
+            newton_history.kind,
+        newton_history_gain=isempty(newton_history.gain) ? [NaN] :
+            newton_history.gain,
+        newton_history_alpha=isempty(newton_history.alpha) ? [NaN] :
+            newton_history.alpha,
+        newton_history_value=isempty(newton_history.value) ? [NaN] :
+            newton_history.value,
+        # Why L-BFGS stopped: "gap", "stall", "progress", "jump",
+        # "linesearch", "gradient", "tolerance", "cap" or "other"; "jump" too
+        # where the finish's steps confirmed one.
+        stop_reason=stop_reason,
+        # A jump the route named (`stop_reason == "jump"`): the units whose
+        # terms jumped, their changes along the step, and where each one's
+        # inner solve stopped at the points either side, column `j` of
+        # `jump_point_values` for unit `jump_point_units[j]` (NaN-padded to
+        # the widest, `_laplace_known_column`). `[0]`, `[0.0]` and a 1x1
+        # matrix when there was none.
+        jump_units=jumped_units[] === nothing ? [0] : jumped_units[].units,
+        jump_changes=jumped_units[] === nothing ? [0.0] : jumped_units[].changes,
+        jump_point_units=jumped_units[] === nothing ? [0] :
+            jumped_units[].point_units,
+        jump_point_values=jumped_units[] === nothing ? zeros(1, 1) :
+            jumped_units[].point_values,
+        jump_excess=jump.seen ? jump.excess : 0.0,
+        stopped_by_gap=stopped_by_gap[],
+        # A resumed stage stopped on progress alone; see `CTSEMStallWatch`.
+        stopped_by_progress=stopped_by_progress[],
+        # Whether the run ended because it stopped making progress rather than
+        # because it arrived.
+        stopped_by_stall=stopped_by_stall[],
+        # Walking off to a limit, and the coordinates that were (`0` for none).
+        stopped_by_divergence=stopped_by_divergence[],
+        diverging_parameters=stopped_by_divergence[] && !isempty(stall.flat) ?
+            stall.flat : [0],
+        stall_window=Int(stall.window),
+        # Which coordinates were flat when it stopped, and how many times the
+        # progress test fired without finding one. `0` for none, for the reason
+        # `saturated_parameters` gives.
+        stall_parameters=isempty(stall.flat) ? [0] : stall.flat,
+        stall_triggers=stall.triggers,
+        # The sgd phase's iterations (`sgd`), 0 when it did not run.
+        sgd_iterations=sgd_iterations,
+        # The SAEM phase (`saem`): its iterations, whether it stopped on its
+        # trend rule and the trend there, its chains, its mean acceptance rate
+        # and its own trace; zeros and `nothing` when it did not run.
+        saem_iterations=saem_result === nothing ? 0 : saem_result.iterations,
+        saem_settled=saem_result === nothing ? false : saem_result.settled,
+        saem_trend=saem_result === nothing ? NaN : saem_result.trend,
+        saem_chains=saem_result === nothing ? 0 : saem_result.chains,
+        saem_acceptance=saem_result === nothing ? NaN : saem_result.acceptance,
+        saem_trace=saem_result === nothing ? nothing : saem_result.trace,
+        # The point the in-flight probe found, so the caller resuming from it
+        # does not pay for the same ladder twice. Empty unless it stopped here.
+        stall_point=isempty(stall.point) ? Float64[0.0] : stall.point,
+        stall_gain=stall.gain,
+        stalled=stalled,
+        # Reported because the answer depends on it. Dividing a unit's members
+        # reassociates a sum, so two fits at different widths differ in the last
+        # few digits -- and so do two at one width above one, since the pool
+        # takes units as its workers come free: five evaluations at one point
+        # and width 8 differed by 2e-13 (2026-10-16). One worker reproduces.
+        chunks=ctsem_max_chunks().max_chunks,
+        gradient_norm=gradient_norm,
+        converge_tol=Float64(converge_tol),
+        # What the objective resolved (`_ctsem_resolution`) and the bar the
+        # verdict read for it, which R's certification reads too.
+        resolution=_ctsem_resolution(directional),
+        converge_floor=converge_floor,
+        last_gain=_ctsem_last_gain(trace),
+        # What the last step was predicted to gain, and the rule it was judged
+        # against. `Inf` when no line search ran, and `0` when the rule was off;
+        # `gap_floor` is the tolerance it last applied (`_ctsem_gap_floor`).
+        predicted_gain=_ctsem_predicted_gain(directional),
+        gap_tol=Float64(gap_tol),
+        gap_floor=_ctsem_gap_floor(gap_tol, directional),
+        linesearch=linesearch,
+        # See `ctsem_laplace_optimize`: a disjunction of the L-BFGS's flags
+        # includes the x and f criteria, which a line search that stops making
+        # progress satisfies
+        # trivially, so convergence is judged on the gradient alone.
+        #
+        # `overshot`, not `saturated`. `converged` answers one question -- did
+        # the optimizer arrive at a maximum -- and a coordinate the data do not
+        # identify is a separate finding, reported separately in `saturated`
+        # and `saturated_parameters`. Keying convergence on saturation made the
+        # flag false on two thirds of good fits; see `_ctsem_overshot`.
+        converged=!stalled && !overshot && finite_gradient &&
+            stop_reason != "jump" && stop_reason != "diverged" &&
+            (result.g_converged || converged_enough),
+        saturated=saturated,
+        # The pullback verdict and its margin. `overshot` is the half of
+        # saturation that is a convergence failure; `overshoot_gain` is how
+        # much the objective improved when the flagged coordinate was pulled
+        # back, so a user can see whether it was 16 log units or 1e-13.
+        overshot=overshot,
+        overshoot_gain=overshoot.gain,
+        # Which coordinates the pullback moved. Not the same as
+        # `saturated_parameters` any more and no longer derivable from it: the
+        # probe selects by magnitude order, so the set that proved the estimate
+        # is not a maximum can include coordinates whose transform is merely
+        # unresponsive rather than flat. `0` means none, for the reason the
+        # saturated list gives.
+        overshoot_parameters=isempty(overshoot.coordinates) ? [0] :
+            overshoot.coordinates,
+        # And where it went to prove it. The probe has already paid for this
+        # point -- it is the trial that beat the estimate -- so handing it back
+        # lets a caller resume from somewhere measurably better for no further
+        # evaluations, rather than only being told the estimate is not a
+        # maximum. Used by `.ctBackendStallEscape()`.
+        #
+        # `[0.0]` rather than `Float64[]` for the reason `saturated_parameters`
+        # gives: a zero-length vector deadlocks the R bridge. A real point is
+        # `length(minimizer)` long, which is how the caller tells them apart.
+        overshoot_point=isempty(overshoot.point) ? Float64[0.0] : overshoot.point,
+        # Which raw parameters, not just whether one did -- most of the
+        # diagnostic value, and free once the derivatives are computed.
+        #
+        # NEVER an empty vector. A zero-length vector deadlocks the
+        # JuliaConnectoR bridge in both directions, and "nothing saturated" is
+        # the normal case, so returning Int[] here hung every healthy fit the
+        # moment its result crossed back to R. 0 means none; any other entry is
+        # a raw parameter index.
+        saturated_parameters=isempty(saturated_parameters) ? [0] : saturated_parameters,
+        g_converged=result.g_converged,
+        f_converged=result.f_converged,
+        x_converged=result.x_converged,
+        trace=_trace_result(trace),
+    )
+end

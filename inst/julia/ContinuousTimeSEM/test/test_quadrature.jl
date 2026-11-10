@@ -1,0 +1,464 @@
+using ForwardDiff, LinearAlgebra
+
+# `_fresh_linear`, `_fresh_nonlinear`, `_fresh_twolevel` and `_fresh_threelevel`
+# come from `laplace_fixtures.jl`, which `test_laplace.jl` also includes. Shared
+# rather than rebuilt because `ekf_from_columns` parses transform strings through
+# `eval`, so a rebuilt model is uniquely typed and recompiles the whole filter.
+isdefined(@__MODULE__, :_LAPLACE_LINEAR_OBJECTIVE) ||
+    include(joinpath(@__DIR__, "laplace_fixtures.jl"))
+
+# Adaptive Gauss-Hermite quadrature over the same integral `laplace.jl`
+# approximates.
+#
+# Three things need checking, and they are independent of one another.
+#
+#  1. The *rule* is a Gauss-Hermite rule. Checked against integrals whose value
+#     is known in closed form, with no ctsem in sight.
+#
+#  2. The rule and the Laplace term are integrating the *same thing*. Checked at
+#     `nodes = 1`, where the adaptive rule degenerates to a single point at the
+#     mode and must reproduce the Laplace value exactly -- constants, log
+#     determinant, prior and all. That is a sharp test: the two arrive at the
+#     number by completely different routes, and every constant that either one
+#     drops has to be dropped by the other.
+#
+#  3. Where Laplace is exact, more nodes must change nothing. The linear model's
+#     integrand is exactly Gaussian in `z`, so a nine-node rule integrates the
+#     same Gaussian and has to agree to quadrature precision.
+
+@testset "Gauss-Hermite rule" begin
+    x, w = ContinuousTimeSEM._gauss_hermite(7)
+    @test length(x) == 7 && length(w) == 7
+    @test sum(w) ≈ sqrt(pi) rtol = 1e-12
+    # int x^2 exp(-x^2) dx = sqrt(pi)/2, and the rule is exact to degree 2m-1.
+    @test sum(w .* x .^ 2) ≈ sqrt(pi) / 2 rtol = 1e-12
+    @test sum(w .* x .^ 4) ≈ 3 * sqrt(pi) / 4 rtol = 1e-12
+    @test sum(w .* x .^ 3) ≈ 0 atol = 1e-12
+    # One node is the degenerate rule the adaptive scheme uses as Laplace.
+    x1, w1 = ContinuousTimeSEM._gauss_hermite(1)
+    @test x1 == [0.0] && w1 ≈ [sqrt(pi)]
+
+    points, logweights = ContinuousTimeSEM._gh_grid(2, 5)
+    @test length(points) == 25 && length(logweights) == 25
+    # The exp(x^2) factor is folded into the log weight, so the plain weights
+    # come back by removing it.
+    @test sum(exp(lw - sum(p .^ 2)) for (p, lw) in zip(points, logweights)) ≈ pi rtol = 1e-12
+end
+
+@testset "quadrature reproduces Laplace at one node" begin
+    for (name, fresh) in (("linear", _fresh_linear), ("nonlinear", _fresh_nonlinear))
+        laplace, values = fresh()
+        reference = ctsem_laplace_evaluate(laplace, values; gradient=false).value
+        single = ctsem_laplace_quadrature(laplace, values; nodes=1).value
+        @test single ≈ reference rtol = 1e-12
+        @test isfinite(single)
+        name == "linear" || continue
+        # Where Laplace is exact the rule cannot move: the integrand is exactly
+        # Gaussian in z, so every node count integrates the same Gaussian.
+        for nodes in (3, 5, 9)
+            @test ctsem_laplace_quadrature(laplace, values; nodes=nodes).value ≈
+                reference rtol = 1e-9
+        end
+    end
+end
+
+@testset "quadrature disagrees with Laplace only where it should" begin
+    laplace, values = _fresh_nonlinear()
+    reference = ctsem_laplace_evaluate(laplace, values; gradient=false).value
+    five = ctsem_laplace_quadrature(laplace, values; nodes=5).value
+    nine = ctsem_laplace_quadrature(laplace, values; nodes=9).value
+    # A genuinely non-Gaussian integrand: more nodes must move the answer, and
+    # the movement must be settling rather than wandering.
+    @test five != reference
+    @test abs(nine - five) < abs(five - reference)
+    @test isapprox(nine, ctsem_laplace_quadrature(laplace, values; nodes=11).value;
+        atol = 1e-6)
+end
+
+@testset "quadrature contributions sum to the value" begin
+    laplace, values = _fresh_nonlinear()
+    result = ctsem_laplace_quadrature(laplace, values; nodes=5, contributions=true)
+    prior = ContinuousTimeSEM._ctsem_log_prior(laplace.objective, collect(Float64, values))
+    @test sum(result.subject_loglik) + prior ≈ result.value rtol = 1e-12
+    @test length(result.subject_loglik) == length(laplace.objective.subject_objectives)
+end
+
+@testset "the block tree the recursion walks" begin
+    for (label, fresh, nblocks, nroots) in (("two levels", _fresh_twolevel, 3, 1),
+                                            ("three levels", _fresh_threelevel, 7, 1))
+        laplace, _ = fresh()
+        blocks = laplace.units.blocks[1]
+        tree = ContinuousTimeSEM._quadrature_children(blocks)
+        @test (label, length(blocks)) == (label, nblocks)
+        @test (label, length(tree.roots)) == (label, nroots)
+        # Every block is either a root or exactly one block's child, and the
+        # tree spans all of them -- otherwise the recursion would silently drop
+        # a level's likelihood contribution.
+        reached = Set(tree.roots)
+        queue = copy(tree.roots)
+        while !isempty(queue)
+            b = pop!(queue)
+            for c in tree.children[b]
+                @test !(c in reached)
+                push!(reached, c); push!(queue, c)
+            end
+        end
+        @test (label, length(reached)) == (label, length(blocks))
+        # A child sits one level below its parent, and its members are a subset.
+        for b in eachindex(blocks), c in tree.children[b]
+            @test blocks[c].level < blocks[b].level
+            @test issubset(Set(blocks[c].members), Set(blocks[b].members))
+        end
+        # A leaf's members partition its ancestors' members.
+        leaves = [b for b in eachindex(blocks) if isempty(tree.children[b])]
+        covered = sort(vcat([blocks[b].members for b in leaves]...))
+        @test covered == collect(1:length(laplace.units.members[1]))
+    end
+end
+
+@testset "the recursion reproduces Laplace at one node, at every depth" begin
+    for (label, fresh) in (("two levels", _fresh_twolevel),
+                           ("three levels", _fresh_threelevel))
+        laplace, values = fresh()
+        reference = ctsem_laplace_evaluate(laplace, values; gradient=false).value
+        single = ctsem_laplace_quadrature(laplace, values; nodes=1).value
+        # The node scale is clipped at the prior's curvature, block by block on
+        # the eliminated precisions. The three-level fixture's outermost effect
+        # is on DRIFT, and there two study blocks come out at 0.9949 and 0.9973:
+        # at one node each is scored as if it were 1, so the one-node rule is the
+        # Laplace value less half the log of each clipped eigenvalue. Computed
+        # here from the factorization with LinearAlgebra's own eigvals, which
+        # shares nothing with the rule's clipping. The two-level fixture is
+        # Gaussian, clips nothing, and the correction is exactly zero.
+        C = ContinuousTimeSEM
+        theta = collect(Float64, values)
+        Ls = C._laplace_popchols(theta, laplace.spec)
+        correction = 0.0
+        for U in eachindex(laplace.units.members)
+            blocks = laplace.units.blocks[U]
+            fac = C._laplace_factor_repaired!(C._laplace_unit_curvature(laplace, U,
+                theta, Ls, laplace.modes[U]), blocks)
+            for (b, F) in enumerate(fac.factors)
+                blocks[b].size == 0 && continue
+                Lf = Matrix(F.L)
+                lam = eigvals(Symmetric(Lf * transpose(Lf)))
+                correction += sum(log, min.(lam, 1.0)) / 2
+            end
+        end
+        label == "two levels" && @test correction == 0
+        label == "three levels" && @test correction < -1e-3
+        @test (label, isapprox(single, reference + correction; rtol=1e-10)) ==
+            (label, true)
+        # `nodes = 1` forces `sum over blocks of logdet(scale) = -logdet(M)/2`,
+        # and that sum telescopes only if each outer block is scaled by its
+        # curvature *after* its descendants are eliminated. The marginal
+        # covariance passes this at two levels and fails at three, which is why
+        # the check runs at both depths rather than one.
+    end
+    # Two levels of *identity*-transformed effects make the integrand exactly
+    # Gaussian in the whole unit latent vector, so every node count integrates
+    # the same Gaussian -- through the recursion, the per-node leaf mode solves
+    # and all. The three-level fixture puts its outermost effect on DRIFT, whose
+    # transform is not the identity, so it is genuinely approximate and belongs
+    # to the test below instead.
+    laplace, values = _fresh_twolevel()
+    reference = ctsem_laplace_evaluate(laplace, values; gradient=false).value
+    for nodes in (3, 5)
+        @test ctsem_laplace_quadrature(laplace, values; nodes=nodes).value ≈
+            reference rtol = 1e-7
+    end
+end
+
+@testset "three levels: a nonlinear outer effect moves the answer and settles" begin
+    laplace, values = _fresh_threelevel()
+    reference = ctsem_laplace_evaluate(laplace, values; gradient=false).value
+    five = ctsem_laplace_quadrature(laplace, values; nodes=5).value
+    nine = ctsem_laplace_quadrature(laplace, values; nodes=9).value
+    # The outermost effect sits on DRIFT, so Laplace is approximate here and the
+    # rule must disagree with it -- and then stop disagreeing with itself.
+    @test five != reference
+    @test abs(nine - five) < abs(five - reference)
+    @test isapprox(nine, ctsem_laplace_quadrature(laplace, values; nodes=11).value;
+        atol = 1e-5)
+end
+
+@testset "per-unit contributions at more than one level" begin
+    laplace, values = _fresh_twolevel()
+    result = ctsem_laplace_quadrature(laplace, values; nodes=3, contributions=true)
+    prior = ContinuousTimeSEM._ctsem_log_prior(laplace.objective, collect(Float64, values))
+    # One entry per *unit*, not per subject: a study's integral does not
+    # decompose over its members.
+    @test length(result.subject_loglik) == length(laplace.units.members)
+    @test length(result.subject_loglik) < length(laplace.objective.subject_objectives)
+    @test sum(result.subject_loglik) + prior ≈ result.value rtol = 1e-12
+end
+
+@testset "the correction is available at more than one level" begin
+    laplace, values = _fresh_twolevel()
+    result = ctsem_laplace_optimize(laplace, values; maxiter=100, g_tol=1e-7)
+    H = ctsem_laplace_hessian(laplace, result.minimizer)
+    correction = ctsem_laplace_correction(laplace, result.minimizer, H; nodes=3)
+    @test all(isfinite, correction.delta)
+
+    # Not `-H * delta == gap` any more, and the reason is the sentence below
+    # about `inv(-H)` being "big enough to carry it": on this fixture the gap
+    # gradient is entirely floating-point noise (Laplace is exact here) and the
+    # information matrix is near-singular, so an exact solve amplifies the noise
+    # by 1/lambda_min. Two consecutive corrections on the same fit returned
+    # largest steps of 3.3e+08 and 3.5e-10 standard errors. `_correction_step`
+    # truncates at sqrt(eps) relative to the largest eigenvalue, so the residual
+    # now lives in the directions it declined to correct along.
+    #
+    # Three properties replace the one, and together they are stronger.
+
+    # 1. Where the curvature *is* identified, the solve is still exact --
+    #    truncation must be a no-op on a well-conditioned problem, or it has
+    #    quietly broken every model that did not need it.
+    n = length(result.minimizer)
+    wellposed = ctsem_laplace_correction(laplace, result.minimizer,
+        Matrix(-1.0I, n, n); nodes=3)
+    @test wellposed.dropped_directions == 0
+    @test -(Symmetric(Matrix(-1.0I, n, n)) * wellposed.delta) ≈
+        wellposed.gap_gradient rtol = 1e-7
+
+    # 2. A singular information matrix yields no correction rather than an
+    #    arbitrarily large one.
+    singular = ctsem_laplace_correction(laplace, result.minimizer,
+        zeros(n, n); nodes=3)
+    @test all(iszero, singular.delta)
+    @test singular.dropped_directions == n
+
+    # 3. The correction on the real Hessian is reproducible. This is what
+    #    actually failed before: the two calls disagreed by eighteen orders of
+    #    magnitude while describing the same fit.
+    again = ctsem_laplace_correction(laplace, result.minimizer, H; nodes=3)
+    @test correction.delta ≈ again.delta atol = 1e-9
+    # Laplace is exact for this model, so there is nothing to correct. The step
+    # is measured against the standard errors rather than against zero: the gap
+    # it differences is ~1e-9 here, a 1e-3 finite-difference step turns that
+    # into ~5e-7 of gradient, and six subjects make `inv(-H)` big enough to
+    # carry it to 1e-3 in raw units -- which is still four orders of magnitude
+    # inside the interval, and it is the ratio that a reader acts on.
+    se = sqrt.(abs.(diag(inv(-Symmetric(H)))))
+    @test maximum(abs.(correction.delta ./ se)) < 0.05
+    @test abs(correction.gap) < 1e-6
+end
+
+@testset "the correction is the Newton step it claims to be" begin
+    laplace, values = _fresh_nonlinear()
+    result = ctsem_laplace_optimize(laplace, values; maxiter=200, g_tol=1e-8)
+    est = result.minimizer
+    H = ctsem_laplace_hessian(laplace, est)
+    correction = ctsem_laplace_correction(laplace, est, H; nodes=5)
+    @test all(isfinite, correction.delta)
+    @test correction.corrected ≈ est .+ correction.delta
+    # `delta` solves -H delta = grad(Q - T). At the Laplace estimate the Laplace
+    # gradient is zero, so that gap gradient is the quadrature objective's own
+    # gradient, and the step is an ordinary Newton step on it.
+    #
+    # In the directions H can resolve, and only there. This fixture drops three
+    # of five -- the Laplace is exact for it, so the gap gradient is 4e-13 and
+    # three coordinates are flat at the estimate -- and `delta` is deliberately
+    # zero along a dropped one. The bare identity therefore asserts that a
+    # numerically zero gap gradient happens to have no component in a dropped
+    # direction, which is a property of the last bit of the estimate rather than
+    # of the correction: it held here until an unrelated change in the inner
+    # solve moved the estimate along the flat ridge by 3%, at an identical log
+    # likelihood, and then it did not.
+    #
+    # What the correction promises is that what it did not solve is what H
+    # cannot see. H annihilates exactly that, so an error in any direction it
+    # *can* see survives this and is caught -- which is the identity, restricted
+    # to where it can hold.
+    residual = -(Symmetric(H) * correction.delta) .- correction.gap_gradient
+    # With an absolute floor, because a purely relative bound here compares two
+    # quantities that are both rounding error. This fixture's gap gradient is
+    # 4e-13 -- the Laplace is exact for it, which is the point of the fixture --
+    # so `1e-8` of it is 4e-21, and the left side is the product of a curvature
+    # with a residual of order 1e-25. It duly failed at 9.3e-21 against 4.4e-21
+    # when the worker pool changed the order a sum is accumulated in, which is
+    # not an error in the correction by any reading.
+    #
+    # The floor is five orders below the gap gradient, so where that gradient
+    # means anything the relative term is the one that binds and this changes
+    # nothing; and five orders above the arithmetic noise, so the assertion
+    # stops being a coin toss on the last bits. A real violation of the
+    # identity is many orders larger than either: the `dropped_directions == 0`
+    # branch below tests the same claim at `rtol = 1e-8` wherever the fixture
+    # is identified.
+    @test maximum(abs, Symmetric(H) * residual) <
+        max(1e-8 * maximum(abs, correction.gap_gradient), 1e-16)
+    # And the bare identity wherever the fixture is fully identified, so this
+    # keeps its teeth if the fixture ever becomes so.
+    if correction.dropped_directions == 0
+        @test -(Symmetric(H) * correction.delta) ≈ correction.gap_gradient rtol = 1e-8
+    end
+    # The gap gradient must be a derivative of the gap the same call reports.
+    @test correction.gap ≈ correction.quadrature - correction.laplace rtol = 1e-12
+
+    # Refinement moves in the direction the correction predicts, and improves
+    # the objective it is maximising.
+    refined = ctsem_laplace_refine(laplace, est; nodes=5, maxiter=30)
+    @test refined.maximum_loglik >=
+        ctsem_laplace_quadrature(laplace, est; nodes=5).value - 1e-8
+    @test refined.shift ≈ refined.minimizer .- est
+end
+
+@testset "quadrature is unaffected by how the modes were left" begin
+    # The rule reuses the retained inner modes as its centre, so it inherits
+    # whatever `_laplace_solve_unit_mode!` guarantees. That guarantee is the
+    # point: a detour through a distant parameter vector must not change the
+    # value here.
+    laplace, values = _fresh_nonlinear()
+    first = ctsem_laplace_quadrature(laplace, values; nodes=5).value
+    detour = collect(Float64, values); detour[2] += 3.0; detour[5] += 2.5
+    ctsem_laplace_quadrature(laplace, detour; nodes=5)
+    @test ctsem_laplace_quadrature(laplace, values; nodes=5).value ≈ first rtol = 1e-10
+end
+
+@testset "node scaling is clipped at the prior's curvature, and only there" begin
+    C = ContinuousTimeSEM
+    # Every eigenvalue above one: the Cholesky scale, bit for bit.
+    Q = [cos(0.4) -sin(0.4); sin(0.4) cos(0.4)]
+    concave = Q * Diagonal([6.0, 1.5]) * transpose(Q)
+    F = C._ctsem_cholesky(copy(concave), 2)
+    rule = C._quadrature_scale(F, 2)
+    @test !rule.clipped
+    @test rule.S == C._ctsem_cholesky_uinv(F)
+    @test rule.logdetscale == -logdet(F) / 2
+    # From the precision itself, the same scale as from its factor.
+    @test C._quadrature_scale(concave, 2) == rule
+    # One eigenvalue at 1e-3: scaled as if it were one, never wider than the prior.
+    convex = Q * Diagonal([6.0, 1e-3]) * transpose(Q)
+    G = C._ctsem_cholesky(copy(convex), 2)
+    clipped = C._quadrature_scale(G, 2)
+    @test clipped.clipped
+    target = Q * Diagonal([6.0, 1.0]) * transpose(Q)
+    @test clipped.S * transpose(clipped.S) ≈ inv(target) rtol = 1e-10
+    @test transpose(clipped.U) * clipped.U ≈ target rtol = 1e-10
+    @test clipped.logdetscale ≈ -log(6.0) / 2 rtol = 1e-10
+    # An indefinite precision, which has no factor: clipped the same way, and
+    # its eigenvalues kept for the derivative through the clip.
+    saddle = Q * Diagonal([6.0, -2.0]) * transpose(Q)
+    indefinite = C._quadrature_scale(saddle, 2)
+    @test indefinite.ok && indefinite.clipped
+    @test indefinite.values ≈ [-2.0, 6.0] rtol = 1e-10
+    @test indefinite.S * transpose(indefinite.S) ≈ inv(target) rtol = 1e-10
+    @test !C._quadrature_scale(fill(NaN, 2, 2), 2).ok
+    # Continuous across the switch: just below one, the clipped scale is the
+    # unclipped one to the size of the gap.
+    near = Q * Diagonal([6.0, 1 - 1e-9]) * transpose(Q)
+    Hn = C._ctsem_cholesky(copy(near), 2)
+    @test isapprox(C._quadrature_scale(Hn, 2).S, C._ctsem_cholesky_uinv(Hn);
+        atol=1e-8)
+end
+
+@testset "a leaf's solve leaves a saddle for a maximum" begin
+    C = ContinuousTimeSEM
+    laplace, _ = _fresh_linear()
+    # f(Q w) = -w1^2 + w2^2/2 - w2^4/8: a saddle at the origin, maxima at
+    # w2 = +-sqrt(2) with value 1/2 and precision 2I, turned off the axes.
+    Q = [cos(0.4) -sin(0.4); sin(0.4) cos(0.4)]
+    inner = function (z)
+        w = transpose(Q) * z
+        (value=-w[1]^2 + w[2]^2 / 2 - w[2]^4 / 8,
+         gradient=Q * [-2 * w[1], w[2] - w[2]^3 / 2])
+    end
+    precision_at = z -> (w = transpose(Q) * z;
+        Q * Diagonal([2.0, 1.5 * w[2]^2 - 1]) * transpose(Q))
+    # From a point with no gradient along the saddle's negative direction,
+    # Newton ends on the saddle; the solve leaves it.
+    z0 = Q * [0.3, 0.0]
+    zn, cn = C._quadrature_leaf_newton(inner, precision_at, z0, inner(z0), laplace, 2)
+    @test maximum(abs, zn) < 1e-6
+    r = C._quadrature_leaf_solve(inner, precision_at, z0, inner(z0), laplace, 2)
+    w = transpose(Q) * r.z
+    @test abs(w[1]) < 1e-6
+    @test abs(abs(w[2]) - sqrt(2)) < 1e-6
+    @test r.current.value ≈ 0.5 rtol = 1e-10
+    @test !r.sc.clipped
+    @test r.M ≈ 2 * Matrix(I, 2, 2) rtol = 1e-8
+    # The two maxima are equal; the signed direction picks the same one
+    # whichever sign the eigensolver returns: the one whose largest entry is
+    # positive along the negative direction, Q's second column.
+    @test w[2] > 0
+    # From an indefinite point off the saddle's line, the step on the clipped
+    # precision climbs straight to the maximum on its side.
+    z1 = Q * [0.3, -0.5]
+    r1 = C._quadrature_leaf_solve(inner, precision_at, z1, inner(z1), laplace, 2)
+    @test (transpose(Q) * r1.z)[2] ≈ -sqrt(2) rtol = 1e-6
+end
+
+@testset "the soft-direction reference rule is exact for a Gaussian, and one node is the clipped Laplace" begin
+    C = ContinuousTimeSEM
+    # A Gaussian integrand with M >= I: the rule is exact whatever its nodes.
+    laplace, values = _fresh_linear()
+    reference = ctsem_laplace_evaluate(laplace, values; gradient=false)
+    for U in eachindex(laplace.units.members)
+        term = sum(reference.subject_loglik[laplace.units.members[U]])
+        for n in (1, 3, 5)
+            @test isapprox(C._laplace_soft_rule_unit(laplace, values, U;
+                nodes=n, ndirs=1), term; atol=1e-8)
+        end
+    end
+    # One node, no forced direction, soft below one: g(uhat) - sum log max(l, 1) / 2,
+    # computed here from the curvature with LinearAlgebra's eigvals.
+    laplace, values = _fresh_nonlinear()
+    ctsem_laplace_evaluate(laplace, values; gradient=false)
+    theta = collect(Float64, values)
+    Ls = C._laplace_popchols(theta, laplace.spec)
+    aws = C._laplace_workspace!(laplace, Float64, length(theta))
+    for U in eachindex(laplace.units.members)
+        u = laplace.modes[U]
+        g = C._laplace_unit_objective_gradient(laplace, U, theta, Ls, u, aws).value
+        lam = eigvals(Symmetric(C._laplace_block_dense(C._laplace_unit_curvature(
+            laplace, U, theta, Ls, u), laplace.units.blocks[U], length(u))))
+        term = g - sum(log, max.(lam, 1.0)) / 2
+        for recenter in (false, true)
+            @test isapprox(C._laplace_soft_rule_unit(laplace, values, U;
+                nodes=1, ndirs=0, tau=1.0, recenter=recenter), term; atol=1e-10)
+        end
+    end
+end
+
+@testset "the soft-quadrature term hands off smoothly and is exact where it should be" begin
+    C = ContinuousTimeSEM
+    @test C._laplace_soft_weight(0.1, 0.2, 0.7) == 1.0
+    @test C._laplace_soft_weight(0.9, 0.2, 0.7) == 0.0
+    @test C._laplace_soft_weight(0.45, 0.2, 0.7) ≈ 0.5
+    # Concave everywhere: the gate accepts every unit and the term is Laplace.
+    laplace, values = _fresh_linear()
+    reference = ctsem_laplace_evaluate(laplace, values; gradient=false)
+    for U in eachindex(laplace.units.members)
+        g = C._laplace_soft_quadrature_unit_reference(laplace, values, U)
+        @test !g.flagged
+        @test g.value ≈ sum(reference.subject_loglik[laplace.units.members[U]]) rtol = 1e-12
+        # and the one-step rule is exact on a Gaussian integrand
+        @test isapprox(C._laplace_soft_rule_unit(laplace, values, U;
+            nodes=3, ndirs=1, newton_steps=1), g.value; atol=1e-8)
+    end
+    # A mildly convex unit inside a band placed around it: flagged, its
+    # smallest eigenvalue placed by inverse iteration, and the blend is what it
+    # says it is.
+    laplace = ctsem_laplace_objective(_LAPLACE_NONLINEAR_OBJECTIVE, [1, 2], [5, 6],
+        [7], [1.0, 1.0])
+    values = [0.1, -2.0, -0.2, 0.05, -0.25, 2.0, 0.0]
+    ctsem_laplace_evaluate(laplace, values; gradient=false)
+    Ls = C._laplace_popchols(values, laplace.spec)
+    lams = [eigmin(Symmetric(C._laplace_block_dense(C._laplace_unit_curvature(laplace,
+        U, values, Ls, laplace.modes[U]), laplace.units.blocks[U], 2))) for U in 1:5]
+    U = argmin(lams)
+    g = C._laplace_soft_quadrature_unit_reference(laplace, values, U; lo=lams[U] - 0.1,
+        hi=lams[U] + 0.1, nodes=3, newton_steps=1)
+    @test g.flagged
+    @test isapprox(g.lambda_min, lams[U]; rtol=1e-10)
+    @test 0 < g.weight < 1
+    soft = C._laplace_soft_rule_unit(laplace, values, U; nodes=3, ndirs=1,
+        newton_steps=1)
+    @test isfinite(soft)
+    plain = C._laplace_soft_quadrature_unit_reference(laplace, values, U; lo=lams[U] - 0.3,
+        hi=lams[U] - 0.2)
+    @test !plain.flagged
+    @test isapprox(g.value, plain.value + g.weight * (soft - plain.value); rtol=1e-12)
+end
+

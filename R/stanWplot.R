@@ -4,10 +4,10 @@
 #' @param iter Number of iterations
 #' @param chains Number of chains
 #' @param ... All the other regular arguments to stan()
+#' @return The stanfit object \code{rstan::sampling} returns.
 #' @export
 #' @details On windows, requires Rtools installed and able to be found by pkgbuild::rtools_path()
 #' @examples
-#' if(w32chk()){
 #' library(rstan)
 #' #### example 1 
 #' scode <- "
@@ -22,22 +22,21 @@
 #' #Uncomment the following lines -- launches rscript not compatible with cran check.
 #' #sm <- stan_model(model_code = scode)
 #' #fit1 <- stanWplot(object = sm,iter = 100000,chains=2,cores=1)
-#' }
 
 stanWplot <- function(object,iter=2000,chains=4,...){
-    
+  
     tmpdir=tempdir()
     tmpdir=gsub('\\','/',tmpdir,fixed=TRUE)
     windows= Sys.info()[1]=='Windows'
   
-    stanplot<-function(chains,seed){
+    stanplot<-function(chains,seed,iter){
       wd<-  paste0("setwd('",tmpdir,"')")
       
       writeLines(text=paste0(wd,'
     seed<-',seed,';
     chains<-',chains,';
     iter<-',iter,';
-    # addtopath=ifelse(windows,paste0(pkgbuild::rtools_path(),"/"),"")
+    
     notyet<-TRUE
      while(any(notyet==TRUE)){
       Sys.sleep(1);
@@ -47,9 +46,22 @@ stanWplot <- function(object,iter=2000,chains=4,...){
       # file=paste0(seed,"samples_1.csv"),
         ),silent=TRUE)
       if(!"try-error" %in% class(samps) && length(samps) > 0) notyet<-FALSE
-    }
+     }
+    
     varnames<-colnames(samps);
-    shiny::runApp(appDir=list(server=function(input, output,session) {
+    
+    
+    
+    server=function(input, output,session) {
+      # 
+      session$onSessionEnded(function() {
+        stopApp()
+      })
+
+      # observe({ # stop shiny
+      #   if (all(input$nsamps %in% c(0,input$iter))) close.window()#stopApp()
+      #   if(all(unlist(lapply(inputsamps,class))=="try-error")) window.close()#stopApp()
+      # })
     
     output$chainPlot <- renderPlot({
     parameter<-input$parameter
@@ -60,6 +72,7 @@ stanWplot <- function(object,iter=2000,chains=4,...){
     colclasses <- rep("NULL",length(varnames))
 colclasses[which(varnames %in% parameter)] <- NA
         
+        nsamps <- rep(NA,chains)
     for(chaini in 1:chains) {
       cmd = paste0(\'findstr "^[^#]" \', seed,"samples_",chaini,".csv") #needed because of comments after warmup
       samps[[chaini]]<-try(
@@ -72,8 +85,23 @@ colclasses[which(varnames %in% parameter)] <- NA
           select = parameter,
           skip="lp__")
       ,silent=TRUE)
-      if("try-error" %in% class(samps[[chaini]]) || nrow(samps[[chaini]]) ==0) samps[[chaini]]=samps[[1]][1,,drop=FALSE]
+      if("try-error" %in% class(samps[[chaini]]) || nrow(samps[[chaini]]) ==0) {
+       samps[[chaini]]=samps[[1]][1,,drop=FALSE]
+       nsamps[chaini] <- NA
+      } else  nsamps[chaini] <- nrow(samps[[chaini]])
     }
+    
+      # Check if all chains have reached the iter value, and if so, close the browser window
+  observe({
+    if (all(nsamps == iter)) {
+      for(chaini in 1:chains){
+        unlink(paste0(tmpdir,"/",stanseed,"samples_",chaini,".csv"))
+      }
+      runjs("window.close();")
+      
+    }
+  })
+ 
     
     mini<-min(unlist(lapply(1:chains,function(chaini) samps[[chaini]][begin:nrow(samps[[chaini]]),parameter,with=FALSE])),na.rm=T)
     maxi<-max(unlist(lapply(1:chains,function(chaini) samps[[chaini]][begin:nrow(samps[[chaini]]),parameter,with=FALSE])),na.rm=T)
@@ -94,7 +122,12 @@ colclasses[which(varnames %in% parameter)] <- NA
     grid()
     
     })
-    },ui=shiny::fluidPage(
+    } #end server function
+    
+    
+    
+    
+    ui=shiny::fluidPage(
     # Application title
     shiny::titlePanel("stan mid-sampling plots..."),
     shiny::sidebarLayout(
@@ -109,8 +142,10 @@ colclasses[which(varnames %in% parameter)] <- NA
     shiny::mainPanel(
     shiny::plotOutput("chainPlot")
     )
-    ))),
-    launch.browser=TRUE)
+    )) #end ui function
+    
+    
+    shiny::runApp(appDir=list(server=server,ui=ui), launch.browser=TRUE)
     quit(save="no")'),con=paste0(tmpdir,"/stanplottemp.R"))
       
       if(windows) system(paste0("Rscript --slave --no-restore -e source(\'",tmpdir,"/stanplottemp.R\')"),wait=FALSE) else
@@ -120,15 +155,19 @@ colclasses[which(varnames %in% parameter)] <- NA
     
     stanseed<-floor(as.numeric(Sys.time()))
     
+    on.exit({
+      for(chaini in 1:chains) unlink(paste0(tmpdir,'/',stanseed,"samples_",chaini,".csv"))
+      unlink(paste0(tmpdir,'/stanplottemp.R'))
+    })
+    
+    
     sample_file<-paste0(tmpdir,'/',stanseed,'samples', ifelse(chains==1,'_1',''),'.csv')
     
-    if(requireNamespace('shiny'))  stanplot(chains=chains,seed=stanseed)
+    if(requireNamespace(c('shiny')))  stanplot(chains=chains,seed=stanseed,iter=iter)
     
     # out=rstan::sampling(object=object,iter=iter,chains=chains,sample_file=sample_file)
     out=rstan::sampling(object=object,iter=iter,chains=chains,sample_file=sample_file,...)
     
-    for(chaini in 1:chains) system(paste0("rm ",tmpdir,'/',stanseed,"samples_",chaini,".csv"))
-    system(paste0('rm ',tmpdir,'/stanplottemp.R'))
     return(out)
   
 }

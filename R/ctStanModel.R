@@ -1,40 +1,430 @@
 ctModelUnlist<-function(ctmodelobj,
-  matnames=c('T0MEANS','LAMBDA','DRIFT','DIFFUSION','MANIFESTVAR','MANIFESTMEANS', 'CINT', 'TDPREDEFFECT', 'T0VAR','PARS')){
-  out<-data.frame(matrix=as.character(NA), row=as.integer(NA), col=as.integer(NA), param=as.character(NA), value=as.numeric(NA),
-    stringsAsFactors =FALSE) 
-  out[1:sum(sapply(ctmodelobj[names(ctmodelobj) %in% matnames],length)),]=out
-
-  rowcount <- 0
+  matnames=c('T0MEANS','LAMBDA','DRIFT','DIFFUSION','MANIFESTVAR','MANIFESTMEANS', 'CINT', 'TDPREDEFFECT', 'T0VAR','PARS','THRESHOLDS','ASYMPTOTES','RESPONSE')){
+  # Each matrix's cells by row, gathered and written a column at a time:
+  # written a row at a time, a 20-latent model's took a quarter of a second.
+  #
+  # Every cell of every matrix is listed, NA ones included: an NA is a value
+  # there (an asymptote a latent without an equilibrium does not have). A
+  # matrix was once skipped when its first cell was NA, after rows had been
+  # set aside for it, so a summary gained rows with no matrix, row or col --
+  # and, its columns filled by one call each, a column whose matrix was not
+  # skipped put every later value on the wrong cell.
+  cells <- list()
   for(obji in matnames){
-    if(!is.null(dim(ctmodelobj[[obji]])) && !is.null(ctmodelobj[[obji]]) && !is.na(ctmodelobj[[obji]][1])){
-      for(rowi in 1:nrow(ctmodelobj[[obji]])){
-        for(coli in 1:ncol(ctmodelobj[[obji]])){
-          rowcount <- rowcount + 1
-          out[rowcount,]<-list(obji,rowi,coli,
-            ifelse(is.na(suppressWarnings(as.numeric(ctmodelobj[[obji]][rowi,coli]))), #ifelse element is character string
-              ctmodelobj[[obji]][rowi,coli],
-              NA),
-            ifelse(!is.na(suppressWarnings(as.numeric(ctmodelobj[[obji]][rowi,coli]))), #ifelse element is numeric
-              as.numeric(ctmodelobj[[obji]][rowi,coli]),
-              NA)
-          )
+    x <- ctmodelobj[[obji]]
+    if(is.null(dim(x)) || !length(x)) next
+    nr <- nrow(x)
+    nc <- ncol(x)
+    x <- as.vector(t(x))
+    value <- suppressWarnings(as.numeric(x))
+    cells[[length(cells) + 1]] <- list(matrix = rep(obji, length(x)),
+      row = rep(seq_len(nr), each = nc),
+      col = rep(seq_len(nc), times = nr),
+      # The cell's text where it is not a number; a numeric NA names nothing.
+      param = if(is.character(x)) ifelse(is.na(value), x, NA_character_) else
+        rep(NA_character_, length(x)),
+      value = value)
+  }
+  gather <- function(column, empty) if(length(cells))
+    unlist(lapply(cells, `[[`, column), use.names = FALSE) else empty
+  data.frame(matrix = gather('matrix', character()),
+    row = gather('row', integer()), col = gather('col', integer()),
+    param = gather('param', character()), value = gather('value', numeric()),
+    stringsAsFactors = FALSE)
+}
+
+.ctModelDefaultFreePar <- function(matrix, row, col, continuoustime){
+  transform <- 0
+  multiplier <- 1
+  meanscale <- 1
+  offset <- 0
+  inneroffset <- 0
+
+  if(matrix %in% c('T0MEANS','MANIFESTMEANS','TDPREDEFFECT','CINT')) {
+    meanscale <- 10
+  }
+  if(matrix %in% c('LAMBDA')) {
+    offset <- 0.5
+    meanscale <- 5
+  }
+  # Column 1 is the first threshold, free on the real line like any intercept.
+  # Later columns are gaps to the previous threshold and must be positive, so
+  # they take the same positive transform the variances use. At a raw value of
+  # zero a gap is log(2)*2 = 1.39, which is a sane spacing on a logit scale.
+  if(matrix %in% c('THRESHOLDS')) {
+    # Column 1 is fixed at zero by `.ctThresholdMatrix()`, so this applies to
+    # nothing a model estimates; it is kept so the column has a coherent
+    # default if anything ever frees it.
+    if(col == 1) meanscale <- 10
+    if(col > 1) {
+      transform <- 1
+      meanscale <- 2
+      multiplier <- 2
+    }
+  }
+  # A binary indicator's response probability floor (column 1) and ceiling
+  # (column 2), each a probability in its own right. The inner offsets set
+  # where a raw zero lands, which is what the prior and the optimizer's start
+  # both see: a guessing probability of 0.18 rather than a coin flip, and a
+  # ceiling of 0.95 rather than halfway down. Neither bounds anything -- the
+  # whole of (0, 1) stays reachable for both.
+  if(matrix %in% c('ASYMPTOTES')) {
+    transform <- 3
+    inneroffset <- if(col == 1) -1.5 else 3
+  }
+  # A censored indicator's response scale. A free half-width is positive, by
+  # the positive transform the variances use; a free power is on the real line
+  # with a raw zero at 1, the linear scale, so the prior is centred there.
+  if(matrix %in% c('RESPONSE')) {
+    if(col == 1) {
+      transform <- 1
+      meanscale <- 2
+    }
+    if(col == 2) offset <- 1
+  }
+
+  if(matrix %in% c('DIFFUSION','MANIFESTVAR', 'T0VAR')) {
+    if(row != col){
+      # Free on the real line, with no squash here. Each covariance transform
+      # reads this cell differently -- 'rawcorr' as a coordinate it bounds
+      # itself inside constraincorsqrt1, 'z' as an unbounded Fisher z,
+      # 'cholesky' as a factor entry -- so one model structure now works under
+      # all three. The (-1, 1) map that used to live here (transform 3,
+      # multiplier 2, offset -1) moved into constraincorsqrt1 unchanged, so the
+      # composite raw -> correlation is the same and 'rawcorr' fits are
+      # bit-identical.
+      transform <- 0
+      multiplier <- 1
+      offset <- 0
+      meanscale <- 1
+    }
+    if(row == col){
+      transform <- 1
+      meanscale <- 2
+      multiplier <- 5
+      offset <- 1e-10
+      if(matrix %in% c('DIFFUSION')) multiplier <- 10
+    }
+  }
+  if(matrix %in% c('DRIFT')) {
+    if(row == col){
+      if(continuoustime==TRUE) {
+        transform <- 1
+        meanscale <- -2
+        multiplier <- -2
+        offset <- -1e-6
+      }
+      if(continuoustime==FALSE) {
+        transform <- 3
+        meanscale <- 2
+        offset <- 0
+      }
+    }
+    if(row != col){
+      transform <- 0
+      meanscale <- 1
+    }
+  }
+
+  # The numeric fields come back alongside the text form, because the loop in
+  # `ctStanModel()` needs them and used to restate every default itself. Two
+  # copies of the same table is how a change to the covariance off-diagonal
+  # default got made in one of them, verified in isolation, and had no effect on
+  # a built model -- the other copy was the one that ran.
+  list(
+    transform = Simplify(tform(parin = 'param',
+      transform = as.integer(transform),
+      multiplier = multiplier,
+      meanscale = meanscale,
+      offset = offset,
+      inneroffset = inneroffset,
+      singletext = TRUE)),
+    indvarying = matrix %in% c('T0MEANS','MANIFESTMEANS','CINT'),
+    sdscale = 1,
+    numeric = list(transform = transform, multiplier = multiplier,
+      meanscale = meanscale, offset = offset, inneroffset = inneroffset)
+  )
+}
+
+# Which cells' text is an expression or a latent state rather than a name:
+# anything with an operator, a bracket or a state in it. Such a cell takes no
+# transform, except that a state alone keeps 'param', which stands for the
+# state. Like the references `.ctSpecHoldsParameter()` names, it holds no
+# parameter, so it takes no random or predictor effect either; the matrix
+# setup reads none on it (`.ctModelMatSetup()`). Given the intercepts' default
+# random effect, an expression intercept made `intoverpop = 'auto'` take the
+# Laplace route on a model with nothing to integrate, and the fit stopped.
+.ctCellIsExpression <- function(param, latentNames)
+  !is.na(param) & (grepl('\\W', gsub('.', '', param, fixed = TRUE)) |
+    param %in% latentNames)
+
+.ctModelMatrixValue <- function(value){
+  if(length(value) != 1) stop('Matrix elements must have length 1')
+  if(is.factor(value)) value <- as.character(value)
+  if(is.na(value)) return(list(param=NA_character_, value=NA_real_))
+
+  numericvalue <- suppressWarnings(as.numeric(value))
+  if(!is.na(numericvalue)) {
+    return(list(param=NA_character_, value=numericvalue))
+  }
+  list(param=as.character(value), value=NA_real_)
+}
+
+.ctModelMatricesPlaceholder <- function(){
+  'pars-backed matrix view -- use model$matrices or ctModelMatrices(model)'
+}
+
+.ctModelUpdateParsFromMatrices <- function(ctm, matrices){
+  if(!'ctStanModel' %in% class(ctm)) stop('x must be a ctStanModel object')
+  if(!is.list(matrices) || is.null(names(matrices))) {
+    stop('matrices must be a named list of matrices')
+  }
+
+  # RAWPOPVAR is not a system matrix and has no rows in `pars`; it is stored on
+  # the model and taken out here before the loop below, which requires every
+  # matrix it sees to be present in `pars`.
+  for(field in grep('^RAWPOPVAR(_.+)?$', names(matrices), value=TRUE)){
+    ctm <- .ctModelRawPopVarAssign(ctm, matrices[[field]], field)
+    matrices[[field]] <- NULL
+  }
+  # A covariance given as ctCov(): its cells for this model's construction,
+  # with the covariance remembered (R/ctCov.R).
+  for(field in intersect(names(matrices), .ctCovSystemMatrices)){
+    if(inherits(matrices[[field]], 'ctCov')){
+      accepted <- .ctCovAccept(ctm, field, matrices[[field]])
+      ctm <- accepted$model
+      matrices[[field]] <- matrix(as.numeric(accepted$cells),
+        nrow(accepted$cells), ncol(accepted$cells))
+    }
+  }
+
+  pars <- ctm[['pars']]
+  tieffects <- colnames(pars)[grep('_effect', colnames(pars), fixed=TRUE)]
+  # Whether a cell holds a parameter of its own, as ctModel() reads it, on
+  # the table as assigned so far.
+  holds <- function(row) .ctSpecHoldsParameter(pars[row, , drop = FALSE],
+    ctm[['latentNames']], ctm[['TDpredNames']], .ctSpecParsLabels(pars))
+
+  if(!length(matrices)) return(ctm)
+
+  for(matrixname in names(matrices)){
+    mat <- matrices[[matrixname]]
+    if(!is.matrix(mat)) stop(matrixname, ' must be a matrix')
+
+    matrixrows <- pars$matrix %in% matrixname
+    if(!any(matrixrows)) stop(matrixname, ' is not present in x$pars')
+
+    expecteddim <- c(max(pars$row[matrixrows]), max(pars$col[matrixrows]))
+    if(!identical(dim(mat), expecteddim)) {
+      stop(matrixname, ' must have dimensions ', paste(expecteddim, collapse=' x '))
+    }
+
+    for(rowi in seq_len(nrow(mat))){
+      for(coli in seq_len(ncol(mat))){
+        parrow <- which(matrixrows & pars$row == rowi & pars$col == coli)
+        if(length(parrow) != 1) {
+          stop('Could not match one pars row for ', matrixname, '[', rowi, ',', coli, ']')
+        }
+
+        # A cell that held no parameter -- a value, an expression, a
+        # reference -- has no flags of a parameter's to keep, so a parameter
+        # written there takes the defaults.
+        fresh <- !holds(parrow)
+        parsed <- .ctModelMatrixValue(mat[rowi,coli])
+        # A cell assigned here can carry the same fields a cell given to
+        # ctModel() can, written either way (R/ctPar.R). Without this the
+        # separators or `key=value` text would be stored as the parameter name.
+        spec <- .ctCellSpecFields(parsed$param)
+        parsed$param <- spec$param
+        # A stated population mean (ctPar(mean=)) belongs to the parameter,
+        # and the model holds it beside `pars`.
+        if(!is.na(spec$mean)) {
+          means <- ctm[['fixedpopmeans']]
+          if(is.null(means)) means <- numeric(0)
+          means[[spec$param]] <- spec$mean
+          ctm[['fixedpopmeans']] <- means
+        }
+        pars$param[parrow] <- parsed$param
+        pars$value[parrow] <- parsed$value
+
+        if(!is.na(parsed$value)){
+          pars$transform[parrow] <- NA
+          pars$indvarying[parrow] <- FALSE
+          pars$sdscale[parrow] <- NA_real_
+          if(length(tieffects) > 0) pars[parrow,tieffects] <- 'FALSE'
+        } else if(!is.na(parsed$param)){
+          defaults <- .ctModelDefaultFreePar(
+            matrix=matrixname,
+            row=rowi,
+            col=coli,
+            continuoustime=ctm[['continuoustime']])
+          # An expression or a state, read as ctModel() reads one: none of a
+          # free cell's defaults.
+          if(.ctCellIsExpression(parsed$param, ctm[['latentNames']])){
+            if(!all(is.na(spec$indvarying) | spec$indvarying %in% FALSE) ||
+                length(spec$tipreds)) stop(matrixname, '[', rowi, ',', coli,
+              '] = "', parsed$param, '" is an expression or a latent state, ',
+              'which cannot vary between units or carry tipred effects of its ',
+              'own. Set those on the PARS cells of the parameters it reads.',
+              call.=FALSE)
+            pars$transform[parrow] <- if(simpleStateCheck(parsed$param)) 'param' else NA
+            pars$indvarying[parrow] <- FALSE
+            if(is.na(pars$sdscale[parrow])) pars$sdscale[parrow] <- defaults$sdscale
+            if(length(tieffects) > 0) pars[parrow,tieffects] <- 'FALSE'
+            next
+          }
+          if(fresh || is.na(pars$transform[parrow])) pars$transform[parrow] <- defaults$transform
+          if(fresh || is.na(pars$sdscale[parrow])) pars$sdscale[parrow] <- defaults$sdscale
+          if(fresh || is.na(pars$indvarying[parrow])) pars$indvarying[parrow] <- defaults$indvarying
+
+          # Anything the cell states explicitly beats the default for that cell.
+          if(!is.na(spec$transform)) pars$transform[parrow] <- spec$transform
+          if(!all(is.na(spec$indvarying))){
+            idlevels <- c(ctm[['subjectIDname']], ctm[['groupIDnames']])
+            if(!length(idlevels)) idlevels <- 'id'
+            pars$indvarying[parrow] <- .ctIndvaryingValue(.ctIndvaryingLevels(
+              spec$indvarying, idlevels,
+              where = paste0(matrixname, '[', rowi, ',', coli, ']')))
+          }
+          if(!is.na(spec$sdscale)) pars$sdscale[parrow] <- spec$sdscale
+          if(!is.null(spec$tipreds)){
+            # character(0) means no predictor acts on this cell, so `wanted` has
+            # to stay empty; paste0() would recycle it into "_effect".
+            wanted <- if(length(spec$tipreds)) paste0(spec$tipreds, '_effect') else character(0)
+            unknown <- setdiff(wanted, tieffects)
+            if(length(unknown)) {
+              stop(paste(sub('_effect$', '', unknown), collapse=', '),
+                ' is not a time independent predictor of this model')
+            }
+            pars[parrow,tieffects] <- 'FALSE'
+            pars[parrow,wanted] <- 'TRUE'
+          }
+          # A reference to a PARS cell or a predictor holds no parameter
+          # either, as ctModel() reads one.
+          if(!holds(parrow)){
+            pars$indvarying[parrow] <- FALSE
+            if(length(tieffects) > 0) pars[parrow,tieffects] <- 'FALSE'
+          }
         }
       }
     }
   }
-  return(out)
+
+  pars$indvarying <- .ctIndvaryingColumn(pars$indvarying)
+  ctm[['pars']] <- pars
+  if(is.null(ctm[['matrices']])) ctm[['matrices']] <- .ctModelMatricesPlaceholder()
+  ctm
 }
 
-#' Convert a frequentist (omx) ctsem model specification to Bayesian (Stan).
+#' Matrix view for ctStanModel objects
 #'
-#' @param ctmodelobj ctsem model object of type 'omx' (default)
-#' @param type either 'stanct' for continuous time, or 'standt' for discrete time.
+#' Access or replace the matrix representation of a \code{ctStanModel} while
+#' keeping the \code{pars} data frame as the canonical model specification.
+#'
+#' @param x A \code{ctStanModel} object.
+#' @param value A named list of matrices, typically copied from
+#' \code{ctModelMatrices(x)} or \code{x$matrices}.
+#'
+#' @details
+#' \code{ctModelMatrices(x)} reconstructs matrices from \code{x$pars}. The
+#' replacement form updates matching \code{matrix}, \code{row}, and \code{col}
+#' entries in \code{x$pars}. Numeric matrix entries become fixed values;
+#' non-numeric entries become parameter labels. Metadata such as transforms and
+#' individual variation settings is preserved when possible and reset to
+#' fit-ready defaults when fixed/free status changes.
+#'
+#' The same view is available as \code{x$matrices}. Direct replacements such as
+#' \code{x$matrices$DRIFT[1, 2] <- "cross"} update \code{x$pars}; detached copies
+#' must be assigned back with \code{x$matrices <- mats}. A placeholder
+#' \code{matrices} element is stored in the object so the view is visible in
+#' \code{names(x)} and printed objects, but the matrix values are always derived
+#' from \code{x$pars}.
+#'
+#' The view also holds the population spread of the individually varying
+#' parameters: \code{RAWPOPVAR} for the subject level and
+#' \code{RAWPOPVAR_<idname>} for each grouping level, one row and column per
+#' parameter varying at that level, also reachable as \code{x$RAWPOPVAR}.
+#' The diagonal holds standard deviations and the lower triangle correlation
+#' coordinates, both for the raw, untransformed parameters, the scale a fit
+#' reports them on. A number fixes a cell, on every route, and a label leaves
+#' it free. \code{\link{ctCov}} writes a whole matrix from a covariance, which
+#' is also how to state \code{T0VAR}, \code{DIFFUSION} or \code{MANIFESTVAR}
+#' as the covariance it is meant to be.
+#'
+#' @return \code{ctModelMatrices()} returns a named list of matrices. The
+#' replacement form returns the updated \code{ctStanModel}.
+#' @export
+ctModelMatrices <- function(x){
+  if(!'ctStanModel' %in% class(x)) stop('x must be a ctStanModel object')
+  out <- listOfMatrices(x[['pars']])
+  # Rebuilt on read rather than trusted: `indvarying` is routinely set directly
+  # after the model is built, and a RAWPOPVAR describing a different set of random
+  # effects than the model currently has would be worse than none.
+  synced <- .ctModelRawPopVarSync(x)
+  for(field in .ctModelRawPopVarLevels(x)$field){
+    if(!is.null(synced[[field]])) out[[field]] <- synced[[field]]
+  }
+  out
+}
+
+#' @rdname ctModelMatrices
+#' @export
+`ctModelMatrices<-` <- function(x, value){
+  .ctModelUpdateParsFromMatrices(x, value)
+}
+
+#' @export
+`$.ctStanModel` <- function(x, name){
+  nameindex <- pmatch(name, names(x), duplicates.ok=FALSE)
+  if(!is.na(nameindex) && identical(names(x)[nameindex], 'matrices')) return(ctModelMatrices(x))
+  # A level's RAWPOPVAR follows its varying parameters, which are routinely set
+  # after the model is built, so `m$RAWPOPVAR_study['mm', 'mm'] <- 0.3` finds
+  # the matrix whether or not anything has synced it yet.
+  if(grepl('^RAWPOPVAR(_.+)?$', name)) return(.ctModelRawPopVarSync(x)[[name]])
+  x[[name, exact=FALSE]]
+}
+
+#' @export
+`$<-.ctStanModel` <- function(x, name, value){
+  if(identical(name, 'matrices')) return(.ctModelUpdateParsFromMatrices(x, value))
+  if(grepl('^RAWPOPVAR(_.+)?$', name) && !is.null(value)){
+    x <- .ctModelRawPopVarAssign(x, value, name)
+  } else x[[name]] <- value
+  x
+}
+
+#' Convert an old OpenMx-style ctsem model to the modern ctsem model format.
+#'
+#' Convert an old OpenMx-style ctsem model to the modern ctsem model format.
+#' \code{ctStanModel} is maintained as a backward-compatible alias.
+#'
+#' @param ctmodelobj ctsem model object created by \code{\link{ctModel}} with
+#' \code{type='omx'}.
+#' @param type Either \code{'ct'} for continuous time, or \code{'dt'} for
+#' discrete time.
 #' @param tipredDefault Logical. TRUE sets any parameters with unspecified time independent 
 #' predictor effects to have effects estimated, FALSE fixes the effect to zero unless individually specified.
 #'
-#' @return List object of class ctStanModel, with random effects specified for any intercept type parameters
-#' (T0MEANS, MANIFESTMEANS, and or CINT), and time independent predictor effects for all parameters. Adjust these
-#' after initial specification by directly editing the \code{pars} subobject, so \code{model$pars} . 
+#' @return List object of class ctStanModel in the modern ctsem model format,
+#' with a \code{pars} data frame used by \code{\link{ctFit}}. Random effects are
+#' specified for any intercept type parameters (T0MEANS, MANIFESTMEANS, and or
+#' CINT), and time independent predictor effects are specified for all
+#' parameters. Adjust these after initial specification by directly editing the
+#' \code{pars} subobject, so \code{model$pars}, or by editing the pars-backed
+#' matrix view, so \code{model$matrices}.
+#' @details
+#' \code{ctStanModel} is maintained as a backward-compatible alias.
+#'
+#' Call this when you have a matrix-list model built with
+#' \code{ctModel(type='omx')} and want to fit it: \code{ctFit()} takes a
+#' built model, and an \code{omx} object is not one until it comes through
+#' here. That conversion is the reason the function is exported.
+#'
+#' New models need it only implicitly. \code{ctModel(type='ct')} and
+#' \code{ctModel(type='dt')} call it for you and return a model that is
+#' already built, so there is nothing left to convert.
+#' @importFrom rstantools rstan_config
+#' @aliases ctStanModel
 #' @export
 #'
 #' @examples
@@ -51,12 +441,20 @@ ctModelUnlist<-function(ctmodelobj,
 #'   0, 0,
 #'   0, "diffusion"), ncol=2, nrow=2, byrow=TRUE))
 #' 
-#' stanmodel=ctStanModel(model)
+#' modernmodel=ctModelConvertOMX(model)
 #' 
 #' 
-ctStanModel<-function(ctmodelobj, type='stanct',tipredDefault=TRUE){
-  if(type=='stanct') continuoustime<-TRUE
-  if(type=='standt') continuoustime<-FALSE
+ctModelConvertOMX<-function(ctmodelobj, type='ct',tipredDefault=TRUE){
+  if(FALSE) rstanconfig() #placeholder to use rstantools
+  if(type=='stanct' | type=='standt'){
+    warning('type should now be specified as simply ct or dt, without the stan prefix')
+    type <- gsub('stan','',type)
+  }
+  
+  if(type=='ct') continuoustime<-TRUE
+  if(type=='dt') continuoustime<-FALSE
+  
+  if(!type %in% c('ct','dt')) stop('type must be either ct or dt!')
   
   ctm <- ctmodelobj
   
@@ -76,9 +474,19 @@ ctStanModel<-function(ctmodelobj, type='stanct',tipredDefault=TRUE){
   latentNames<-ctm$latentNames
   TDpredNames<-ctm$TDpredNames
   TIpredNames<-ctm$TIpredNames
+  # Smooth terms' columns are predictors like any other, but a cell names the
+  # covariate, and their default targets differ (R/ctTIpredSmooth.R).
+  TIsmooths <- ctm$TIsmooths
   
   ctspec<-ctModelUnlist(ctm)
-  
+
+  # A cell may state its fields with `|` separators ('mm||TRUE|0.5') or by name
+  # ('mm, indvarying=TRUE, sdscale=0.5'). Normalise the named form to the `|`
+  # form here so the parser below has exactly one thing to read; see
+  # .ctCellSpecToPipe in R/ctPar.R for how the two are told apart.
+  ctspec$param <- vapply(ctspec$param, .ctCellSpecToPipe, character(1),
+    USE.NAMES = FALSE)
+
   freeparams<-is.na(ctspec[,'value'])
   
   ctspec$transform<- NA
@@ -90,50 +498,23 @@ ctStanModel<-function(ctmodelobj, type='stanct',tipredDefault=TRUE){
   
   
   ######### STAN parameter transforms
+  # One source of truth: `.ctModelDefaultFreePar` states these defaults, and
+  # this loop asks it rather than restating them. They were two copies of the
+  # same table, and only this one ran for a labelled cell -- so a default
+  # changed in the other took no effect on a built model, which cost real time
+  # to find.
   for(pi in 1:length(ctspec$matrix)){
     if(freeparams[pi]){
-      if(ctspec$matrix[pi] %in% c('T0MEANS','MANIFESTMEANS','TDPREDEFFECT','CINT')) {
-        ctspec$meanscale[pi] <-10
-      }
-      if(ctspec$matrix[pi] %in% c('LAMBDA')) {
-        ctspec$offset[pi] <- 0.5
-        ctspec$meanscale[pi] <- 5
-      }
-      
-      if(ctspec$matrix[pi] %in% c('DIFFUSION','MANIFESTVAR', 'T0VAR')) {
-        if(ctspec$row[pi] != ctspec$col[pi]){
-          ctspec$transform[pi] <- 3
-          ctspec$multiplier[pi] <- 2
-          ctspec$offset[pi] <- -1
-          # if(ctspec$matrix[pi] %in% c('DIFFUSION')) ctspec$meanscale[pi] <-2
-        }
-        if(ctspec$row[pi] == ctspec$col[pi]){
-          ctspec$transform[pi] <- 1
-          ctspec$meanscale[pi] <- 2
-          ctspec$multiplier[pi] <- 5
-          ctspec$offset[pi] <- 1e-10
-          if(ctspec$matrix[pi] %in% c('DIFFUSION')) ctspec$multiplier[pi] <-10
-        }
-      }
-      if(ctspec$matrix[pi] %in% c('DRIFT')) {
-        if(ctspec$row[pi] == ctspec$col[pi]){
-          if(continuoustime==TRUE) {
-            ctspec$transform[pi] <- 1
-            ctspec$meanscale[pi] <- -2
-            ctspec$multiplier[pi] <- -2
-            ctspec$offset[pi] <- -1e-6
-          }
-          if(continuoustime==FALSE) {
-            ctspec$transform[pi] <- 0
-            ctspec$meanscale[pi] <- 1
-            ctspec$offset[pi] <- .5
-          }
-        }
-        if(ctspec$row[pi] != ctspec$col[pi]){
-          ctspec$transform[pi] <- 0
-          ctspec$meanscale[pi] <- 1
-        }
-      }
+      defaults <- .ctModelDefaultFreePar(
+        matrix = ctspec$matrix[pi],
+        row = ctspec$row[pi],
+        col = ctspec$col[pi],
+        continuoustime = continuoustime)$numeric
+      ctspec$transform[pi] <- defaults$transform
+      ctspec$multiplier[pi] <- defaults$multiplier
+      ctspec$meanscale[pi] <- defaults$meanscale
+      ctspec$offset[pi] <- defaults$offset
+      ctspec$inneroffset[pi] <- defaults$inneroffset
     }
   }
   
@@ -160,12 +541,15 @@ ctStanModel<-function(ctmodelobj, type='stanct',tipredDefault=TRUE){
   
   nparams<-sum(freeparams)
 
+  # One `indvarying` column for every level of the id hierarchy: TRUE, FALSE or
+  # level names (R/ctPar.R). Free intercepts vary at every level by default.
   ctspec$indvarying<-FALSE
   ctspec$indvarying[!is.na(ctspec$transform) & ctspec$matrix %in% c('T0MEANS','MANIFESTMEANS','CINT')] <- TRUE
-  
+
+  # And one sdscale, applying at every level where the parameter varies.
   ctspec$sdscale<-NA
   ctspec$sdscale[is.na(ctspec$value)]<-1
-  
+
   
   
   
@@ -173,9 +557,12 @@ ctStanModel<-function(ctmodelobj, type='stanct',tipredDefault=TRUE){
     tipredspec<-matrix(TRUE,ncol=n.TIpred,nrow=1)
     colnames(tipredspec)<-paste0(TIpredNames,'_effect')
     ctspec<-cbind(ctspec,tipredspec,stringsAsFactors=FALSE)
-    ctspec[,paste0(TIpredNames,'_effect')]<-tipredDefault
+    # Character, not logical. An effect can now be free ('TRUE'), free and named
+    # ('myeffect', so two parameters can share one), fixed ('4.3') or absent
+    # ('FALSE'); see R/ctTipredEffect.R. A logical could say only the first and
+    # last of those, and a numeric could not tell 'free' from 'fixed at 1'.
     for(predi in TIpredNames){
-      class(ctspec[,paste0(predi,'_effect')])<-'logical'
+      ctspec[[paste0(predi,'_effect')]] <- as.character(tipredDefault)
     }
   }
   
@@ -184,81 +571,250 @@ ctStanModel<-function(ctmodelobj, type='stanct',tipredDefault=TRUE){
   getwords <- function(x) gsub('\\W+',',',x)
   
   
+  # Rows whose tipreds field was given, which a smooth's default leaves alone.
+  tiexplicit <- rep(FALSE, nrow(ctspec))
+  # Population means stated rather than estimated, by parameter name: those a
+  # model already holds, and those its cells write as 'name=value'.
+  fixedpopmeans <- ctm[['fixedpopmeans']]
+  if(is.null(fixedpopmeans)) fixedpopmeans <- numeric(0)
   for(pi in 1:nrow(ctspec)){ #check for complex / split specifications
     if(grepl('|',ctspec$param[pi],fixed=TRUE)){
+      # The trailing space keeps a trailing empty field, which strsplit()
+      # would otherwise drop: 'p||||' is then five fields, an empty tipreds
+      # field meaning "no effects", rather than four with tipreds left to
+      # tipredDefault. The spaces are removed again just below.
       ctspec$param[pi] <- gsub('$',' ',ctspec$param[pi])
       split = strsplit(ctspec$param[pi],split = '|',fixed=TRUE)[[1]]
       split=sapply(split,function(x) gsub(' ','',x))
       
       tisplit <- NA
       if(length(split) > 4){ #check for ti pred spec in splits
-        if(n.TIpred < 1 || length(split) > 5) stop(paste0('Param spec has too many separators!  ', ctspec$param[pi]))
+        # Two different mistakes used to share one message. Naming predictors
+        # in a model that has none is the common one, and 'too many
+        # separators' says nothing about it -- least of all to someone who
+        # wrote `tipreds=age` and never counted a separator.
+        if(n.TIpred < 1) stop(paste0(ctspec$matrix[pi],'[',ctspec$row[pi],',',
+          ctspec$col[pi],'] asks for time independent predictor effects (',
+          split[5],'), but the model has no time independent predictors. Set ',
+          'n.TIpred and TIpredNames in ctModel().'), call.=FALSE)
+        if(length(split) > 5) stop(paste0('Param spec has too many separators!  ', ctspec$param[pi]))
         tisplit <- split[5]
         split <- split[1:4]
       }
       
+      # A number in the first element fixes the cell, and nothing after it can
+      # apply.
+      #
+      # A fixed value cannot individually differ, cannot carry a covariate and
+      # cannot have a transform -- there is no parameter left for any of those
+      # to act on. So the value is heeded and the rest dropped, with a warning
+      # naming exactly what was dropped, because the alternative is what this
+      # branch used to do: `'2|param|TRUE|3'` became a *free* parameter named
+      # "2" with value NA and indvarying TRUE, and `'2||||TI1=4.3'` became a
+      # free parameter named "2" carrying a covariate of 4.3. Both silently.
+      #
+      # Only non-negative integers even got that far. `'-2|...'` and
+      # `'-0.5|...'` both hit the simpleStateCheck error below, because a minus
+      # sign and a decimal point are non-word characters -- so one
+      # specification errored or silently misbehaved depending on which number
+      # was written in it.
+      # 'lev=0': a stated population mean (ctPar(mean=)), which leaves the
+      # random effects about it to fit and no mean of its own.
+      namemean <- .ctCellSpecNameMean(split[1])
+      if(!is.na(namemean$mean)){
+        stated <- fixedpopmeans[namemean$name]
+        if(!is.na(stated) && stated != namemean$mean) stop('Two population ',
+          'means stated for ', namemean$name, ': ', stated, ' and ',
+          namemean$mean, '.', call.=FALSE)
+        fixedpopmeans[[namemean$name]] <- namemean$mean
+        split[1] <- namemean$name
+      }
+
+      fixedvalue <- suppressWarnings(as.numeric(split[1]))
+      if(!is.na(fixedvalue)){
+        ignored <- c(
+          if(length(split) > 1 && nzchar(split[2])) paste0('transform ',split[2]),
+          if(length(split) > 2 && nzchar(split[3])) paste0('indvarying ',split[3]),
+          if(length(split) > 3 && nzchar(split[4])) paste0('sdscale ',split[4]),
+          if(!is.na(tisplit) && nzchar(tisplit)) paste0('tipred effects ',tisplit))
+        ctspec$value[pi] <- fixedvalue
+        ctspec$param[pi] <- NA
+        # Cleared here rather than left to the earlier pass that blanks the
+        # transform of a valued cell: that pass runs before this loop, when the
+        # cell still looked like a free parameter whose name happened to
+        # contain separators.
+        ctspec$transform[pi] <- NA
+        for(cl in grep('^indvarying', names(ctspec), value=TRUE)) ctspec[[cl]][pi] <- FALSE
+        for(cl in grep('^sdscale', names(ctspec), value=TRUE)) ctspec[[cl]][pi] <- NA
+        for(cl in grep('_effect$', names(ctspec), value=TRUE)) ctspec[[cl]][pi] <- 'FALSE'
+        if(length(ignored)) warning(paste0(ctspec$matrix[pi],'[',ctspec$row[pi],',',
+          ctspec$col[pi],'] is fixed to ',format(fixedvalue),', so ',
+          paste0(ignored,collapse=', '),
+          if(length(ignored) > 1) ' were' else ' was',
+          ' ignored: a fixed value cannot be transformed, cannot vary between ',
+          'individuals and cannot carry a predictor effect. Give the cell a ',
+          'parameter name if any of those were meant.'), call.=FALSE)
+        next
+      }
+
       if(grepl('\\W',split[1]) || 
           any(sapply(latentNames,function(x){ #if symbols or latent states
         grepl(paste0('\\b(',x,')\\b'),split[1])
       }))) {
-        if(!simpleStateCheck(split[1])) stop(paste0(split[1],' invalid -- Matrix elements involving multiple parameters / latent states cannot have | separators -- transformations should be specified as part of the first element, indvarying and tipredeffects must be specified in the corresponding singular PARS matrix elements.'))
+        # Both spellings reach here, so the message cannot talk about `|`: a
+        # cell written 'eta1, indvarying=TRUE' has no separator in it, and
+        # being told about separators sends the reader looking for one.
+        if(!simpleStateCheck(split[1])) stop(paste0('The cell "',
+          trimws(ctspec$param[pi]),'" builds ',ctspec$matrix[pi],'[',ctspec$row[pi],',',
+          ctspec$col[pi],'] from more than one parameter or latent state, so it ',
+          'cannot also carry transform, indvarying, sdscale or tipreds fields. ',
+          'Put the transform inside the expression itself, and set indvarying ',
+          'and tipred effects on the single PARS cell that names the ',
+          'parameter.'), call.=FALSE)
+        # A state alone may take a transform, but it is no parameter: nothing
+        # downstream reads a random or predictor effect on it.
+        if((length(split) > 2 && !toupper(split[3]) %in% c('', 'FALSE', 'F')) ||
+            (!is.na(tisplit) && nzchar(tisplit))) stop(paste0('The cell "',
+          trimws(ctspec$param[pi]),'" sets ',ctspec$matrix[pi],'[',ctspec$row[pi],',',
+          ctspec$col[pi],'] from a latent state, which cannot vary between ',
+          'units or carry tipred effects of its own.'), call.=FALSE)
       }
-      
+
       nonzero <- which(!split %in% '')
       ctspec[pi,c('param','transform','indvarying','sdscale')] <- 
         list(NA,ctspec$transform[pi],ctspec$indvarying[pi],1) #base values
-      ctspec[pi,c('param','transform','indvarying','sdscale')[1:(length(split))]][nonzero] <- 
+      ctspec[pi,c('param','transform','indvarying','sdscale')[1:(length(split))]][nonzero] <-
         split[1:(length(split))][nonzero] #update with non zero length split elements
-      
+
+      # The indvarying field names levels -- TRUE every level, or a list of id
+      # names (R/ctPar.R) -- checked against the model's ids here and written
+      # back in its tidy form.
+      idlevels <- if(length(ctm$id)) ctm$id else 'id'
+      ivmessage <- NULL
+      if(length(split) >= 3 && nzchar(split[3])){
+        ivlevels <- .ctIndvaryingLevels(split[3], idlevels,
+          where = paste0(ctspec$matrix[pi],'[',ctspec$row[pi],',',ctspec$col[pi],']'))
+        ctspec$indvarying[pi] <- .ctIndvaryingValue(ivlevels)
+        if(length(idlevels) > 1) ivmessage <- paste0('varying at: ',
+          if(any(ivlevels)) paste(names(ivlevels)[ivlevels], collapse=', ') else 'no level','; ')
+      }
+
       whichtipreds <- c()
       timessage <- c()
       if(!is.na(tisplit)){
-        tisplit <- strsplit(getwords(tisplit),split = ',')[[1]]
-        ctspec[pi,paste0(TIpredNames,'_effect')] <- FALSE #first set all FALSE
-        if(!tisplit[1] %in% ''){
-          for(ti in TIpredNames){ #check which tipreds were included
-            for(spliti in tisplit){
-              if(!spliti %in% TIpredNames) stop (spliti,' is not a time independent predictor!')
-              if(grepl(paste0('\\b(',ti,')\\b'),spliti)) whichtipreds <- c(whichtipreds,ti)
-            }
+        # `TI1, TI2=4.3, TI3=myeffect` -- a bare name is a free effect as it
+        # always was, `=` gives it a value or a name of its own.
+        #
+        # Deliberately not `getwords()`, which every other field here uses:
+        # it replaces each non-word character with a comma, so `TI1=4.3` came
+        # out as `TI1,4,3` and there was no way to write a value at all.
+        tisplit <- trimws(strsplit(tisplit, ',', fixed=TRUE)[[1]])
+        ctspec[pi,paste0(TIpredNames,'_effect')] <- 'FALSE' #first set all off
+        tiexplicit[pi] <- TRUE
+        for(entry in tisplit){
+          if(!nzchar(entry)) next
+          parts <- trimws(strsplit(entry, '=', fixed=TRUE)[[1]])
+          ti <- parts[1]
+          spec <- if(length(parts) > 1 && nzchar(parts[2])) parts[2] else 'TRUE'
+          # A smooth is named by its covariate, and is estimated whole.
+          if(ti %in% names(TIsmooths)){
+            if(!identical(spec, 'TRUE')) stop('s(', ti, ') in ', ctspec$matrix[pi],
+              '[', ctspec$row[pi], ',', ctspec$col[pi], '] cannot be fixed or ',
+              'named: a smooth is estimated whole.', call.=FALSE)
+            ctspec[pi,paste0(TIsmooths[[ti]]$columns,'_effect')] <- 'TRUE'
+            whichtipreds <- c(whichtipreds, paste0('s(', ti, ')'))
+            next
           }
+          if(!is.na(.ctTIsmoothOfColumn(TIsmooths, ti))) stop(ti, ' is a column ',
+            'of s(', .ctTIsmoothOfColumn(TIsmooths, ti), '); name the covariate ',
+            'to give a cell the smooth.', call.=FALSE)
+          if(!ti %in% TIpredNames) stop(ti,' is not a time independent predictor!')
+          ctspec[pi,paste0(ti,'_effect')] <- spec
+          whichtipreds <- c(whichtipreds,
+            if(identical(spec,'TRUE')) ti else paste0(ti,'=',spec))
         }
-        
-        if(!is.null(whichtipreds))  ctspec[pi,paste0(whichtipreds,'_effect')] <- TRUE #set those effects TRUE
         if(is.null(whichtipreds)) whichtipreds <- 'NULL'
         timessage <- paste0(ctspec$param[pi],' tipred effects from: ', paste0(whichtipreds,collapse=', '))
-        
+
       }
       
       
+      shown <- c('param','transform', if(is.null(ivmessage)) 'indvarying', 'sdscale')
       message('Custom par ',ctspec$param[pi],' set as: ',paste0(
-        colnames(ctspec[pi,c('param','transform','indvarying','sdscale')]),' = ',
-        ctspec[pi,c('param','transform','indvarying','sdscale')],'; '),timessage)
+        colnames(ctspec[pi,shown]),' = ', ctspec[pi,shown],'; '), ivmessage, timessage)
     }
   }
   
-  if(n.TIpred > 0 && sum(unlist(ctspec[,paste0(TIpredNames,'_effect')]))==0) warning('TI predictors included but no effects specified!')
-  
-  for(ri in 1:nrow(ctspec)){ #set NA's on complex params
-    
-    if(grepl('\\W',gsub('.','',ctspec$param[ri],fixed=TRUE)) || ctspec$param[ri] %in% latentNames){
-      ctspec$value[ri] <- NA
-      if(!simpleStateCheck(ctspec$param[ri])) ctspec$transform[ri] <-NA #allow transforms for simplestates
-      if(simpleStateCheck(ctspec$param[ri])) ctspec$transform[ri] <-'param' #allow transforms for simplestates
-    }
+  ctspec <- .ctTIsmoothDefaultEffects(ctspec, TIsmooths, tiexplicit, tipredDefault)
+
+  # An expression takes no transform, and a state alone the transform 'param'.
+  for(ri in which(.ctCellIsExpression(ctspec$param, latentNames))){
+    ctspec$value[ri] <- NA
+    ctspec$transform[ri] <- if(simpleStateCheck(ctspec$param[ri])) 'param' else NA
   }
+  # A free cell that holds no parameter of its own -- an expression, a state,
+  # a reference to a PARS cell or a predictor -- takes no default random or
+  # predictor effect (`.ctSpecDropNoParameterFlags()`).
+  ctspec <- .ctSpecDropNoParameterFlags(ctspec, latentNames, TDpredNames)
+
+  if(n.TIpred > 0 && !any(.ctTipredEffectActive(ctspec[,paste0(TIpredNames,'_effect')]))) warning('TI predictors included but no effects specified!')
   
 
-  ctspec$indvarying <- as.logical(ctspec$indvarying)
-  
+  # What each cell is -- a number, a name, a name with fields, or an expression
+  # -- is decided by what its text looks like, so a cell that means one and
+  # reads as another builds a different model quietly. See
+  # R/ctModelSpecCheck.R.
+  .ctCheckModelSpec(ctspec, latentNames, manifestNames, TDpredNames,
+    TIpredNames)
+
+  # Refuse a circular dependency here rather than later: the generated Stan
+  # program breaks the T0MEANS / state / PARS loop by evaluation order, so a
+  # cell caught in a real loop is read before anything writes it and returns a
+  # plausible number instead of an error. See R/ctModelCycleCheck.R.
+  .ctCheckModelCycles(ctspec, latentNames, n.latent)
+
+  # Logical for a single level; level names where a cell gave them.
+  ctspec$indvarying <- .ctIndvaryingColumn(ctspec$indvarying)
+  # A cell's fields arrive as text, which left the whole column character as
+  # soon as one cell used them.
+  ctspec$sdscale <- as.numeric(ctspec$sdscale)
+
   out<-list(pars=ctspec,n.latent=n.latent,n.manifest=n.manifest,n.TIpred=n.TIpred,n.TDpred=n.TDpred,
     latentNames=latentNames,manifestNames=manifestNames,
     TIpredNames=TIpredNames,TDpredNames=TDpredNames,
-    subjectIDname=ctm$id,
+    # `id` may name a hierarchy rather than a single column: innermost
+    # (subject) first, then any grouping levels above it -- e.g.
+    # id = c('subject','study'). `subjectIDname` stays the scalar every
+    # existing code path expects, and the rest is carried alongside so nothing
+    # downstream has to learn about vectors it does not use.
+    subjectIDname=ctm$id[1],
+    groupIDnames=if(length(ctm$id) > 1) ctm$id[-1] else character(),
     timeName=ctm$time,
-    continuoustime=continuoustime)
+    continuoustime=continuoustime,
+    manifesttype=ctmodelobj$manifesttype,
+    # Zero for every non-ordinal variable, so `any(manifesttype %in% 2)` is the
+    # only thing that ever has to be tested before reading it.
+    ncategories=if(is.null(ctmodelobj$ncategories))
+      rep(0L, n.manifest) else as.integer(ctmodelobj$ncategories),
+    # Infinite for every non-censored variable, so a limit cannot apply where
+    # it was not asked for.
+    censormin=if(is.null(ctmodelobj$censormin))
+      rep(-Inf, n.manifest) else as.numeric(ctmodelobj$censormin),
+    censormax=if(is.null(ctmodelobj$censormax))
+      rep(Inf, n.manifest) else as.numeric(ctmodelobj$censormax))
   class(out)<-'ctStanModel'
-  
+
+  # The resolved effects are in $pars, but whatever edits a model afterwards
+  # -- ctsemGUI adding a parameter to a loaded one -- needs the default the
+  # cells without a tipreds field were given, and had to guess it.
+  out$tipredDefault <- isTRUE(tipredDefault)
+  # Smooth terms, with their basis once data has built it (R/ctTIpredSmooth.R).
+  if(length(TIsmooths)) out$TIsmooths <- TIsmooths
+  # Population means stated rather than estimated (ctPar(mean=)), natural
+  # scale, by parameter name; checked and used when the model is fitted
+  # (`.ctFixedPopMeans()`).
+  if(length(fixedpopmeans)) out$fixedpopmeans <- fixedpopmeans
+
   out$tipredeffectscale <- 1
   out$tipredsimputedscale <- 1
   
@@ -268,9 +824,193 @@ ctStanModel<-function(ctmodelobj, type='stanct',tipredDefault=TRUE){
   out$rawpopsdtransform <- 'log1p_exp(2*rawpopsdbase-1) .* sdscale' #'log(1+exp(2*rawpopsdbase)) .* sdscale' #'exp(rawpopsdbase * 2 -2) .* sdscale' # 'rawpopsdbase .* sdscale' #
   # out$stationarymeanprior <- NA
   # out$stationaryvarprior <- NA
-  out$manifesttype <- rep(0,n.manifest)
-  out$covmattransform <- 'rawcorr'
+  # 'z' by default. Measured against known optima at k = 2, 3, 4 and 6, over
+  # random, near-singular, uniformly-high-correlation and alternating-sign
+  # targets: 'z' reached every one from every start, and 'rawcorr' could not
+  # represent three of the twelve at all -- best of ten starts still 0.04 to
+  # 0.21 short of the attainable optimum, with the fit converging and nothing
+  # raised. That is `constraincorsqrt1` not being onto the correlation space,
+  # and it applies to T0VAR, DIFFUSION, MANIFESTVAR and the population
+  # covariance alike. Set covmattransform='rawcorr' for the previous
+  # parameterisation, which is what a comparison against stan or against a
+  # stored fit needs.
+  out$covmattransform <- 'z'
+  # The population covariance, one row and column per varying parameter. Held
+  # beside `pars` rather than in it, deliberately: everything that enumerates
+  # free parameters walks `pars`, and the population covariance is not one of
+  # those -- both backends build it from their own parameterisation. See
+  # R/ctModelRawPopVar.R.
+  out <- .ctModelRawPopVarSync(out)
+  out[['matrices']] <- .ctModelMatricesPlaceholder()
+  # out$NOrdinalIntegrationPoints <- 9L
   
   return(out)
 }
 
+#' @export
+ctStanModel <- ctModelConvertOMX
+
+
+# --- which parameters vary, at which level -----------------------------------
+
+# A model as the user holds it has one `indvarying` column: TRUE (every level
+# of the id hierarchy), FALSE, or level names (R/ctPar.R), however it was set.
+# Inside ctsem each level is a logical column instead -- `indvarying` for the
+# subject level and `indvarying_<idname>`, with `sdscale_<idname>`, for each
+# grouping level above it -- and this is the one place the first becomes the
+# second. ctFit(), .ctJuliaPrepare(), T0VARredundancies(), the RAWPOPVAR sync
+# and the .ctVarying*() helpers below all start with it, so no reader meets a
+# level name where it expects a logical: as.logical('couple') is NA, which
+# reads as "does not vary" without an error.
+#
+# A model that already has every grouping level's column, and a logical
+# `indvarying`, has been resolved and keeps its columns, which is what makes
+# calling this anywhere safe. Level names written into a resolved model's
+# `indvarying` resolve again, replacing the columns rather than losing to them.
+#
+# A flag on a cell that holds no parameter -- an expression, a state, a
+# reference to a PARS cell -- is dropped here too, at every level
+# (`.ctSpecDropNoParameterFlags()`), so a model whose flags were set by hand
+# after ctModel() reads as the one the filter fits. Every time, resolved or not:
+# `m$pars$indvarying[m$pars$matrix %in% 'MANIFESTMEANS'] <- TRUE` is how
+# such a flag is usually set, and a resolved model can be edited the same way.
+.ctResolveLevels <- function(model){
+  pars <- model[['pars']]
+  if(is.null(pars) || is.null(pars$indvarying)) return(model)
+  groups <- as.character(model[['groupIDnames']])
+  subject <- model[['subjectIDname']]
+  levels <- c(if(is.null(subject)) 'id' else as.character(subject), groups)
+  iv <- pars$indvarying
+  if(length(groups) && is.logical(iv) &&
+      all(paste0('indvarying_', groups) %in% names(pars))){
+    # resolved already
+  } else if(is.logical(iv) && !length(groups)){
+    pars$indvarying <- iv %in% TRUE
+  } else {
+    resolved <- matrix(FALSE, nrow(pars), length(levels),
+      dimnames = list(NULL, levels))
+    for(i in which(!is.na(iv))){
+      resolved[i, ] <- .ctIndvaryingLevels(iv[i], levels, where = paste0(
+        pars$matrix[i], '[', pars$row[i], ',', pars$col[i], ']'))
+    }
+    pars$indvarying <- resolved[, 1L]
+    for(g in groups){
+      pars[[paste0('indvarying_', g)]] <- resolved[, g]
+      pars[[paste0('sdscale_', g)]] <- pars$sdscale
+    }
+  }
+  model[['pars']] <- .ctSpecDropNoParameterFlags(pars, model[['latentNames']],
+    model[['TDpredNames']], .ctVaryingColumns(model))
+  model
+}
+
+# The per-level columns, subject first.
+#
+# Everything that asks "does this model have random effects" has to ask about
+# every level, not just the subject's. A study effect with no subject effect is
+# an ordinary multilevel model -- one intercept per study, subjects treated as
+# exchangeable within a study -- and testing `indvarying` alone refused it as
+# having nothing to integrate over.
+.ctVaryingColumns <- function(model){
+  c('indvarying',
+    if(length(model$groupIDnames)) paste0('indvarying_', model$groupIDnames))
+}
+
+# Which rows are free and varying at the given levels. A cell with a value is
+# fixed and never varies, whatever its flag says. `%in% TRUE` rather than
+# `isTRUE` per element because these columns carry NA on rows added after the
+# model was built.
+.ctVaryingRows <- function(model, columns = .ctVaryingColumns(model)){
+  model <- .ctResolveLevels(model)
+  columns <- columns[columns %in% names(model$pars)]
+  free <- is.na(model$pars$value)
+  out <- rep(FALSE, nrow(model$pars))
+  for(cl in columns) out <- out | (model$pars[[cl]] %in% TRUE & free)
+  out
+}
+
+# Does anything vary at any of the given levels?
+.ctAnyVarying <- function(model, columns = .ctVaryingColumns(model))
+  any(.ctVaryingRows(model, columns))
+
+# The same, named. For messages that have to say which parameters a route
+# cannot carry; an unnamed row cannot be reported and is dropped here only.
+.ctVaryingParams <- function(model, columns = .ctVaryingColumns(model)){
+  model <- .ctResolveLevels(model)
+  rows <- .ctVaryingRows(model, columns)
+  unique(model$pars$param[rows & !is.na(model$pars$param)])
+}
+
+# The grouping levels above the subject, alone. Used where a route handles the
+# subject level and nothing else, so it can say which parameters it would have
+# had to drop rather than dropping them.
+.ctOuterVaryingColumns <- function(model){
+  cols <- .ctVaryingColumns(model)
+  cols[-1L]
+}
+
+
+# --- which route intoverpop = 'auto' takes -----------------------------------
+
+# `intoverpop = 'auto'`, and TRUE, are resolved here and nowhere else, so that
+# the rule and the reason it gives are one thing. It returns the route --
+# 'augmented', 'laplace', or 'none' for "nothing is integrated" -- and the
+# reason in a phrase.
+#
+# On the julia backend, when optimising, that is 'laplace' (Charles,
+# 2026-10-24). An effect that shifts a mean affinely in a linear Gaussian
+# model -- a manifest mean, an initial mean, a continuous intercept -- is
+# integrated there inside each subject's filter (`CTSEMHybrid`), exactly as the
+# augmented route integrates it, and an objective with no coordinate left is
+# evaluated as the marginal route evaluates the augmented one
+# (`_laplace_filter_evaluate`), at no more cost
+# (review/FITTING-laplace-collapse-2026-10-24.md). Every other effect is a
+# Laplace coordinate, where the augmented route is measurably the wrong
+# estimator and no optimiser recovers what its objective has lost:
+#
+#   * an effect on DRIFT (a nonlinear cell, 200 subjects x 12 occasions)
+#     recovered 0.66 of the population sd where laplace recovered 1.00, with
+#     the linear effects in the same model unmoved (memory note
+#     augmented-shrinks-nonlinear-random-effects, review/POPCOV-separation);
+#   * with ordinal indicators the augmented objective separates a population
+#     sd of 0.7 from one of 1900 by 0.07 log units where laplace has 40, on a
+#     linear MANIFESTMEANS effect (augmented-objective-flat-in-popsd-
+#     categorical);
+#   * an effect on a variance cell is identified only through its
+#     correlations with the others (review/RANDOMEFFECTS-partial-
+#     identification-2026-09-07.md).
+#
+# An affine effect the filter does not take -- one parameter in several cells,
+# or a continuous intercept a stationary initial mean reads -- is a coordinate
+# too: exact, and dearer than its carrier state, which `intoverpop =
+# 'augmented'` gives it. Stan has one route and keeps it.
+.ctIntOverPopAuto <- function(model, backend = 'julia', optimize = TRUE,
+  intoverstates = TRUE){
+  choose <- function(route, reason) list(route = route, reason = reason)
+  # Sampling integrates nothing: the effects are sampled with the rest.
+  if(!isTRUE(optimize)) return(choose('none',
+    'optimize=FALSE samples the individual differences'))
+  if(!.ctAnyVarying(model)) return(choose('none', 'no parameter varies'))
+  # The augmented layout gives a carrier state to every `indvarying` cell and
+  # knows nothing about the columns a grouping level uses, so a model with
+  # effects above the subject has one route, whatever the backend -- stan then
+  # refuses it by name.
+  if(.ctAnyVarying(model, .ctOuterVaryingColumns(model))) return(choose(
+    'laplace', 'a grouping level above the subject varies'))
+  if(!identical(backend, 'julia')) return(choose('augmented',
+    "backend='stan' integrates individual differences by state augmentation only"))
+  # The state-explicit target replaces the likelihood the Laplace route wraps,
+  # so the two do not compose (`.ctJuliaJointObjective()` refuses it).
+  if(!isTRUE(intoverstates)) return(choose('augmented',
+    'intoverstates=FALSE composes with the augmented route only'))
+  # T0VAR cannot vary on any route: `.ctModelCleanctspec()` clears its flags
+  # ('Individual variation in T0VAR parameters not possible, removed'). A model
+  # flagged there alone is left with nothing for laplace to integrate, which
+  # laplace refuses, and with no carrier for the augmented route to add, which
+  # then fits it plainly.
+  if(!any(.ctVaryingRows(model, 'indvarying') &
+      !as.character(model$pars$matrix) %in% 'T0VAR')) return(choose('augmented',
+    'only T0VAR is flagged, and it cannot vary'))
+  choose('laplace', paste0('the julia route: the filter integrates effects ',
+    'that shift a mean, a Laplace approximation the rest'))
+}

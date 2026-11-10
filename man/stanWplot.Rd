@@ -15,6 +15,9 @@ stanWplot(object, iter = 2000, chains = 4, ...)
 
 \item{...}{All the other regular arguments to stan()}
 }
+\value{
+The stanfit object \code{rstan::sampling} returns.
+}
 \description{
 Runs stan, and plots sampling information while sampling.
 }
@@ -22,7 +25,6 @@ Runs stan, and plots sampling information while sampling.
 On windows, requires Rtools installed and able to be found by pkgbuild::rtools_path()
 }
 \examples{
-if(w32chk()){
 library(rstan)
 #### example 1 
 scode <- "
@@ -37,5 +39,4 @@ model {
 #Uncomment the following lines -- launches rscript not compatible with cran check.
 #sm <- stan_model(model_code = scode)
 #fit1 <- stanWplot(object = sm,iter = 100000,chains=2,cores=1)
-}
 }

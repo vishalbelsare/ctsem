@@ -1,0 +1,243 @@
+# The matrix-exponential covariance construction: correctness of the forward,
+# of its pullback, and of the default route being left alone.
+#
+# The pullback is checked against ForwardDiff rather than by inspection. A wrong
+# adjoint returns a plausible wrong gradient, which is the failure mode that has
+# been most expensive in this engine, and the first version of this one was
+# wrong by a factor of two in the standard-deviation term while looking right.
+
+using LinearAlgebra
+
+using ForwardDiff
+
+const _COVEXPM_BUF = (k, T) -> (s = Vector{T}(undef, k), ss = Vector{T}(undef, k),
+    r = Vector{T}(undef, k), row_sq = Vector{T}(undef, k),
+    out = Matrix{T}(undef, k, k), intermediate = Matrix{T}(undef, k, k))
+
+_covexpm_lower_n(k) = k * (k - 1) ÷ 2
+
+function _covexpm_unpack(v, k, ::Type{T}) where {T}
+    M = zeros(T, k, k)
+    for i in 1:k
+        M[i, i] = v[i]
+    end
+    idx = k
+    for i in 1:k, j in 1:(i - 1)
+        idx += 1
+        M[i, j] = v[idx]
+    end
+    M
+end
+
+function _covexpm_pack(M, k)
+    v = zeros(eltype(M), k + _covexpm_lower_n(k))
+    for i in 1:k
+        v[i] = M[i, i]
+    end
+    idx = k
+    for i in 1:k, j in 1:(i - 1)
+        idx += 1
+        v[idx] = M[i, j]
+    end
+    v
+end
+
+# Sigma under a named construction, as a function of the packed coordinates.
+#
+# The code is a required argument. Two callers need different ones -- the
+# pullback comparisons differentiate the expm route, "the default route is
+# untouched" differentiates the correlation square root -- and a default would
+# make whichever of them disagreed with it silently compare the wrong thing.
+function _covexpm_sigma(v, k, code)
+    T = eltype(v)
+    b = _COVEXPM_BUF(k, T)
+    ContinuousTimeSEM.sdcovsqrt2cov!(b, _covexpm_unpack(v, k, T), code, k)
+    copy(b.out)
+end
+
+function _covexpm_coords(k)
+    v = zeros(k + _covexpm_lower_n(k))
+    for i in 1:k
+        v[i] = 0.7 + 0.3 * i / k
+    end
+    for m in (k + 1):length(v)
+        v[m] = 0.55 * sinpi(0.6 * m / length(v))
+    end
+    v
+end
+
+# An asymmetric cotangent, so the symmetrisation convention is exercised rather
+# than hidden by a symmetric one.
+_covexpm_cotangent(k) = [0.03 * (1 + i) + 0.011 * j for i in 1:k, j in 1:k]
+
+@testset "expm covariance forward" begin
+        for k in (3, 6)
+            v = _covexpm_coords(k)
+            S = _covexpm_sigma(v, k, 2)
+            @test diag(S) ≈ v[1:k] .^ 2
+            @test S ≈ S'
+            @test minimum(eigvals(Symmetric(S))) > 0
+        end
+        # A lone coordinate is exactly Fisher's z of the correlation: the 2x2
+        # block [[0,a],[a,0]] exponentiates to [[cosh a, sinh a],[sinh a, cosh a]],
+        # which normalises to tanh(a).
+        for k in (3, 6, 12), a in (0.2, 0.8, 2.0)
+            v = zeros(k + _covexpm_lower_n(k))
+            fill!(view(v, 1:k), 1.0)
+            v[k + 1] = a
+            S = _covexpm_sigma(v, k, 2)
+            @test S[2, 1] / sqrt(S[1, 1] * S[2, 2]) ≈ tanh(a) atol = 1e-12
+        end
+    end
+
+    @testset "expm covariance pullback against ForwardDiff" begin
+        for k in (2, 3, 6, 12)
+            v = _covexpm_coords(k)
+            cb = _covexpm_cotangent(k)
+            analytic = ForwardDiff.gradient(x -> sum(cb .* _covexpm_sigma(x, k, 2)), v)
+            mb = zeros(k, k)
+            ContinuousTimeSEM._sdcovexpm2cov_pullback!(mb,
+                _covexpm_unpack(v, k, Float64), cb, k)
+            @test _covexpm_pack(mb, k) ≈ analytic rtol = 1e-9
+        end
+    end
+
+    @testset "a diagonal input takes the closed form, the general route at A = 0" begin
+        # Off-diagonals exactly zero -- the default MANIFESTVAR -- skip the
+        # exponential and its Frechet derivative (`_expm_cov_diagonal`).
+        # ForwardDiff seeds every coordinate, so its off-diagonal duals are not
+        # deep zero and go the general route: an independent reference for the
+        # closed-form pullback, off-diagonal cotangents included. A shortcut
+        # that tested values rather than partials would hand ForwardDiff a
+        # zero derivative for those coordinates and fail here.
+        for k in (2, 6, 30)
+            v = zeros(k + _covexpm_lower_n(k))
+            for i in 1:k
+                v[i] = 0.5 + i / k
+            end
+            @test _covexpm_sigma(v, k, 2) == Matrix(Diagonal(v[1:k] .^ 2))
+            cb = _covexpm_cotangent(k)
+            analytic = ForwardDiff.gradient(x -> sum(cb .* _covexpm_sigma(x, k, 2)), v)
+            mb = zeros(k, k)
+            ContinuousTimeSEM._sdcovexpm2cov_pullback!(mb,
+                _covexpm_unpack(v, k, Float64), cb, k)
+            @test _covexpm_pack(mb, k) ≈ analytic rtol = 1e-12
+            # Under duals whose off-diagonals are deep zero, as a sweep through
+            # a diagonal MANIFESTVAR sees it: the pullback's derivative in the
+            # sds, against central differences of the Float64 pullback (which
+            # is quadratic in them, so the differences are exact to roundoff).
+            pull = function (s)
+                T = eltype(s)
+                m = zeros(T, k, k)
+                for i in 1:k
+                    m[i, i] = s[i]
+                end
+                out = zeros(T, k, k)
+                ContinuousTimeSEM._sdcovexpm2cov_pullback!(out, m, T.(cb), k)
+                _covexpm_pack(out, k)
+            end
+            s0 = v[1:k]
+            J = ForwardDiff.jacobian(pull, s0)
+            h = 1e-4
+            fd = reduce(hcat, [(pull(s0 .+ h .* (1:k .== l)) .-
+                pull(s0 .- h .* (1:k .== l))) ./ (2h) for l in 1:k])
+            @test J ≈ fd rtol = 1e-8
+        end
+    end
+
+    @testset "the route is generic in the element type" begin
+        # Float64 and BigFloat must agree. The construction calls no LAPACK, so
+        # there is no fast path that only some element types take -- this pins
+        # that, and would fail if one were reintroduced for BLAS floats alone.
+        for k in (3, 6)
+            v = _covexpm_coords(k)
+            cb = _covexpm_cotangent(k)
+            fast = zeros(k, k)
+            ContinuousTimeSEM._sdcovexpm2cov_pullback!(fast,
+                _covexpm_unpack(v, k, Float64), cb, k)
+            slow = zeros(BigFloat, k, k)
+            ContinuousTimeSEM._sdcovexpm2cov_pullback!(slow,
+                _covexpm_unpack(BigFloat.(v), k, BigFloat), BigFloat.(cb), k)
+            @test Float64.(slow) ≈ fast rtol = 1e-8
+        end
+    end
+
+    @testset "the cache serves several matrices at one size" begin
+        # T0VAR, DIFFUSION and MANIFESTVAR of the same size share one scratch
+        # entry. With a single cache slot they evicted each other; this cycles
+        # three distinct matrices repeatedly and checks every answer.
+        k = 6
+        mats = [_covexpm_unpack(_covexpm_coords(k) .* f, k, Float64)
+                for f in (1.0, 0.6, 1.4)]
+        expected = map(m -> begin
+            b = _COVEXPM_BUF(k, Float64)
+            ContinuousTimeSEM.sdcovsqrt2cov!(b, m, 2, k)
+            copy(b.out)
+        end, mats)
+        for _ in 1:5, (m, want) in zip(mats, expected)
+            b = _COVEXPM_BUF(k, Float64)
+            ContinuousTimeSEM.sdcovsqrt2cov!(b, m, 2, k)
+            @test b.out ≈ want
+        end
+        # and a matrix that has fallen out of the table still comes back right
+        many = [_covexpm_unpack(_covexpm_coords(k) .* (0.5 + 0.1 * i), k, Float64)
+                for i in 1:10]
+        for m in many
+            b = _COVEXPM_BUF(k, Float64)
+            ContinuousTimeSEM.sdcovsqrt2cov!(b, m, 2, k)
+            b2 = _COVEXPM_BUF(k, Float64)
+            ContinuousTimeSEM.sdcovexpm2cov!(b2, m, k)
+            @test b.out ≈ b2.out
+        end
+    end
+
+    @testset "the default route is untouched" begin
+        for k in (3, 6)
+            v = _covexpm_coords(k)
+            M = _covexpm_unpack(v, k, Float64)
+            b = _COVEXPM_BUF(k, Float64)
+            ContinuousTimeSEM.sdcovsqrt2cov!(b, M, 0, k)
+            b2 = _COVEXPM_BUF(k, Float64)
+            ContinuousTimeSEM.constraincorsqrt1_vec!(b2, M, 1e-5, k)
+            D = Diagonal([M[i, i] for i in 1:k])
+            @test b.out ≈ (D * b2.out) * (D * b2.out)'
+            # and the existing pullback still agrees with ForwardDiff, so the
+            # branch added to it did not disturb the arithmetic
+            cb = _covexpm_cotangent(k)
+            analytic = ForwardDiff.gradient(x -> sum(cb .* _covexpm_sigma(x, k, 0)), v)
+            mb = zeros(k, k)
+            ContinuousTimeSEM._sdcovsqrt2cov_pullback!(mb, M, cb, k)
+            @test _covexpm_pack(mb, k) ≈ analytic rtol = 1e-9
+        end
+    end
+
+    @testset "choleskymats selects the construction" begin
+        # `choleskymats == 2` is covmattransform='z', the same code the stan
+        # path reads from its data block. This pins that the argument is
+        # honoured rather than accepted and ignored, which is the failure mode
+        # this engine has had before with covmattransform.
+        for k in (3, 6)
+            v = _covexpm_coords(k)
+            M = _covexpm_unpack(v, k, Float64)
+            b0 = _COVEXPM_BUF(k, Float64)
+            ContinuousTimeSEM.sdcovsqrt2cov!(b0, M, 0, k)
+            b2 = _COVEXPM_BUF(k, Float64)
+            ContinuousTimeSEM.sdcovsqrt2cov!(b2, M, 2, k)
+            @test !isapprox(b0.out, b2.out)
+            # 0 still reproduces constraincorsqrt1 exactly
+            bc = _COVEXPM_BUF(k, Float64)
+            ContinuousTimeSEM.constraincorsqrt1_vec!(bc, M, 1e-5, k)
+            D = Diagonal([M[i, i] for i in 1:k])
+            @test b0.out ≈ (D * bc.out) * (D * bc.out)'
+            # and 2 is the expm construction and not merely "not 0"
+            bf = _COVEXPM_BUF(k, Float64)
+            ContinuousTimeSEM.sdcovexpm2cov!(bf, M, k)
+            @test b2.out ≈ bf.out
+            # 1 is the factor form, which is neither of the other two
+            b1 = _COVEXPM_BUF(k, Float64)
+            ContinuousTimeSEM.sdcovsqrt2cov!(b1, M, 1, k)
+            @test b1.out ≈ M * M'
+            @test !isapprox(b1.out, b0.out)
+            @test !isapprox(b1.out, b2.out)
+        end
+    end

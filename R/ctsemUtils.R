@@ -1,132 +1,48 @@
-vgrep <- function(patterns,x){
-  unique(unlist(sapply(patterns,function(pattern) grep(pattern,x))))
-}
+# vgrep <- function(patterns,x){
+#   unique(unlist(sapply(patterns,function(pattern) grep(pattern,x))))
+# }
 
-mupd <- function(m, nr=NA,nc=NA, upd=NA, sr=NA,sc=NA){
-  if(is.na(nr)) nr <- max(nrow(upd)+sr-1,nrow(m))
-  if(is.na(nc)) nc <- max(ncol(upd)+sc-1,nrow(m))
-  mo <- rbind(
-    cbind(m, matrix(0,nrow(m),nc-ncol(m))),
-    matrix(0,nr-nrow(m),nc))
-  if(!is.na(upd)) mo[sr:(sr+nrow(upd)-1),sc:(ncol(upd)+sc-1)] <- upd
-  return(mo)
-}
+# mupd <- function(m, nr=NA,nc=NA, upd=NA, sr=NA,sc=NA){
+#   if(is.na(nr)) nr <- max(nrow(upd)+sr-1,nrow(m))
+#   if(is.na(nc)) nc <- max(ncol(upd)+sc-1,nrow(m))
+#   mo <- rbind(
+#     cbind(m, matrix(0,nrow(m),nc-ncol(m))),
+#     matrix(0,nr-nrow(m),nc))
+#   if(!is.na(upd)) mo[sr:(sr+nrow(upd)-1),sc:(ncol(upd)+sc-1)] <- upd
+#   return(mo)
+# }
 
-diagt <- function(d){
-  m <- diag(0,length(d))
-  m[diag(1,length(d))==1] <- d
-  return(m)
-}
+# diagt <- function(d){
+#   m <- diag(0,length(d))
+#   m[diag(1,length(d))==1] <- d
+#   return(m)
+# }
 
-findmatrixslots <- function(pars,l){
-  p<-list()
-  for(pi in pars){
-    for(mi in 1:length(l)){
-      if(any(l[[mi]] %in% pi)){
-        arrind <- arrayInd(which(l[[mi]] %in% pi),dim(l[[mi]]))
-        p[[pi]] <- paste0(names(l)[mi],'[',arrind[1,1],',',arrind[1,2],']')
-        next
-      }
-    }
-  }
-  return(p)
-}
-
-
-
-ctstantestfitfunc<-function(){
-  checkm<-ctModel(
-    type='stanct',
-    n.latent=2,n.TDpred=1,n.TIpred=1,n.manifest=2,
-    MANIFESTVAR=matrix(c('merror',0,0,'merror'),2,2),
-    MANIFESTMEANS=0,
-    DIFFUSION=c('diff11',0,'diff21','diff22||||TI1'),
-    CINT=matrix(c('cint1||||TI1','cint2||||TI1'),ncol=1),
-    LAMBDA=diag(2),tipredDefault=FALSE)  
-  
-  ctstantestfit<-ctStanFit(ctsem::ctstantestdat,checkm,cores=1,
-    inits = c(0.748310681869536,0.945659953796114,0.0964592332562144,
-      0.029153487981562,0.651471066485501,0.0314778013950629,
-      0.217818608752396,1.10441297459423,-0.801320300354595,
-      0.647010811111734,-0.7344068376597,-1.04150782976995,
-      0.0558819480347101,-0.108435212373754,-0.225029736388403,
-      -0.203457959897841,-0.736264486213394,-0.687369939087293,
-      0.576641002392084,0.248625561427667,-0.0683189297539777,
-      -0.230342395895042,0.205299380670756,-0.34522281922735,
-      0.0829819407118698,0.0137367678089216,-0.0611697475527028),
-    optimize = TRUE,optimcontrol=list(finishsamples=20),nopriors=FALSE)
-  
-  ctstantestfit <- ctStanGenerateFromFit(ctstantestfit,nsamples = 20,fullposterior = TRUE)
-  
-  return(ctstantestfit)
-}
+# findmatrixslots <- function(pars,l){
+#   p<-list()
+#   for(pi in pars){
+#     for(mi in 1:length(l)){
+#       if(any(l[[mi]] %in% pi)){
+#         arrind <- arrayInd(which(l[[mi]] %in% pi),dim(l[[mi]]))
+#         p[[pi]] <- paste0(names(l)[mi],'[',arrind[1,1],',',arrind[1,2],']')
+#         next
+#       }
+#     }
+#   }
+#   return(p)
+# }
 
 
 
-#' Check for non win32
-#' 
-#' If win32, returns FALSE, else TRUE
-#'
-#' @return Logical
-#' @export
-#'
-#' @examples
-#' w32chk()
-w32chk <- function(){
-  notw32 <- !(.Platform$OS.type=="windows" && .Platform$r_arch=="i386")
-  return(notw32)
-}
-
-
-removeOutliers <- function(dat,multiplier,by=2){
-  dat2 <- array(apply(dat,by,function(x){
-    s=sd(x,na.rm=TRUE)
-    m=mean(x,na.rm=TRUE)
-    message("Removed ", sum(abs(x-m) > (multiplier*s),na.rm=TRUE)," outliers...")
-    x[abs(x-m) > (multiplier*s)] <- NA
-    return(x)
-  }),dim=dim(dat))
-}
-
-
-testall<- function(cores=4,folder = '/tests/testthat',examples=TRUE){
-  requireNamespace('testthat')
-  Sys.setenv(NOT_CRAN='true')
-  pdf(NULL)
-  tests <- dir(paste0('.',folder))
-  tests <- tests[grepl('^test',tests)]
-  runex <- grep('runExamples',tests)
-  tests <- c(tests[runex],tests[-runex]) #do examples first
-  if(!examples) tests <- tests[-grep('runExamples',tests)]
-  a=Sys.time()
-
-  if(cores > 1){
-    cl <- parallel::makeCluster(cores,outfile='')
-    on.exit(try(parallel::stopCluster(cl),silent=TRUE),add=TRUE)
-    out <- parallel::parLapplyLB(cl,paste0(getwd(),folder,'/',tests),function(x){
-      Sys.setenv(NOT_CRAN='true')
-      pdf(NULL)
-    out<-testthat::test_file(x, reporter = "minimal")
-    dev.off()
-    return(out)
-  })
-  }
-  if(cores==1){
-    out <- lapply(paste0(getwd(),folder,'/',tests),function(x){
-      cat(x)
-      out<-testthat::test_file(x, reporter = "minimal")
-      print(out)
-      return(out)
-    })
-  }
-  out2 <- do.call(what = rbind,lapply(out,utils::getS3method('as.data.frame','testthat_results')))
-  dev.off()
-  print(out2[,colnames(out2)!='result'])
-  print(Sys.time()-a)
-  if(cores > 1) parallel::stopCluster(cl)
-  return(invisible(out2))
-}
-  
+# removeOutliers <- function(dat,multiplier,by=2){
+#   dat2 <- array(apply(dat,by,function(x){
+#     s=sd(x,na.rm=TRUE)
+#     m=mean(x,na.rm=TRUE)
+#     message("Removed ", sum(abs(x-m) > (multiplier*s),na.rm=TRUE)," outliers...")
+#     x[abs(x-m) > (multiplier*s)] <- NA
+#     return(x)
+#   }),dim=dim(dat))
+# }
 
 
 suppressOutput <- function(...,verbose=0){
@@ -158,6 +74,12 @@ if(1==99) Row <- Col <- NULL
   Subject <- data.table(Subject=factor(l$id),Obs=seq_along(l$time))
   l$id <- NULL
   l$time <- NULL
+  # Everything melted below has to be a numeric array. `ctKalmanArray` also
+  # returns `subjectMatrices`, a list of per-subject model matrices, and
+  # melting that folds a list into `value`, which then poisons the whole
+  # column through the `rbind(fill=TRUE)` at the end -- silently, so the
+  # failure surfaces later as a ggplot that will not print.
+  l <- l[!vapply(l, is.list, logical(1))]
   TimeSubject <- merge(Time,Subject)
   
   dout <- NULL
@@ -192,28 +114,28 @@ if(1==99) Row <- Col <- NULL
 return(dout)
 }
 
-gridplot <- function(m, maxdim=c(3,3),...){
-  d=n2mfrow(dim(m)[length(dim(m))])
-  d[d>maxdim] <-maxdim[d>maxdim]
-  oldpar<-par(no.readonly=TRUE)
-  par(mfrow=d,mar=c(1.1,1.1,1.1,0),mgp=c(.1,.1,0))
-  for(i in 1:dim(m)[length(dim(m))]){
-    n=colnames(m)[i]
-    if('matrix' %in% class(m)) plot(m[,i],main=ifelse(is.null(n),i,n),col='red',xlab='',ylab='',...)
-    if('array' %in% class(m)) matplot(m[,,i],main=ifelse(is.null(n),i,n),type='l',xlab='',ylab='',...)
-  }
-  suppressWarnings(do.call(par,oldpar))
-}
+# gridplot <- function(m, maxdim=c(3,3),...){
+#   d=n2mfrow(dim(m)[length(dim(m))])
+#   d[d>maxdim] <-maxdim[d>maxdim]
+#   oldpar<-par(no.readonly=TRUE)
+#   par(mfrow=d,mar=c(1.1,1.1,1.1,0),mgp=c(.1,.1,0))
+#   for(i in 1:dim(m)[length(dim(m))]){
+#     n=colnames(m)[i]
+#     if('matrix' %in% class(m)) plot(m[,i],main=ifelse(is.null(n),i,n),col='red',xlab='',ylab='',...)
+#     if('array' %in% class(m)) matplot(m[,,i],main=ifelse(is.null(n),i,n),type='l',xlab='',ylab='',...)
+#   }
+#   suppressWarnings(do.call(par,oldpar))
+# }
 
-perm <- function(v) {
-  n <- length(v)
-  if (n == 1) v
-  else {
-    X <- NULL
-    for (i in 1:n) X <- rbind(X, cbind(v[i], perm(v[-i])))
-    X
-  }
-}
+# perm <- function(v) {
+#   n <- length(v)
+#   if (n == 1) v
+#   else {
+#     X <- NULL
+#     for (i in 1:n) X <- rbind(X, cbind(v[i], perm(v[-i])))
+#     X
+#   }
+# }
 
 # helper function to generate an index matrix, or return unique elements of a matrix
 indexMatrix<-function(dimension,symmetrical=FALSE,upper=FALSE,lowerTriangular=FALSE, sep=NULL,starttext=NULL,endtext=NULL,
@@ -273,18 +195,6 @@ makeNumericIDs <- function(datalong,idName='id',timeName='time'){
 }
 
 
-crosscov <- function(a,b){
-  da <- a-matrix(colMeans(a),nrow=nrow(a),ncol=ncol(a),byrow=TRUE)
-  db <- b-matrix(colMeans(b),nrow=nrow(b),ncol=ncol(b),byrow=TRUE)
-  t(da) %*% db / (nrow(a)-1)
-  
-  # cc <- matrix(NA,nrow=nrow(a))
-  # for(i in 1:nrow(a)){
-  #   cc[i,] <- da[i,] * db[i,]
-  
-}
-
-
 
 #' ctCollapse
 #' Easily collapse an array margin using a specified function.
@@ -296,6 +206,8 @@ crosscov <- function(a,b){
 #' @examples
 #' testarray <- array(rnorm(900,2,1),dim=c(100,3,3))
 #' ctCollapse(testarray,1,mean)
+#' @return An array (or vector) with the \code{collapsemargin} dimensions
+#'   removed, holding \code{collapsefunc} applied over them.
 #' @export
 ctCollapse<-function(inarray,collapsemargin,collapsefunc,plyr=TRUE,...){
   indims<-dim(inarray)
@@ -323,9 +235,10 @@ rl<-function(x) { #robust logical - wrap checks likely to return NA's in this
 #'
 #' @examples
 #' inv_logit(-3)
+#' @return \code{1 / (1 + exp(-x))}, elementwise.
 #' @export
 inv_logit<-function(x) {
-  exp(x)/(1+exp(x))
+  1/(1+exp(-x))
 }
 
 #' log1p_exp
@@ -336,59 +249,38 @@ inv_logit<-function(x) {
 #'
 #' @examples
 #' log1p_exp(-3)
+#' @return \code{log(1 + exp(x))}, elementwise, finite where \code{exp(x)}
+#'   overflows.
 #' @export
-log1p_exp <- function(x) log1p(exp(x))
+log1p_exp <- function(x) pmax(x, 0) + log1p(exp(-abs(x)))
 
-#' ctDensity
-#'
-#' Wrapper for base R density function that removes outliers and computes 'reasonable' bandwidth and x and y limits.
-#' Used for ctsem density plots.
-#' 
-#' @param x numeric vector on which to compute density.
-#' @param bw either 'auto' or a numeric indicating bandwidth.
-#' @param plot logical to indicate whether or not to plot the output.
-#' @param ... Further args to density.
-#' 
-#' @examples
-#' y <- ctDensity(exp(rnorm(80)))
-#' plot(y$density,xlim=y$xlim,ylim=y$ylim)
-#' 
-#' #### Compare to base defaults:
-#' par(mfrow=c(1,2))
-#' y=exp(rnorm(10000))
-#' ctdens<-ctDensity(y)
-#' plot(ctdens$density, ylim=ctdens$ylim,xlim=ctdens$xlim)
-#' plot(density(y))
-#' @export
+# `inv` of the engine's cell vocabulary, so R evaluates and differentiates a
+# cell that uses it (`.ctWithStableDerivRules()` gives Deriv its rule): without
+# a function of that name Deriv stopped the model's preparation.
+inv <- function(x) 1 / x
 
-ctDensity<-function(x,bw='auto',plot=FALSE,...){
-  xlims=stats::quantile(x,probs=c(.05,.95),na.rm=TRUE)
-  sd=sd(xlims)
-  xlims[1] = xlims[1] - sd
-  xlims[2] = xlims[2] + sd
-  # x=x[x>xlims[1]*1.2 & x<xlims[2]*1.2]
-  # bw=(max(x)-min(x))^1.2 / length(x)^.4 *.4
-  if(bw=='auto') bw=min(sd/100,1e-4)
-  
-  # xlims=stats::quantile(x,probs=c(.01,.99))
-  # mid=mean(c(xlims[2],xlims[1]))
-  # xlims[1] = xlims[1] - (mid-xlims[1])/8
-  # xlims[2] = xlims[2] + (xlims[2]-mid)/8
-  
-  out1<-stats::density(x,bw=bw,n=5000,from=xlims[1]-sd,to=xlims[2]+sd)
-  ylims=c(0,max(out1$y)*1.1)
-  
-  if(plot) plot(out1$x, out1$y,type='l', xlim=xlims,ylim=ylims,ylab='Density',xlab='Par. Value',...)
-  
-  return(list(density=out1,xlim=xlims,ylim=ylims))
+# R's random stream kept for a step whose draws are its own -- from a fixed
+# `seed`, or thrown away -- and must leave the caller's where it was: the
+# stream is set to `seed` if one is given, and the function returned puts the
+# caller's back, or removes it where there was none.
+.ctStreamKeep <- function(seed = NULL) {
+  had <- exists(".Random.seed", envir = globalenv(), inherits = FALSE)
+  saved <- if (had) get(".Random.seed", envir = globalenv(), inherits = FALSE)
+  if (!is.null(seed)) set.seed(seed)
+  function() {
+    if (had) {
+      assign(".Random.seed", saved, envir = globalenv())
+    } else if (exists(".Random.seed", envir = globalenv(), inherits = FALSE)) {
+      rm(".Random.seed", envir = globalenv())
+    }
+  }
 }
-
 
 
 ctDensityList<-function(x,xlimsindex='all',ylimsindex='all',cut=FALSE,plot=FALSE,
   grouplabels=names(x),
   ylab='Density',
-  xlab='Par. Value',probs=c(.05,.95),main='',colvec=NA){
+  xlab='Par. Value',probs=c(.05,.95),main='',colvec=NA,smoothness=1){
   
   if(all(xlimsindex=='all')) xlimsindex <- 1:length(x)
 
@@ -404,20 +296,15 @@ ctDensityList<-function(x,xlimsindex='all',ylimsindex='all',cut=FALSE,plot=FALSE
   sd=sd(xlims)
   xlims[1] = xlims[1] - sd/2
   xlims[2] = xlims[2] + sd/2
-# browser()
   bw=sapply(x,function(d) {
     out<-try(bw.SJ(na.omit(c(d))),silent=TRUE)
     if('try-error' %in% class(out)) out <- bw.nrd0(na.omit(c(d)))
     return(out)
     })
-  # browser()
-  # logbwmean = mean(logbw)# + ifelse(length(logbw) > 1,sd(logbw),0))
-# browser()
+
   denslist<-lapply(1:length(x),function(xi) {
-    bw=exp(log(bw[xi]) + (mean(log(bw))-log(bw[xi]))*.3)
-    # print(bw)
+    bw=smoothness*exp(log(bw[xi]) + (mean(log(bw))-log(bw[xi]))*.3)
     d=stats::density(x[[xi]],bw=bw,n=5000,from=xlims[1],to=xlims[2],na.rm=TRUE)
-    # d$y=d$y/ sum(d$y)/range(d$x)[2]*length(d$y)
     return(d)
   })
 if(xlimsindex[1] %in% 'all') xlimsindex <- 1:length(denslist)
@@ -457,7 +344,6 @@ if(ylimsindex[1] %in% 'all') ylimsindex <- 1:length(denslist)
     # pd$Source <- factor(pd$Source)
     
     if(1==99) x <- y <- Source <- NULL
-    # plot(denslist[[1]]$x, denslist[[1]]$y,type='l', xlim=xlims,ylim=ylims,ylab=ylab,xlab=xlab,col=colvec[1],lty=ltyvec[1],...)
 
     plots<- ggplot(pd,aes(x=x,y=y,group=Source,colour=Source)) +
       geom_line() +
@@ -467,21 +353,6 @@ if(ylimsindex[1] %in% 'all') ylimsindex <- 1:length(denslist)
       theme(legend.title = element_blank())
     if(!all(is.na(colvec))) plots <- plots + scale_colour_manual(values=setNames(colvec, names(x)))
 
-  #     
-  #   if(length(denslist)>1){
-  #     for(ci in 2:length(denslist)){
-  #       points(denslist[[ci]]$x, denslist[[ci]]$y,type='l', col=colvec[ci],lty=ltyvec[ci],...)
-  #     }
-  #   }
-  #   if(all(legend!=FALSE)) {
-  #     if(is.null(legendargs$col)) legendargs$col = colvec
-  #     if(is.null(legendargs$text.col)) legendargs$text.col = colvec
-  #     if(is.null(legendargs$lty)) legendargs$lty = ltyvec
-  #     if(is.null(legendargs$x)) legendargs$x='topright'
-  #     if(is.null(legendargs$bty)) legendargs$bty='n'
-  #     legendargs$legend = legend
-  #     do.call(graphics::legend,legendargs)
-  #   }
     
   }
   
@@ -530,6 +401,10 @@ ctPoly <- function(x,y,ylow,yhigh,steps=20,...){
 #' @param manifestNames vector of character strings giving column names of manifest indicator variables
 #' @param TDpredNames vector of character strings giving column names of time dependent predictor variables
 #' @param TIpredNames vector of character strings giving column names of time independent predictor variables
+#' @return A character vector of column names for a wide format dataset: the
+#'   manifest variables and time dependent predictors at each time point,
+#'   the intervals \code{dT1}, \code{dT2}, ..., then the time independent
+#'   predictors.
 #' @export
 
 ctWideNames<-function(n.manifest,Tpoints,n.TDpred=0,n.TIpred=0,manifestNames='auto',TDpredNames='auto',TIpredNames='auto'){
@@ -573,35 +448,35 @@ cseq <- function(from, to, by){
   return(temp)
 }
 
-get_stan_params <- function(object) {
-  stopifnot(methods::is(object, "stanfit"))
-  params <- grep("context__.vals_r", fixed = TRUE, value = TRUE,
-    x = strsplit(rstan::get_cppcode(rstan::get_stanmodel(object)), "\n")[[1]])
-  params <- sapply(strsplit(params, "\""), FUN = function(x) x[[2]])
-  params <- intersect(params, object@model_pars)
-  return(params)
-}
+# get_stan_params <- function(object) {
+#   stopifnot(methods::is(object, "stanfit"))
+#   params <- grep("context__.vals_r", fixed = TRUE, value = TRUE,
+#     x = strsplit(rstan::get_cppcode(rstan::get_stanmodel(object)), "\n")[[1]])
+#   params <- sapply(strsplit(params, "\""), FUN = function(x) x[[2]])
+#   params <- intersect(params, object@model_pars)
+#   return(params)
+# }
 
 
-get_stan_massmat<-function(fit){
-  
-  spars<-get_stan_params(fit)
-  spars2<-c()
-  for(pari in spars){
-    spars2<-c(spars2,grep(paste0(pari,'['),names(fit@sim$samples[[1]]),fixed=TRUE))
-  }
-  
-  massmat<-list()
-  for(chaini in 1:fit@sim$chains){
-    temp<-c()
-    for(pari in spars2){
-      newval<-stats::cov(cbind(fit@sim$samples[[chaini]][[pari]][(fit@sim$warmup - fit@stan_args[[1]]$control$adapt_term_buffer):fit@sim$warmup]))
-      names(newval)<-names(fit@sim$samples[[chaini]])[pari]
-      temp<-c(temp,newval)
-    }
-    massmat[[chaini]]<-temp
-  }
-  return(massmat)
-}
+# get_stan_massmat<-function(fit){
+#   
+#   spars<-get_stan_params(fit)
+#   spars2<-c()
+#   for(pari in spars){
+#     spars2<-c(spars2,grep(paste0(pari,'['),names(fit@sim$samples[[1]]),fixed=TRUE))
+#   }
+#   
+#   massmat<-list()
+#   for(chaini in 1:fit@sim$chains){
+#     temp<-c()
+#     for(pari in spars2){
+#       newval<-stats::cov(cbind(fit@sim$samples[[chaini]][[pari]][(fit@sim$warmup - fit@stan_args[[1]]$control$adapt_term_buffer):fit@sim$warmup]))
+#       names(newval)<-names(fit@sim$samples[[chaini]])[pari]
+#       temp<-c(temp,newval)
+#     }
+#     massmat[[chaini]]<-temp
+#   }
+#   return(massmat)
+# }
 
 

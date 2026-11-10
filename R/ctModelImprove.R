@@ -1,0 +1,1856 @@
+# Improve a fitted model a step at a time.
+#
+# The search signal and the decision are kept apart. Score tests
+# (`ctScoreTest`) say which relaxation the data point to and roughly how much
+# it would add, at the cost of a few gradients; a refit with the relaxation
+# decides whether it is kept, by its likelihood. Posterior predictive adequacy
+# (`ctFitAdequacy`) is the stopping rule and the fallback: the score tests see
+# only directions near the current model, and a model that is adequate by
+# every check it was not tuned on is the aim. When the screen is clean and the
+# checks still fail, structural changes the score tests cannot reach -- a
+# slow process driving a latent, a higher-order process, a model the user
+# supplies -- are tried by refit.
+#
+# Greedy, one change a step, retested after each: a missing relaxation echoes
+# in the tests of related ones (a varying drift moves the diffusion's
+# heterogeneity test; a missing moderation moves a term in the other equation),
+# and those echoes go once the source is in the model.
+
+#' Improve a model step by step, from score tests and predictive checks
+#'
+#' Starting from a fitted model, repeatedly: screens it with
+#' \code{\link{ctScoreTest}}; refits it with the most strongly indicated
+#' relaxations, one at a time, warm started from the current estimates; keeps
+#' the best of them if the refit's likelihood confirms it; and stops when no
+#' relaxation is indicated and the model is adequate by
+#' \code{\link{ctFitAdequacy}}. When nothing is indicated but the model is not
+#' adequate, a slow process driving a latent
+#' (\code{\link{ctModelSlowComponent}}), a cycle such as a daily rhythm
+#' (\code{\link{ctModelPeriodicComponent}}), a process of its own for an item
+#' (\code{\link{ctModelUniqueProcess}}), raising the order of a latent process
+#' (\code{\link{ctModelHigherOrder}}) and any models given in
+#' \code{candidates} are tried the same way, each ranked by the adequacy
+#' check's evidence for it: a slow process for a latent whose updates stay
+#' correlated over time gaps (the \code{latent} family), a cycle at the period
+#' the \code{periodic} family points to, a process of its own for an item
+#' whose errors stay correlated with its own (the \code{residuals} family).
+#'
+#' The relaxations, in the language of the model:
+#' \describe{
+#'   \item{heterogeneity}{\code{indvarying = TRUE} for a parameter and the
+#'     \code{T0MEANS} parameters, whose covariances with it the test took in;
+#'     for a fixed \code{MANIFESTMEANS} cell, a parameter there varying about
+#'     the fixed value as its stated mean.}
+#'   \item{covariates}{a covariate added as a time independent predictor, with
+#'     effects on the parameters its tests single out.}
+#'   \item{statedependence}{a term \code{d * eta_k * eta_m} in a latent's
+#'     drift, written into \code{CINT} with \code{d} a \code{PARS} parameter:
+#'     a drift coefficient that varies with a state.}
+#'   \item{volatility}{a latent's innovation sd scaled by \code{exp(v *
+#'     eta_m)}: innovations whose size depends on a state.}
+#'   \item{fixed}{a cell fixed at zero freed: a drift cross effect, a
+#'     diffusion covariance, a cross loading.}
+#'   \item{level}{a parameter of the dynamics or error variances that depends
+#'     on a subject's level (a random intercept) let vary over subjects, its
+#'     random effect correlated with the intercepts (\code{\link{ctScoreTest}}'s
+#'     level terms).}
+#'   \item{slow}{a slow process driving a latent through its drift, its effect
+#'     started at one and its persistence at a tenth of the latent's; where
+#'     the model has a slow process for another latent, that process driving
+#'     this one too is tried first.}
+#'   \item{periodic}{a cycle of the period the adequacy check points to,
+#'     driving every latent with innovations of its own, each subject's
+#'     phase set from the clock at its first row and free to deviate; the
+#'     phase predictors are added to the data.}
+#'   \item{unique}{a process of its own, persistent, loading on one item;
+#'     and, where the \code{pairs} family finds two items' errors correlated
+#'     within an occasion, a process the two share
+#'     (\code{ctModelUniqueProcess(shared = TRUE)}): an error is meant to be
+#'     random, and co-movement within an occasion that the latents' innovation
+#'     covariances do not explain is read as a process faster than the
+#'     occasions. Like the other structural changes it is tried once the
+#'     score tests indicate nothing, ranked against them by the check's
+#'     evidence, so that it does not absorb misfit that belongs to a cycle or
+#'     to one item's own process.}
+#'   \item{errorcov}{not by default: a measurement error covariance the score
+#'     test flags is freed, for designs with a reason for correlated error,
+#'     such as a method the items share, and no shared process is proposed.}
+#'   \item{order}{a latent process made second order.}
+#' }
+#'
+#' On a reduced-rank level (\code{poprank}) a heterogeneity result for a
+#' parameter that already varies through the shared dimensions gives it a
+#' variance of its own (\code{popunique}); without reduced rank, a
+#' significant \code{dimension} test makes the parameters its direction
+#' loads on vary together. Relaxations the score tests cannot tell apart (the same
+#' \code{class}) are not refitted in the same round.
+#'
+#' Each random effect the search adds brings its correlations with the others,
+#' and with many effects for few subjects the data no longer determine them.
+#' When a kept change leaves the fit's curvature weak or negative along the
+#' population covariance (\code{fit$identifiability}), the covariance is
+#' refitted at one rank lower (\code{poprank}), starting from its leading
+#' dimensions, and the lower rank kept unless the likelihood ratio test needs
+#' the dropped dimension; it steps down until the fit is identified. Later
+#' random effects then load on the shared dimensions, and later heterogeneity
+#' results give own variances. Single-level models only.
+#'
+#' When the search stops, each change kept is tried out again, by refitting
+#' without it (\code{prune}), and dropped if the others make it redundant.
+#'
+#' A relaxation is kept when its refit improves on the current model by
+#' \code{criterion}: a likelihood ratio test at \code{alpha} divided by the
+#' number of refits tried at that step (\code{'LR'}), or a lower AIC or BIC
+#' (subjects as the sample size). The likelihood ratio test of a new random
+#' effect against the chi-square is conservative, as its variance starts on a
+#' boundary.
+#'
+#' @section Error rates: The screen and the refit read the same data, so a
+#'   refit confirms most of what the screen proposes, and the search's error
+#'   rate is close to \code{alpha} per decision. Measured on simulated data (one
+#'   latent, 80 subjects, 20 irregular rows, 40 searches each): with nothing
+#'   missing, \code{alpha = 0.05} kept something in 5 per cent of searches and
+#'   \code{alpha = 0.01} in none; an omitted covariate shifting a random
+#'   intercept by half its sd was added in 75 and 55 per cent; an unrelated
+#'   covariate never. \code{criterion = 'BIC'} kept something in 8 per cent,
+#'   so at that size it is not the stricter choice. A drift that varied over
+#'   subjects was never added as such at that size; a random diffusion or
+#'   measurement error variance stood in for it in 10 per cent, since what the
+#'   data showed was subjects differing in variance. A search makes a decision
+#'   per family it screens, so its error rate grows with the families: on two
+#'   processes with three items each (60 subjects, about 48 rows each), where
+#'   the screen also tests state dependence and volatility in each process,
+#'   \code{alpha = 0.05} kept something in 4 of 20 searches with nothing
+#'   missing (a volatility term twice, state dependence once, a random effect
+#'   once), and \code{alpha = 0.01} is the stricter choice. With an omitted
+#'   cross effect, a process of an item's own and a daily cycle in the same
+#'   data, the search kept the cross effect in 19 of 20 searches, the cycle in
+#'   16 and the item's process in all 20.
+#'
+#' The result is a model chosen by the data it is fitted to, and its
+#' standard errors and tests do not account for that choice (MacCallum,
+#' Roznowski & Necowitz, 1992). \code{holdout} sets aside a share of the
+#' subjects: the search runs on the rest, and each change it keeps is then
+#' tested on the held-out subjects alone, by refitting the final model without
+#' it there; \code{confirmation} says which held, and the final model, refitted
+#' to every subject, keeps only those. Every step, and every refit tried and
+#' rejected, is in \code{history}.
+#'
+#' With many observations a model can be rejected by the checks for
+#' departures that are small on these summaries. With \code{close}, the search
+#' also stops when every check that fails is a residual or within-row
+#' correlation family
+#' whose size is shown below \code{close} (\code{\link{ctFitAdequacy}}).
+#'
+#' Each refit is judged by \code{criterion}; with \code{'LR'}, the likelihood
+#' ratio against a chi-square on the parameters the change adds, at
+#' \code{alpha} divided by the refits the round tries. That reference is
+#' exact for none of the changes the search makes: a variance added at zero
+#' sits on its boundary, where the chi-square is conservative, and a process
+#' or cycle added brings parameters that mean nothing when its coupling is
+#' zero, where it can err either way. Screening, rounds and pruning add
+#' further choices the level does not count. The search is a way of
+#' developing a model, and its p-values describe the steps it took rather than
+#' testing the result. A refit that ends below the model it extends has not
+#' reached an optimum, and is recorded as such.
+#'
+#' @param fit A fit from \code{\link{ctFit}} with \code{backend = 'julia'}.
+#' @param covariates Optional subject-level covariates the model may add, as
+#'   for \code{\link{ctScoreTest}}.
+#' @param relax Which relaxations may be made.
+#' @param changes Optionally rows of \code{\link{ctModelProposals}}: the first
+#'   round refits with these, in the order given, instead of screening, and
+#'   keeps the first that improves the fit by \code{criterion}. With
+#'   \code{maxsteps = 1}, one step of a search made by hand; later rounds
+#'   screen as usual.
+#' @param candidates Optional list of alternative models (from
+#'   \code{\link{ctModel}}) to try when the screen is clean but the checks fail.
+#' @param alpha Level for the screen (Benjamini-Hochberg within each family),
+#'   for the likelihood ratio decision, and for adequacy.
+#' @param maxsteps Most refit rounds.
+#' @param ntry Proposals from the score tests refitted in a round, at most:
+#'   one at a time, the strongest first, keeping the first that improves the
+#'   fit. Proposals from the adequacy check are tried the same way until one
+#'   improves or none is left, since the check does not change until the model
+#'   does. Pruning and a held-out confirmation refit this many side by side.
+#' @param criterion \code{'LR'}, \code{'AIC'} or \code{'BIC'}.
+#' @param adequacy Use \code{\link{ctFitAdequacy}} to decide when to stop.
+#' @param prune After the search, try dropping each kept change in turn and
+#'   drop it if the likelihood does not need it given the others: a change
+#'   kept early can be made redundant by one kept later.
+#' @param close Optional root mean square residual correlation regarded as a
+#'   close enough fit to stop at; see Details.
+#' @param holdout Share of subjects, between 0 and 0.5, held out of the search
+#'   to confirm its changes on.
+#' @param periods Periods for the adequacy check's \code{periodic} family, as
+#'   for \code{\link{ctFitAdequacy}}; by default it scans.
+#' @param form How covariates are screened, as for \code{\link{ctScoreTest}};
+#'   \code{'threshold'} lets the search add a covariate as a step.
+#' @param nsamples Generated datasets for the adequacy checks.
+#' @param projection How the adequacy checks remove the estimation, as for
+#'   \code{\link{ctFitAdequacy}}.
+#' @param cores Cores for fitting and testing. With two or more, once a
+#'   refit has taken longer than five minutes, the refits of pruning and of a
+#'   held-out confirmation run side by side in worker processes, \code{ntry}
+#'   at a time, as sampling chains do, each with an equal share of
+#'   \code{cores}: they are independent, one fit uses its cores only partly,
+#'   and a worker takes about half a minute to start.
+#'   \code{options(ctsem.improve.processes = FALSE)} keeps them in this
+#'   session.
+#' @param checkpoint Optional file the search saves its state to after every
+#'   round and after pruning. Called again with the same file, the same fit and
+#'   the same settings, it resumes after the last round saved; a file from a
+#'   different search is refused. A long search on a cluster otherwise keeps
+#'   nothing until it ends. With \code{verbose}, the refit running is also
+#'   saved every ten minutes beside it (\code{<checkpoint>.refit.rds}): the
+#'   round, the change, the iteration and the raw parameters it had reached,
+#'   and, where a change's starts are refitted side by side, the start.
+#' @param verbose Report progress: each round's steps, each refit's time, and
+#'   while a refit runs, its iteration, objective and gradient every ten
+#'   minutes.
+#' @return An object of class \code{ctModelImprove}: \code{fit} (the final
+#'   fit), \code{history} (every refit tried: the round, the relaxation, its
+#'   screening p-value, the change in log likelihood and parameters, the
+#'   criterion's verdict, and whether it was kept; a pruning row, \code{family}
+#'   \code{'prune'}, says whether the change was dropped, and a \code{'rank'} row
+#'   whether the lower rank was kept), \code{screens} (the score
+#'   tests of each round), \code{adequacy} (the final checks),
+#'   \code{confirmation} (with \code{holdout}: each kept change's likelihood
+#'   ratio test on the held-out subjects), and \code{stopped} (why the search
+#'   ended: \code{'adequate'}, no adequacy family detected misfit;
+#'   \code{'close fit'}, those that did were shown within \code{close};
+#'   \code{'not adequate, no candidate improved'} or \code{'not adequate,
+#'   nothing left to try'}, the checks still detect misfit; \code{'nothing
+#'   indicated'}, with \code{adequacy = FALSE}, the screen was clean;
+#'   \code{'maxsteps'}). A refit that failed, or ended below the model it
+#'   extends, is in \code{history} with a note saying so. With \code{holdout},
+#'   the held-out subjects take no part in the search; each kept change is
+#'   tested once on them, at the end, at \code{alpha}. \code{fit} is the model with the confirmed
+#'   changes refitted to every subject, and \code{selected} the search's own
+#'   choice fitted to the subjects it searched on.
+#' @seealso \code{vignette('score-tests')}.
+#' @export
+ctModelImprove <- function(fit, covariates = NULL,
+  relax = c('heterogeneity', 'covariates', 'statedependence', 'volatility', 'fixed', 'level',
+    'slow', 'unique', 'periodic', 'order'), changes = NULL,
+  candidates = NULL, alpha = 0.05, maxsteps = 10L, ntry = 3L,
+  criterion = c('LR', 'AIC', 'BIC'), adequacy = TRUE, prune = TRUE,
+  close = NULL, holdout = 0, form = 'auto', periods = NULL, nsamples = 100L,
+  projection = 'auto', cores = getOption('mc.cores', 2L), checkpoint = NULL,
+  verbose = TRUE) {
+  if (!.ctFitIsJulia(fit)) stop("ctModelImprove() needs a fit from ",
+    "ctFit(backend = 'julia').", call. = FALSE)
+  if (is.null(.ctFitBaseModel(fit))) stop("This fit does not carry the model it ",
+    "was built from; refit it with this version of ctsem.", call. = FALSE)
+  .ctBackendResolveThreads(cores)
+  relax <- match.arg(relax, several.ok = TRUE)
+  criterion <- match.arg(criterion)
+  if (!is.null(changes) && (!inherits(changes, 'ctModelProposals') || !nrow(changes)))
+    stop("changes takes rows of ctModelProposals().", call. = FALSE)
+  if (!is.null(changes) && is.null(covariates) && any(changes$family %in% 'covariates'))
+    stop("A covariate's change needs the covariates it was proposed from: pass ",
+      "covariates.", call. = FALSE)
+  say <- function(...) if (isTRUE(verbose)) message(...)
+  covariates <- .ctImproveCovariates(fit, covariates)
+  idname <- .ctFitModelObject(fit)$subjectIDname
+  data <- as.data.frame(.ctFitLongData(fit))
+  selected <- NULL
+  if (!is.numeric(holdout) || holdout < 0 || holdout > 0.5) stop("holdout is a ",
+    "share of subjects between 0 and 0.5.", call. = FALSE)
+  held <- NULL
+  if (holdout > 0) {
+    # A fixed stream, so a search is reproducible, leaving the caller's alone.
+    restore <- .ctStreamKeep(20261011L)
+    on.exit(restore(), add = TRUE)
+    ids <- unique(data[[idname]])
+    held <- sample(ids, max(2L, round(holdout * length(ids))))
+    alldata <- data
+    data <- data[!data[[idname]] %in% held, , drop = FALSE]
+    say("Holding out ", length(held), " of ", length(ids), " subjects; refitting on the rest")
+    fit <- .ctImproveRefit(fit, .ctFitBaseModel(fit), data, cores)
+  }
+  current <- fit
+  startdata <- data
+  kept <- list()
+  extraargs <- list()
+  history <- list(); screens <- list(); rejected <- character()
+  ad <- NULL
+  stopped <- 'maxsteps'
+  slowest <- 0
+  # A checkpoint holds everything the rounds carry from one to the next, and
+  # what the search is, so that a file from another search is not resumed.
+  identity <- list(start = .ctImproveFingerprint(fit), relax = relax, alpha = alpha,
+    criterion = criterion, ntry = ntry, adequacy = adequacy, close = close,
+    holdout = holdout, candidates = length(candidates))
+  if (!is.null(changes)) identity$changes <- vapply(changes$proposal, `[[`, '', 'key')
+  carried <- c('current', 'data', 'kept', 'extraargs', 'history', 'screens', 'rejected',
+    'ad', 'stopped', 'slowest')
+  stage <- list(round = 0L, searched = FALSE, pruned = FALSE)
+  here <- environment()
+  checkpointed <- function() if (!is.null(checkpoint)) .ctImproveCheckpointSave(checkpoint,
+    list(identity = identity, stage = stage,
+      state = mget(carried, envir = here, inherits = FALSE)))
+  if (!is.null(checkpoint) && file.exists(checkpoint)) {
+    saved <- readRDS(checkpoint)
+    if (!identical(saved$identity, identity)) stop("The checkpoint ", checkpoint,
+      " is from a different search: another starting fit or other settings. ",
+      "Remove it, or name another file.", call. = FALSE)
+    for (nm in carried) assign(nm, saved$state[[nm]])
+    stage <- saved$stage
+    say("Resuming after ", if (stage$pruned) "pruning" else if (stage$searched)
+      "the search" else paste0("round ", stage$round), ", from ", checkpoint)
+  }
+  rounds <- if (stage$searched || stage$round >= maxsteps) integer() else
+    seq.int(stage$round + 1L, maxsteps)
+  for (step in rounds) {
+    model <- .ctFitBaseModel(current)
+    available <- .ctImproveAvailable(covariates, model)
+    byhand <- step == 1L && !is.null(changes)
+    if (byhand) {
+      say("Round 1: the ", nrow(changes), " change(s) given")
+      proposals <- as.list(changes$proposal)
+    } else {
+      say("Round ", step, ": screening")
+      st <- .ctImproveScreen(current, available, relax, form, cores)
+      screens[[step]] <- st
+      proposals <- .ctImproveProposals(st, model, alpha, current, relax)
+    }
+    proposals <- proposals[!vapply(proposals, `[[`, '', 'key') %in% rejected]
+    structural <- FALSE
+    if (!length(proposals) && !byhand) {
+      if (isTRUE(adequacy)) {
+        say("Round ", step, ": nothing indicated; checking adequacy")
+        ad <- ctFitAdequacy(current, covariates = available, periods = periods,
+          nsamples = nsamples, alpha = alpha, close = if (is.null(close)) 0.05 else close,
+          projection = projection, cores = cores)
+        if (ad$adequate) { stopped <- 'adequate'; break }
+        if (!is.null(close) && isTRUE(ad$close_fit)) { stopped <- 'close fit'; break }
+      } else { stopped <- 'nothing indicated'; break }
+      proposals <- .ctImproveStructural(model, relax, candidates, ad, current, alpha)
+      proposals <- proposals[!vapply(proposals, `[[`, '', 'key') %in% rejected]
+      structural <- TRUE
+      if (!length(proposals)) { stopped <- 'not adequate, nothing left to try'; break }
+      if (any(vapply(proposals, function(p) identical(p$family, 'periodic'), logical(1))))
+        say("Round ", step, ": scoring the cycle")
+      proposals <- .ctImproveScoreStructural(current, proposals, data, covariates, cores)
+    }
+    # Ranked by each test's own asymptotic p-value: the bootstrap's floors at
+    # 1 / (nboot + 1), and strong signals would tie there. Of relaxations the
+    # tests cannot tell apart (one class), only the strongest is refitted this
+    # round; if it fails, the next round's screen says whether another is
+    # still indicated. Structural proposals come from a check that cannot
+    # change until the model does, so when one fails the next follows in the
+    # same round, until one improves or none is left; stopping after the
+    # first left a daily cycle untried on the Fisher data behind three item
+    # processes. Their likelihood ratio level is divided by every structural
+    # proposal the round might try.
+    #
+    # One refit at a time, the strongest first, and the first that improves
+    # is kept. Refitting three side by side and keeping the best spent two
+    # refits a round for little: on the Fisher search every structural round
+    # that kept a change kept the first tried, and in the score-test rounds
+    # every one of the three passed by tens of log likelihood units, so
+    # keeping the first reorders additions the next rounds make anyway. Each
+    # refit then has all the cores.
+    # Changes given are tried as given: in their order, all of them.
+    if (!byhand) {
+      proposals <- proposals[order(vapply(proposals, `[[`, 0, 'rank'))]
+      cls <- vapply(proposals, function(p) if (is.null(p$class) || is.na(p$class))
+        NA_character_ else paste(p$family, p$class), '')
+      proposals <- proposals[is.na(cls) | !duplicated(cls)]
+      if (!structural) proposals <- utils::head(proposals, ntry)
+    }
+    level <- alpha / length(proposals)
+    tried <- list()
+    ok <- logical()
+    while (length(proposals)) {
+      batch <- utils::head(proposals, 1L)
+      proposals <- proposals[-seq_along(batch)]
+      edits <- lapply(batch, function(prop) try(prop$edit(model, data, covariates),
+        silent = TRUE))
+      for (prop in batch) say("Round ", step, ": refitting with ", prop$label)
+      # A proposal with several starts (`starts`: a time scale at each end of
+      # the design's range) is refitted from each, side by side where the
+      # cores allow, and its best fit is its refit.
+      runs <- unlist(lapply(seq_along(batch), function(b) {
+        s <- batch[[b]]$starts
+        if (length(s) > 1L) lapply(s, function(x) list(b = b, start = x)) else
+          list(list(b = b, start = if (length(s)) s[[1]] else batch[[b]]$start))
+      }), recursive = FALSE)
+      ran <- .ctImproveRefits(current, lapply(runs, function(r) edits[[r$b]]),
+        lapply(runs, `[[`, 'start'), cores, slowest,
+        progress = if (isTRUE(verbose)) list(label = paste0("Round ", step, ": "),
+          change = batch[[1]]$label,
+          file = if (!is.null(checkpoint)) paste0(checkpoint, '.refit.rds')))
+      refits <- .ctImproveBestOf(ran, vapply(runs, `[[`, 0L, 'b'), length(batch))
+      # The best of several starts keeps their wall time, for the report.
+      attr(refits, 'seconds') <- attr(ran, 'seconds')
+      slowest <- max(slowest, attr(ran, 'seconds'))
+      say("Round ", step, ": refit took ", .ctImproveRefitReport(refits))
+      for (b in seq_along(batch)) {
+        prop <- batch[[b]]
+        edited <- edits[[b]]
+        refit <- refits[[b]]
+        verdict <- .ctImproveCompare(current, refit, criterion, level)
+        tried[[length(tried) + 1L]] <- list(prop = prop, refit = refit, edited = edited,
+          verdict = verdict)
+        history[[length(history) + 1L]] <- data.frame(round = step, family = prop$family,
+          change = prop$label, screen_p = prop$p, dloglik = verdict$dloglik,
+          dpar = verdict$dpar, criterion = verdict$value, kept = FALSE,
+          note = verdict$note, stringsAsFactors = FALSE)
+      }
+      ok <- vapply(tried, function(t) isTRUE(t$verdict$accept), logical(1))
+      if (any(ok)) break
+    }
+    rejected <- c(rejected, vapply(tried[!ok], function(t) t$prop$key, ''))
+    if (!any(ok)) {
+      if (structural) { stopped <- 'not adequate, no candidate improved'; break }
+      stage$round <- step
+      checkpointed()
+      next
+    }
+    best <- which(ok)[which.max(vapply(tried[ok], function(t) t$verdict$score, 0))]
+    current <- tried[[best]]$refit
+    data <- tried[[best]]$edited$data
+    extraargs <- utils::modifyList(extraargs, as.list(tried[[best]]$edited$args))
+    kept[[length(kept) + 1L]] <- tried[[best]]$prop
+    history[[length(history) - length(tried) + best]]$kept <- TRUE
+    ad <- NULL
+    say("Round ", step, ": kept ", tried[[best]]$prop$label)
+    # A kept random effect can leave the population covariance more than the
+    # data determine: then the rank comes down until the likelihood needs it.
+    ranked <- .ctImproveRankStep(.ctFitBaseModel(fit), current, kept, startdata, covariates,
+      criterion, alpha, cores, say, label = paste0("Round ", step, ": "), round = step)
+    history <- c(history, ranked$history)
+    if (ranked$changed) {
+      current <- ranked$current; kept <- ranked$kept; data <- ranked$data
+      extraargs <- ranked$args
+    }
+    stage$round <- step
+    checkpointed()
+  }
+  if (!stage$searched) {
+    stage$searched <- TRUE
+    checkpointed()
+  }
+  # Backward: a change kept early can be made redundant by one kept later --
+  # a random effect on a parameter whose variation a covariate then explains.
+  # Each kept change in turn, the model is rebuilt from the start with all the
+  # others and refitted; if the fuller model is not better by the criterion,
+  # the change goes.
+  if (!stage$pruned && isTRUE(prune) &&
+      sum(vapply(kept, .ctImprovePrunable, logical(1))) > 1L) {
+    pruned <- .ctImprovePrune(.ctFitBaseModel(fit), current, kept, startdata, covariates,
+      criterion, alpha, cores, ntry, slowest, say)
+    history <- c(history, pruned$history)
+    slowest <- pruned$slowest
+    if (length(pruned$kept) < length(kept)) {
+      current <- pruned$current; data <- pruned$data; extraargs <- pruned$args; ad <- NULL
+    }
+    kept <- pruned$kept
+    stage$pruned <- TRUE
+    checkpointed()
+  }
+  if (isTRUE(adequacy) && is.null(ad)) {
+    available <- .ctImproveAvailable(covariates, .ctFitBaseModel(current))
+    ad <- ctFitAdequacy(current, covariates = available, periods = periods,
+      nsamples = nsamples, alpha = alpha, close = if (is.null(close)) 0.05 else close,
+      projection = projection, cores = cores)
+  }
+  confirmation <- NULL
+  if (!is.null(held) && length(kept)) {
+    say("Confirming ", length(kept), " change(s) on the ", length(held), " held-out subjects")
+    holddata <- alldata[alldata[[idname]] %in% held, , drop = FALSE]
+    # The model with every change and the model without each one, refitted
+    # to the held-out subjects: independent refits, side by side when refits
+    # go to workers, `ntry` at a time.
+    rebuilt <- lapply(c(list(seq_along(kept)), lapply(seq_along(kept), function(k)
+      seq_along(kept)[-k])), function(idx) try(.ctImproveRebuild(.ctFitBaseModel(fit),
+        holddata, kept[idx], covariates), silent = TRUE))
+    refits <- .ctImproveRefits(current, rebuilt, vector('list', length(rebuilt)), cores,
+      slowest, width = ntry)
+    fullfit <- refits[[1]]
+    confirmation <- do.call(rbind, lapply(seq_along(kept), function(k) {
+      w <- refits[[k + 1L]]
+      verdict <- if (inherits(fullfit, 'try-error') || inherits(w, 'try-error'))
+        list(dloglik = NA_real_, dpar = NA_integer_, value = NA_real_, accept = NA,
+          note = 'refit failed') else
+        .ctImproveCompare(w, fullfit, 'LR', alpha)
+      data.frame(change = kept[[k]]$label, dloglik = verdict$dloglik, dpar = verdict$dpar,
+        p = verdict$value, confirmed = isTRUE(verdict$accept), note = verdict$note,
+        stringsAsFactors = FALSE)
+    }))
+    # The final model keeps what the held-out subjects confirmed; the search's
+    # own choice stays in `selected`.
+    selected <- current
+    confirmedkept <- kept[confirmation$confirmed]
+    say("Refitting the final model, with the ", length(confirmedkept),
+      " confirmed change(s), to every subject")
+    final <- .ctImproveRebuild(.ctFitBaseModel(fit), alldata, confirmedkept, covariates)
+    current <- .ctImproveRefit(current, final$model, final$data, cores, args = final$args)
+  }
+  history <- if (length(history)) do.call(rbind, history) else data.frame()
+  structure(list(fit = current, history = history, screens = screens,
+    adequacy = ad, confirmation = confirmation, stopped = stopped, start = fit,
+    selected = selected,
+    holdout = held), class = 'ctModelImprove')
+}
+
+#' Changes the score tests and adequacy checks propose
+#'
+#' The changes \code{\link{ctModelImprove}} would consider for a fit: the
+#' relaxations its score tests indicate and, given an adequacy check, the
+#' structural changes the check's families point to -- a process of an item's
+#' own or shared by two, a slow process, a cycle, a second order. Rows can be
+#' handed to \code{ctModelImprove(changes = )}, which refits with them and
+#' judges each by the search's criterion: a search made a step at a time, by
+#' hand.
+#'
+#' Unlike a search's rounds, every indicated change is listed, including
+#' relaxations the tests cannot tell apart (one \code{class}), of which a
+#' round refits only the strongest; and the structural changes are listed
+#' beside the relaxations, where a round turns to them only once the screen
+#' is clean.
+#'
+#' @param fit A fit from \code{\link{ctFit}} with \code{backend = 'julia'}.
+#' @param score A \code{\link{ctScoreTest}} of \code{fit}. Run when
+#'   neither it nor \code{adequacy} is given.
+#' @param adequacy Optionally a \code{\link{ctFitAdequacy}} of \code{fit},
+#'   for the structural changes.
+#' @param covariates,relax,alpha,cores As for \code{\link{ctModelImprove}}.
+#' @return A data frame of class \code{ctModelProposals}, one row per change,
+#'   strongest first within the relaxations and within the structural
+#'   changes: \code{change} (as a search's \code{history} names it),
+#'   \code{family}, \code{p} (the evidence ranked by), \code{class}, and
+#'   \code{proposal}, what \code{ctModelImprove()} needs to make the change.
+#' @seealso \code{vignette('score-tests')}.
+#' @export
+ctModelProposals <- function(fit, score = NULL, adequacy = NULL, covariates = NULL,
+  relax = c('heterogeneity', 'covariates', 'statedependence', 'volatility', 'fixed', 'level',
+    'slow', 'unique', 'periodic', 'order'), alpha = 0.05, cores = getOption('mc.cores', 2L)) {
+  if (!.ctFitIsJulia(fit)) stop("ctModelProposals() needs a fit from ",
+    "ctFit(backend = 'julia').", call. = FALSE)
+  if (is.null(.ctFitBaseModel(fit))) stop("This fit does not carry the model it ",
+    "was built from; refit it with this version of ctsem.", call. = FALSE)
+  if (!is.null(score) && !inherits(score, 'ctScoreTest'))
+    stop("score takes a ctScoreTest() of the fit.", call. = FALSE)
+  if (!is.null(adequacy) && !inherits(adequacy, 'ctFitAdequacy'))
+    stop("adequacy takes a ctFitAdequacy() of the fit.", call. = FALSE)
+  relax <- match.arg(relax, several.ok = TRUE)
+  covariates <- .ctImproveCovariates(fit, covariates)
+  model <- .ctFitBaseModel(fit)
+  if (is.null(score) && is.null(adequacy)) score <- .ctImproveScreen(fit,
+    .ctImproveAvailable(covariates, model), relax, 'auto', cores)
+  byrank <- function(p) p[order(vapply(p, `[[`, 0, 'rank'))]
+  props <- byrank(.ctImproveProposals(score, model, alpha, fit, relax))
+  if (!is.null(adequacy)) props <- c(props, byrank(.ctImproveScoreStructural(fit,
+    .ctImproveStructural(model, relax, NULL, adequacy, fit, alpha),
+    as.data.frame(.ctFitLongData(fit)), covariates, cores)))
+  field <- function(name, empty) vapply(props, function(p) {
+    v <- p[[name]]
+    if (is.null(v) || !length(v) || is.na(v[1])) empty else
+      if (is.character(empty)) as.character(v[1]) else as.numeric(v[1])
+  }, empty)
+  out <- data.frame(change = field('label', ''), family = field('family', ''),
+    p = field('p', NA_real_), class = field('class', NA_character_),
+    stringsAsFactors = FALSE)
+  out$proposal <- I(props)
+  class(out) <- c('ctModelProposals', 'data.frame')
+  out
+}
+
+#' @export
+print.ctModelProposals <- function(x, digits = 3, ...) {
+  if (!nrow(x)) {
+    cat("No change proposed.\n")
+    return(invisible(x))
+  }
+  d <- as.data.frame(unclass(x)[c('change', 'family', 'p', 'class')],
+    stringsAsFactors = FALSE)
+  d$p <- signif(d$p, digits)
+  if (all(is.na(d$class))) d$class <- NULL
+  print(d, row.names = FALSE)
+  invisible(x)
+}
+
+# Covariates a search may add, keyed by the model's subject id (or 'id').
+.ctImproveCovariates <- function(fit, covariates) {
+  if (is.null(covariates)) return(NULL)
+  covariates <- as.data.frame(covariates)
+  idname <- .ctFitModelObject(fit)$subjectIDname
+  if (!any(c(idname, 'id') %in% names(covariates)))
+    stop("covariates needs a '", idname, "' column.", call. = FALSE)
+  if (!idname %in% names(covariates)) names(covariates)[names(covariates) == 'id'] <- idname
+  covariates
+}
+
+# The covariates a model does not have yet, or NULL when none is left.
+.ctImproveAvailable <- function(covariates, model) {
+  if (is.null(covariates)) return(NULL)
+  idname <- model$subjectIDname
+  available <- covariates[, c(idname, setdiff(names(covariates), c(idname, model$TIpredNames))),
+    drop = FALSE]
+  if (ncol(available) < 2L) NULL else available
+}
+
+# A round's screen: the score tests of the relaxations a search may make,
+# or NULL when it may make none of them.
+.ctImproveScreen <- function(current, available, relax, form, cores) {
+  tests <- intersect(relax, c('heterogeneity', 'covariates', 'statedependence', 'volatility',
+    'fixed', 'level'))
+  if (is.null(available)) tests <- setdiff(tests, 'covariates')
+  if (!length(tests)) return(NULL)
+  suppressMessages(ctScoreTest(current, covariates = available, tests = tests, form = form,
+    cores = cores, verbose = FALSE))
+}
+
+# Whether the current fit plainly needs a kept change, so pruning can keep it
+# without refitting the model rebuilt without it (`rebuilt`): a Wald test of
+# the change's own parameters at their absent values -- a random effect's sd at
+# zero, a term's coefficient at zero, a freed cell at the value it was fixed
+# at -- on the natural scale, by the delta method from the fit's raw
+# covariance, past twice the bar the criterion sets for the parameters the
+# change adds. NULL where the change has no such parameters to test: a process
+# or cycle added (its persistence has no absent value), loadings on a
+# reduced-rank level, covariate effects. On the Fisher search every one of
+# eleven pruning refits found its change needed, 12 to 48 log likelihood units
+# down, most of them random effects whose sd was many standard errors from
+# zero. Near the boundary the Wald test is unreliable, so a change short of
+# the margin is refitted.
+.ctImprovePruneNeeded <- function(current, prop, rebuilt, cores, criterion, alpha) {
+  if (!isTRUE(prop$family %in% c('heterogeneity', 'dimension', 'level', 'statedependence',
+    'volatility', 'fixed'))) return(NULL)
+  cov <- current$estimate$cov
+  if (is.null(cov)) return(NULL)
+  nm <- as.character(.ctFitRawParNames(current))
+  est <- stats::setNames(.ctFitRawEstimate(current), nm)
+  reduced <- .ctImproveSpec(current, rebuilt$model, rebuilt$data, cores, rebuilt$args)$names
+  added <- setdiff(nm, reduced)
+  dpar <- length(nm) - length(reduced)
+  if (dpar < 1L || !length(added)) return(NULL)
+  model <- .ctFitBaseModel(current)
+  # Natural value of each tested parameter as a function of its raw value,
+  # and its absent value.
+  value <- function(transform, raw) as.numeric(eval(parse(text = transform),
+    list(param = raw, log1p_exp = log1p_exp)))
+  tested <- list()
+  for (a in added) {
+    if (startsWith(a, 'popsd_')) {
+      tested[[a]] <- list(f = function(r) log1p_exp(2 * r - 1), null = 0)
+    } else if (a %in% model$pars$param) {
+      row <- model$pars[.ctParamRows(model, a), , drop = FALSE]
+      tr <- as.character(row$transform)
+      if (is.na(tr) || !nzchar(tr)) tr <- 'param'
+      cell <- rebuilt$model$pars[rebuilt$model$pars$matrix == row$matrix &
+        rebuilt$model$pars$row == row$row & rebuilt$model$pars$col == row$col, , drop = FALSE]
+      null <- if (nrow(cell) == 1L && is.na(cell$param)) suppressWarnings(as.numeric(cell$value)) else 0
+      if (!is.finite(null)) return(NULL)
+      tested[[a]] <- list(f = local({ tr <- tr; function(r) value(tr, r) }), null = null)
+    }
+  }
+  if (!length(tested)) return(NULL)
+  idx <- match(names(tested), nm)
+  g <- vapply(names(tested), function(a) tested[[a]]$f(est[a]) - tested[[a]]$null, 0)
+  J <- vapply(names(tested), function(a) {
+    h <- 1e-6 * max(1, abs(est[a]))
+    (tested[[a]]$f(est[a] + h) - tested[[a]]$f(est[a] - h)) / (2 * h)
+  }, 0)
+  V <- cov[idx, idx, drop = FALSE] * outer(J, J)
+  W <- tryCatch(as.numeric(t(g) %*% solve(V, g)), error = function(e) NA_real_)
+  if (!is.finite(W)) return(NULL)
+  bar <- if (criterion == 'LR') stats::qchisq(1 - alpha, dpar) else
+    (if (criterion == 'BIC') log(.ctFitNsubjects(current)) else 2) * dpar
+  list(needed = W > 2 * bar, W = W, bar = 2 * bar, dpar = dpar)
+}
+
+# Whether pruning may try dropping a kept change: a rank change may not
+# (`.ctImproveRankChange`).
+.ctImprovePrunable <- function(p) !isFALSE(p$prunable)
+
+# The pruning pass: each kept change in turn, the base model rebuilt without
+# it and refitted, and the change dropped if the fuller model is not better
+# by the criterion. Until a change is dropped every refit is compared against
+# the same model, so they are independent: `ntry` at a time run side by side
+# when refits go to workers (`.ctImproveSideBySide`), and after a drop the
+# rest of that batch, compared against the model it replaced, is refitted
+# again. Otherwise one at a time, since there a batch would make refits a
+# drop then discards. The decisions are the one-at-a-time pass's either way.
+.ctImprovePrune <- function(base, current, kept, startdata, covariates, criterion, alpha,
+    cores, ntry, slowest = 0, say = function(...) invisible()) {
+  history <- list(); data <- NULL; args <- NULL
+  k <- 1L
+  while (k <= length(kept) && sum(vapply(kept, .ctImprovePrunable, logical(1))) > 1L) {
+    width <- if (.ctImproveSideBySide(current, ntry, cores, slowest)) as.integer(ntry) else 1L
+    # The next `width` changes that need a refit to be judged: a change the
+    # current fit plainly needs is kept without one (`.ctImprovePruneNeeded`).
+    ks <- integer(); rebuilt <- list(); last <- k - 1L
+    for (j in seq.int(k, length(kept))) {
+      if (length(ks) == width) break
+      last <- j
+      if (!.ctImprovePrunable(kept[[j]])) next
+      rb <- try(.ctImproveRebuild(base, startdata, kept[-j], covariates), silent = TRUE)
+      needed <- if (inherits(rb, 'try-error')) NULL else tryCatch(.ctImprovePruneNeeded(
+        current, kept[[j]], rb, cores, criterion, alpha), error = function(e) NULL)
+      if (isTRUE(needed$needed)) {
+        say("Pruning: kept ", kept[[j]]$label, " without a refit (Wald ",
+          signif(needed$W, 3), ")")
+        history[[length(history) + 1L]] <- data.frame(round = NA_integer_,
+          family = 'prune', change = paste0('drop ', kept[[j]]$label), screen_p = NA_real_,
+          dloglik = NA_real_, dpar = -needed$dpar, criterion = NA_real_, kept = FALSE,
+          note = sprintf('kept without a refit: Wald %.3g against %.3g', needed$W,
+            needed$bar), stringsAsFactors = FALSE)
+        next
+      }
+      ks <- c(ks, j); rebuilt[[length(rebuilt) + 1L]] <- rb
+    }
+    if (!length(ks)) break
+    for (j in ks) say("Pruning: refitting without ", kept[[j]]$label)
+    refits <- .ctImproveRefits(current, rebuilt, vector('list', length(ks)), cores, slowest)
+    slowest <- max(slowest, attr(refits, 'seconds'))
+    for (i in seq_along(ks)) {
+      j <- ks[i]
+      verdict <- if (inherits(refits[[i]], 'try-error')) list(accept = TRUE,
+        dloglik = NA_real_, dpar = NA_integer_, value = NA_real_,
+        note = 'refit without it failed; kept') else
+        .ctImproveCompare(refits[[i]], current, criterion, alpha)
+      drop <- !isTRUE(verdict$accept)
+      history[[length(history) + 1L]] <- data.frame(round = NA_integer_,
+        family = 'prune', change = paste0('drop ', kept[[j]]$label), screen_p = NA_real_,
+        dloglik = if (is.finite(verdict$dloglik)) -verdict$dloglik else NA_real_,
+        dpar = if (is.finite(verdict$dpar)) -verdict$dpar else NA_integer_,
+        criterion = verdict$value, kept = drop, note = verdict$note,
+        stringsAsFactors = FALSE)
+      k <- if (i == length(ks)) last + 1L else j + 1L
+      if (drop) {
+        say("Pruning: dropped ", kept[[j]]$label)
+        current <- refits[[i]]; data <- rebuilt[[i]]$data; args <- rebuilt[[i]]$args
+        kept <- kept[-j]
+        k <- j
+        break
+      }
+    }
+  }
+  list(current = current, kept = kept, data = data, args = args, history = history,
+    slowest = slowest)
+}
+
+# Whether a fit leaves its population covariance unidentified: a weak or
+# negative direction of its curvature (`fit$identifiability$directions`) made
+# mostly of the covariance's own parameters. With eleven random effects for 40
+# people the Fisher example's search reached a fit whose information along 55
+# correlations was about 2.5 against 4e6 elsewhere, with one direction negative:
+# the estimation correction then took more than each row-level statistic's
+# whole variance, and nothing downstream of that fit could be trusted.
+.ctImproveWeakCovariance <- function(fit) {
+  dirs <- fit$identifiability$directions
+  if (!length(dirs)) return(FALSE)
+  any(vapply(dirs, function(d) {
+    p <- as.character(d$parameters)
+    length(p) > 0L && mean(grepl('^(popsd_|rawcor_|poploading_|popunique_)', p)) >= 0.5
+  }, logical(1)))
+}
+
+# Rank-r loadings with L L' the best rank-r approximation of the covariance S:
+# its leading eigen-directions, rotated so that L[p, q] = 0 for p < q, the
+# echelon form the engine reads (`_laplace_poploading`).
+.ctImproveEchelonLoadings <- function(S, r) {
+  S <- (S + t(S)) / 2
+  e <- eigen(S, symmetric = TRUE)
+  B <- e$vectors[, seq_len(r), drop = FALSE] %*%
+    diag(sqrt(pmax(e$values[seq_len(r)], 0)), r)
+  Q <- qr.Q(qr(t(B[seq_len(r), , drop = FALSE])))
+  L <- B %*% Q
+  L[upper.tri(L)] <- 0
+  L
+}
+
+# Raw starting values for a fit of the current model at population rank r:
+# the current fit's raw-scale population covariance (`ctsem_laplace_popcov`)
+# by echelon loadings, each row divided by its effect's sdscale, named as the
+# engine names them. Without it every loading would start at zero, the random
+# effects with no spread at all.
+.ctImproveRankStart <- function(current, r) {
+  spec <- current$model_spec
+  module <- .ctJuliaModule(spec$project)
+  est <- .ctFitRawEstimate(current)
+  S <- as.matrix(.ctBackendJuliaValue(module$ctsem_laplace_popcov(
+    .ctJuliaObjective(current), .ctJuliaNumericVector(est), 1L)))
+  nm <- as.character(.ctFitRawParNames(current))
+  pars <- sub('^popsd_', '', grep('^popsd_', nm, value = TRUE))
+  if (length(pars) != nrow(S)) return(NULL)
+  model <- .ctFitBaseModel(current)
+  scale <- suppressWarnings(as.numeric(model$pars$sdscale[.ctParamRows(model, pars)]))
+  scale[!is.finite(scale) | scale <= 0] <- 1
+  L <- .ctImproveEchelonLoadings(S, r) / scale
+  out <- unlist(lapply(seq_len(r), function(q) stats::setNames(L[q:nrow(L), q],
+    paste0('poploading_', pars[q:nrow(L)], '_dim', q))))
+  out
+}
+
+# The number of parameters varying over subjects in a model.
+.ctImproveNvarying <- function(model) {
+  length(unique(model$pars$param[as.logical(model$pars$indvarying) %in% TRUE &
+    !is.na(model$pars$param)]))
+}
+
+# A change that sets the population covariance's rank: kept like any other, so
+# a rebuild carries it, applied after every other change (`.ctImproveRebuild`)
+# so that it sees how many parameters vary by then, and never pruned -- undoing
+# it adds parameters rather than removing them. A rank no longer below the
+# number varying is the full covariance.
+.ctImproveRankChange <- function(r) list(key = 'rank', family = 'rank', p = NA_real_,
+  label = paste0('population covariance of rank ', r), prunable = FALSE,
+  edit = local({ r <- r; function(model, data, covs, args = list()) {
+    k <- .ctImproveNvarying(model)
+    list(model = model, data = data, args = list(poprank = if (r < k) r else NA))
+  } }))
+
+# The rank a fit's population covariance suggests: the smallest whose dropped
+# dimensions carry under `share` of the correlation matrix's trace. On the
+# Fisher search's eighth round (nine effects) that was 5, where the
+# one-rank-at-a-time step had stopped after four refits, its likelihood ratio
+# tests accepting each.
+.ctImproveRankTarget <- function(current, share = 0.05) {
+  module <- .ctJuliaModule(current$model_spec$project)
+  S <- as.matrix(.ctBackendJuliaValue(module$ctsem_laplace_popcov(
+    .ctJuliaObjective(current), .ctJuliaNumericVector(.ctFitRawEstimate(current)), 1L)))
+  .ctImproveRankFromCov(S, share)
+}
+
+# The rule `.ctImproveRankTarget` applies to a covariance S.
+.ctImproveRankFromCov <- function(S, share = 0.05) {
+  e <- eigen(stats::cov2cor((S + t(S)) / 2), symmetric = TRUE, only.values = TRUE)$values
+  which(1 - cumsum(e) / sum(e) < share)[1]
+}
+
+# While the current fit leaves its population covariance unidentified, refit
+# it at a lower rank, starting from the current covariance's leading
+# dimensions, and keep the lower rank unless the likelihood says the dropped
+# dimensions are needed: the fuller fit better by the criterion. The first
+# refit goes straight to the rank the covariance suggests
+# (`.ctImproveRankTarget`); if the likelihood refuses that, the ranks above it
+# are tried in turn, up to one below the current. Single-level models only,
+# and not below the varying T0MEANS a rank must keep. Returns the current fit
+# and kept changes, and a history row for each refit.
+.ctImproveRankStep <- function(base, current, kept, startdata, covariates, criterion,
+    alpha, cores, say = function(...) invisible(), label = '', round = NA_integer_) {
+  history <- list(); data <- NULL; args <- NULL; changed <- FALSE
+  refused <- NA_integer_
+  repeat {
+    if (!.ctImproveWeakCovariance(current)) break
+    model <- .ctFitBaseModel(current)
+    if (length(model$groupIDnames)) break
+    k <- .ctImproveNvarying(model)
+    replay <- .ctFitReplayArgs(current)
+    r <- suppressWarnings(as.integer(replay$poprank))
+    if (!length(r) || is.na(r) || r >= k) r <- k
+    t0 <- sum(as.logical(model$pars$indvarying) %in% TRUE & model$pars$matrix %in% 'T0MEANS')
+    if (r - 1L < max(1L, t0)) break
+    target <- r - 1L
+    if (is.na(refused)) {
+      suggested <- tryCatch(.ctImproveRankTarget(current), error = function(e) NA_integer_)
+      if (isTRUE(suggested < target)) target <- max(suggested, t0, 1L)
+    } else target <- refused + 1L
+    change <- .ctImproveRankChange(target)
+    say(label, "the population covariance is not identified; refitting at rank ", target)
+    nonrank <- Filter(function(p) !identical(p$family, 'rank'), kept)
+    rebuilt <- try(.ctImproveRebuild(base, startdata, c(nonrank, list(change)), covariates),
+      silent = TRUE)
+    start <- if (inherits(rebuilt, 'try-error')) NULL else
+      tryCatch(.ctImproveRankStart(current, target), error = function(e) NULL)
+    refit <- if (inherits(rebuilt, 'try-error')) rebuilt else try(.ctImproveRefit(current,
+      rebuilt$model, rebuilt$data, cores, start, rebuilt$args), silent = TRUE)
+    verdict <- if (inherits(refit, 'try-error')) list(accept = TRUE, dloglik = NA_real_,
+      dpar = NA_integer_, value = NA_real_, note = 'refit at the lower rank failed') else
+      .ctImproveCompare(refit, current, criterion, alpha)
+    lower <- !isTRUE(verdict$accept)
+    history[[length(history) + 1L]] <- data.frame(round = round, family = 'rank',
+      change = change$label, screen_p = NA_real_,
+      dloglik = if (is.finite(verdict$dloglik)) -verdict$dloglik else NA_real_,
+      dpar = if (is.finite(verdict$dpar)) -verdict$dpar else NA_integer_,
+      criterion = verdict$value, kept = lower, note = verdict$note, stringsAsFactors = FALSE)
+    if (!lower) {
+      if (target < r - 1L) { refused <- target; next }
+      break
+    }
+    say(label, "kept ", change$label)
+    current <- refit; kept <- c(nonrank, list(change)); changed <- TRUE
+    data <- rebuilt$data; args <- rebuilt$args
+    refused <- NA_integer_
+  }
+  list(current = current, kept = kept, data = data, args = args, history = history,
+    changed = changed)
+}
+
+# The base model with a sequence of kept changes applied, for some data: the
+# model, the data the changes need (added covariates), and the ctFit
+# arguments they change (popunique, poprank).
+.ctImproveRebuild <- function(model, data, kept, covariates) {
+  args <- list()
+  rank <- vapply(kept, function(p) identical(p$family, 'rank'), logical(1))
+  for (p in c(kept[!rank], kept[rank])) {
+    e <- p$edit(model, data, covariates, args)
+    model <- e$model; data <- e$data
+    if (!is.null(e$args)) args <- utils::modifyList(args, e$args)
+  }
+  list(model = model, data = data, args = args)
+}
+
+# What the screen indicates, as edits: one per heterogeneity parameter, state
+# term and fixed cell significant within its family, and one per covariate
+# whose joint test is significant, adding it with effects on the parameters
+# its tests single out. A measurement error covariance is freed only with
+# 'errorcov' in `relax`; otherwise the pairs family's evidence proposes a
+# process the items share, at the structural stage (`.ctImproveStructural`).
+.ctImproveProposals <- function(st, model, alpha, current = NULL,
+  relax = c('unique', 'fixed')) {
+  out <- list()
+  if (is.null(st)) return(out)
+  # The ctFit arguments the current fit was made with, for edits that change
+  # a reduced-rank level rather than the model.
+  replay <- if (is.null(current)) list() else .ctFitReplayArgs(current)
+  h <- st$heterogeneity
+  # A heterogeneity test is of the parameter varying with its covariances with
+  # each subject's initial state and the effects already varying (`with`).
+  # The initial means vary with it, or the refit cannot take the covariance
+  # the test found: a CINT that varies from a shared start makes subjects
+  # drift apart, which is not what a random intercept is.
+  t0pars <- unique(stats::na.omit(model$pars$param[model$pars$matrix %in% 'T0MEANS']))
+  withpars <- function(r) if (is.null(h$with) || is.na(h$with[r])) character() else
+    intersect(strsplit(h$with[r], ', ', fixed = TRUE)[[1]], t0pars)
+  rankp <- function(r) if (!is.null(h$LM)) .ctScoreMixtureP(h$LM[r], h$df[r] - 1L) else
+    stats::pnorm(h$z[r], lower.tail = FALSE)
+  if (!is.null(h)) for (r in which(h$p_adj < alpha)) {
+    par <- h$parameter[r]
+    with <- withpars(r)
+    # A MANIFESTMEANS cell the model fixes: a parameter there, varying about
+    # the fixed value as its stated mean.
+    if (identical(h$matrix[r], 'MANIFESTMEANS') && !par %in% model$pars$param) {
+      row <- h$row[r]
+      name <- paste0('mm_', model$manifestNames[row])
+      while (name %in% model$pars$param) name <- paste0(name, '_')
+      out[[length(out) + 1L]] <- list(key = paste0('het:', par), family = 'heterogeneity',
+        label = paste0(par, ' individually varying about its fixed value',
+          if (length(with)) paste0(', with ', paste(with, collapse = ', '))),
+        p = h$p[r], rank = rankp(r), class = h$class[r],
+        start = .ctImprovePopsdStart(model, name, h$sd[r]),
+        edit = local({ row <- row; name <- name; with <- with
+          function(model, data, covs, args = list()) {
+            pars <- model$pars
+            k <- which(pars$matrix %in% 'MANIFESTMEANS' & pars$row %in% row &
+              (is.na(pars$param) | !nzchar(pars$param)))
+            if (length(k) != 1L) stop('that MANIFESTMEANS cell is no longer fixed')
+            value <- as.numeric(pars$value[k])
+            pars <- .ctScoreFreeCell(pars, k, name, .ctModelDefaultFreePar('MANIFESTMEANS',
+              row, 1L, isTRUE(model$continuoustime))$transform)
+            pars$indvarying[pars$param %in% c(name, with)] <- TRUE
+            model$pars <- pars
+            model$fixedpopmeans <- c(model$fixedpopmeans, stats::setNames(value, name))
+            list(model = model, data = data)
+          } }))
+      next
+    }
+    varying <- par %in% model$pars$param[as.logical(model$pars$indvarying) %in% TRUE]
+    out[[length(out) + 1L]] <- if (!varying) list(key = paste0('het:', par),
+      family = 'heterogeneity', label = paste0(par, ' individually varying',
+        if (length(with)) paste0(', with ', paste(with, collapse = ', '))), p = h$p[r],
+      rank = rankp(r), class = h$class[r],
+      start = .ctImprovePopsdStart(model, par, h$sd[r]),
+      edit = local({ pars <- c(par, with); function(model, data, covs, args = list()) {
+        model$pars$indvarying[model$pars$param %in% pars] <- TRUE
+        list(model = model, data = data)
+      } })) else list(key = paste0('own:', par), family = 'heterogeneity',
+      label = paste0(par, ' given a variance of its own'), p = h$p[r],
+      rank = rankp(r), class = h$class[r],
+      edit = local({ par <- par; pu <- replay$popunique; function(model, data, covs, args = list()) {
+        old <- if (!is.null(args$popunique)) args$popunique else pu
+        if (isTRUE(old)) stop('every parameter already has a variance of its own')
+        old <- if (is.null(old) || isFALSE(old)) character() else as.character(old)
+        list(model = model, data = data, args = list(popunique = unique(c(old, par))))
+      } }))
+  }
+  # A parameter depending on a subject's level: let it vary over subjects, so
+  # its random effect is estimated with its correlation with the intercepts --
+  # the heterogeneity edit, under its key, so the two families do not propose
+  # it twice.
+  lv <- st$level$terms
+  if (!is.null(lv)) for (r in which(lv$p_adj < alpha)) {
+    par <- lv$parameter[r]
+    if (paste0('het:', par) %in% vapply(out, `[[`, '', 'key')) next
+    if (par %in% model$pars$param[as.logical(model$pars$indvarying) %in% TRUE]) next
+    out[[length(out) + 1L]] <- list(key = paste0('het:', par), family = 'level',
+      label = paste0(par, ' individually varying (with ', lv$level[r], ')'), p = lv$p[r],
+      rank = lv$p[r], class = lv$class[r],
+      edit = local({ par <- par; function(model, data, covs, args = list()) {
+        model$pars$indvarying[model$pars$param %in% par] <- TRUE
+        list(model = model, data = data)
+      } }))
+  }
+  # The dimension test runs only where the level is not of reduced rank
+  # (ctScoreTest), so a significant one makes the parameters its direction
+  # loads on vary together.
+  d <- st$dimension
+  if (!is.null(d) && isTRUE(d$p < alpha)) {
+    pars <- names(d$direction)[abs(d$direction) >= 0.5]
+    pars <- setdiff(pars, model$pars$param[as.logical(model$pars$indvarying) %in% TRUE])
+    if (length(pars) > 1L) out[[length(out) + 1L]] <- list(
+      key = paste0('dim:', paste(sort(pars), collapse = ',')), family = 'dimension',
+      label = paste0(paste(pars, collapse = ', '), ' individually varying together'),
+      p = d$p, rank = d$p, edit = local({ pars <- pars; function(model, data, covs,
+        args = list()) {
+        model$pars$indvarying[model$pars$param %in% pars] <- TRUE
+        list(model = model, data = data)
+      } }))
+  }
+  for (cv in st$covariates) {
+    if (!isTRUE(cv$joint$p < alpha)) next
+    z <- cv$joint$covariate
+    cut <- cv$joint$cut
+    pt <- cv$parameters
+    # Effects on spreads (popsd_, scale()) are reported, not added: a time
+    # independent predictor acts on a parameter's value.
+    pt <- pt[!grepl('^popsd_|^scale\\(', pt$parameter), , drop = FALSE]
+    pars <- pt$parameter[pt$p_adj < alpha]
+    if (!length(pars)) next
+    # A column name the model can take: the sign and point as letters, since
+    # 'age_above_-0.297' was not found in the data it had just been added to.
+    zname <- if (is.null(cut)) z else paste0(z, '_above_',
+      gsub('.', 'p', sub('^-', 'm', format(signif(cut, 3))), fixed = TRUE))
+    out[[length(out) + 1L]] <- list(key = paste0('cov:', zname, ':', paste(sort(pars), collapse = ',')),
+      family = 'covariates', label = paste0(if (is.null(cut)) z else paste0(z, ' above ',
+        signif(cut, 3)), ' as a predictor of ', paste(pars, collapse = ', ')),
+      p = cv$joint$p, rank = stats::pchisq(cv$joint$LM, cv$joint$df, lower.tail = FALSE),
+      edit = local({ z <- z; pars <- pars; cut <- cut; zname <- zname
+        function(model, data, covs, args = list()) {
+        idname <- model$subjectIDname
+        add <- unique(covs[, c(idname, z)])
+        if (!is.null(cut)) {
+          add[[zname]] <- as.numeric(add[[z]] > cut)
+          add <- add[, c(idname, zname)]
+          z <- zname
+        }
+        data <- merge(data[, setdiff(names(data), z), drop = FALSE], add, by = idname,
+          all.x = TRUE, sort = FALSE)
+        data <- data[order(data[[idname]], data[[model$timeName]]), , drop = FALSE]
+        model$TIpredNames <- c(model$TIpredNames, z)
+        model$n.TIpred <- length(model$TIpredNames)
+        model$pars[[paste0(z, '_effect')]] <- ifelse(model$pars$param %in% pars, 'TRUE', 'FALSE')
+        # Its effects are the ones the tests singled out, not a default for
+        # cells a later change adds.
+        model$statedTIpreds <- c(model$statedTIpreds, z)
+        list(model = model, data = data)
+      } }))
+  }
+  s <- st$statedependence$terms
+  if (!is.null(s)) for (r in which(s$p_adj < alpha)) {
+    mono <- as.integer(strsplit(s$monomial[r], ',')[[1]])
+    i <- s$i[r]
+    name <- paste0('sdep_', s$equation[r], '_', gsub('*', '_', s$term[r], fixed = TRUE))
+    out[[length(out) + 1L]] <- list(key = paste0('sdep:', i, ':', s$monomial[r]),
+      family = 'statedependence', label = paste0(s$term[r], ' in the drift of ',
+        s$equation[r]), p = s$p[r], rank = s$p[r], class = s$class[r],
+      edit = local({ i <- i; mono <- mono; name <- name; function(model, data, covs, args = list()) {
+        list(model = .ctAddCintTerms(model, i, name, list(mono)), data = data)
+      } }))
+  }
+  v <- st$volatility$terms
+  if (!is.null(v)) for (r in which(v$p_adj < alpha)) {
+    name <- paste0('vol_', v$equation[r], '_', v$by[r])
+    out[[length(out) + 1L]] <- list(key = paste0('vol:', v$i[r], ':', v$m[r]),
+      family = 'volatility', label = paste0('the innovation sd of ', v$equation[r],
+        ' varying with ', v$by[r]), p = v$p[r], rank = v$p[r], class = v$class[r],
+      edit = local({ i <- v$i[r]; m <- v$m[r]; name <- name
+        function(model, data, covs, args = list()) {
+          while (name %in% model$pars$param) name <- paste0(name, '_')
+          list(model = .ctAddDiffusionTerms(model, i, name, m), data = data)
+        } }))
+  }
+  f <- st$fixed$cells
+  if (!is.null(f)) for (r in which(f$p_adj < alpha)) {
+    cell <- f[r, ]
+    if (cell$matrix == 'MANIFESTVAR' && !'errorcov' %in% relax) next
+    out[[length(out) + 1L]] <- list(key = paste0('fixed:', cell$cell), family = 'fixed',
+      label = paste0(cell$cell, ' freed'), p = cell$p, rank = cell$p, class = cell$class,
+      edit = local({ cell <- cell; function(model, data, covs, args = list()) {
+        k <- which(model$pars$matrix == cell$matrix & model$pars$row == cell$row &
+          model$pars$col == cell$col)
+        name <- cell$suggested
+        while (name %in% model$pars$param) name <- paste0(name, '_')
+        model$pars$param[k] <- name; model$pars$value[k] <- NA
+        model$pars$transform[k] <- cell$transform; model$pars$indvarying[k] <- FALSE
+        for (e in grep('_effect$', names(model$pars), value = TRUE)) model$pars[[e]][k] <- 'FALSE'
+        list(model = model, data = data)
+      } }))
+  }
+  out
+}
+
+# Changes the score tests cannot reach, for when the screen is clean and the
+# checks fail: a slow process driving each latent (one the model has, then
+# one of its own), each latent made second order, and the user's own
+# candidates. A slow process is ranked by the
+# adequacy check's evidence for it, the latent's own standardised updates
+# still positively correlated over some time gap (the smallest such p), and
+# goes first where there is any; the rest rank alike.
+.ctImproveStructural <- function(model, relax, candidates, ad, current = NULL,
+  alpha = 0.05) {
+  out <- list()
+  # A cycle the periodic family found, at the period its strongest positive
+  # statistic names, driving every latent that has innovations of its own.
+  if ('periodic' %in% relax && isTRUE(model$continuoustime)) {
+    cyc <- .ctImprovePeriodicEvidence(ad, .ctModelCyclePeriods(model))
+    if (!is.null(cyc)) {
+      name <- 'cycle'
+      while (any(startsWith(c(model$latentNames, model$TIpredNames), paste0(name, '_'))))
+        name <- paste0(name, 'x')
+      drives <- .ctImproveNoisyLatents(model)
+      out[[length(out) + 1L]] <- list(key = paste0('periodic:', signif(cyc$period, 3)),
+        family = 'periodic', label = paste0('a cycle of period ', signif(cyc$period, 3)),
+        p = cyc$p, rank = cyc$p,
+        edit = local({ period <- cyc$period; name <- name; drives <- drives
+          function(model, data, covs, args = list()) list(
+            model = ctModelPeriodicComponent(model, period, intersect(drives,
+              seq_len(model$n.latent)), name = name),
+            data = ctPeriodicPhases(data, period, name, id = model$subjectIDname,
+              time = model$timeName)) }))
+    }
+  }
+  # An item whose errors stay correlated with its own over time, given a
+  # process of its own; ranked by that evidence.
+  # The data can hold more than one time scale, so where the evidence stays
+  # after one process, another is proposed for the same items, under a name of
+  # its own (u_<items>_2, ...); each is refitted from both ends of the
+  # design's time scales (.ctImproveTimescales).
+  scales <- if (is.null(current)) c(short = NA_real_, long = NA_real_) else
+    .ctImproveTimescales(model, current)
+  freename <- function(base) {
+    name <- base; k <- 1L
+    while (name %in% model$latentNames) { k <- k + 1L; name <- paste0(base, '_', k) }
+    name
+  }
+  if ('unique' %in% relax && isTRUE(model$continuoustime)) {
+    for (item in model$manifestNames) {
+      evidence <- .ctImproveOwnEvidence(ad, 'residuals', item)
+      if (!is.finite(evidence)) next
+      name <- freename(paste0('u_', item))
+      again <- name != paste0('u_', item)
+      out[[length(out) + 1L]] <- list(key = paste0('unique:', name), family = 'unique',
+        label = paste0(item, ' given ', if (again) 'another process' else 'a process',
+          ' of its own'), p = evidence, rank = evidence,
+        starts = .ctImproveStartsAt(scales, function(h)
+          .ctImproveUniqueStart(model, current, item, halflife = h, name = name)),
+        edit = local({ item <- item; name <- name; function(model, data, covs, args = list())
+          list(model = ctModelUniqueProcess(model, item, name = name), data = data) }))
+    }
+  }
+  # Two items whose errors are correlated within an occasion (the pairs
+  # family), given a process they share: the reading of a measurement error
+  # covariance unless 'errorcov' frees the covariance at the screen. On the
+  # own-evidence scale, the pair's p times the pairs tested, and only where
+  # that is below alpha, since pairs grow with the square of the items.
+  if ('unique' %in% relax && !'errorcov' %in% relax && isTRUE(model$continuoustime)) {
+    s <- if (is.null(ad)) NULL else ad$statistics
+    pr <- if (is.null(s)) NULL else s[s$family == 'pairs' & is.finite(s$z), , drop = FALSE]
+    for (r in seq_len(if (is.null(pr)) 0L else nrow(pr))) {
+      items <- c(pr$variable[r], pr$with[r])
+      if (!all(items %in% model$manifestNames)) next
+      items <- model$manifestNames[sort(match(items, model$manifestNames))]
+      name <- freename(paste0('u_', paste(items, collapse = '_')))
+      again <- name != paste0('u_', paste(items, collapse = '_'))
+      evidence <- min(1, pr$p[r] * nrow(pr))
+      if (!isTRUE(evidence < alpha)) next
+      sign <- if (pr$z[r] < 0) -1 else 1
+      out[[length(out) + 1L]] <- list(key = paste0('shared:', name),
+        family = 'unique', label = paste0(items[1], ' and ', items[2], ' given ',
+          if (again) 'another process' else 'a process', ' they share'), p = evidence,
+        rank = evidence,
+        starts = .ctImproveStartsAt(scales, function(h) .ctImproveUniqueStart(model,
+          current, items, shared = TRUE, sign = sign, halflife = h, name = name)),
+        edit = local({ items <- items; name <- name
+          function(model, data, covs, args = list()) list(model = ctModelUniqueProcess(model,
+            items, shared = TRUE, name = name), data = data) }))
+    }
+  }
+  # A slow process or a second order for a latent with innovations of its
+  # own: not for a cycle's clock, which turns as written, nor for the level
+  # of a process already second order, nor for a process a change added (a
+  # slow process, an item's own, a second order's derivative), which starts
+  # from the stationary distribution of the first-order process it is, or is
+  # that process's rate of change: the cluster's search spent a round
+  # refitting an item process driven by a slow one, dev1's two on slow
+  # processes made second order, none of them kept, and a later one proposed
+  # a second order's derivative made second order -- a third order by
+  # another name.
+  noisy <- .ctImproveNoisyLatents(model)
+  added <- grepl('^(slow|u)_', model$latentNames) |
+    model$latentNames %in% paste0('d', model$latentNames)
+  noisy <- noisy[!added[noisy]]
+  if ('slow' %in% relax && isTRUE(model$continuoustime)) {
+    lat <- model$latentNames
+    slows <- grep('^slow_', lat)
+    for (i in seq_along(lat)) {
+      if (!i %in% noisy || paste0('slow_', lat[i]) %in% lat) next
+      evidence <- .ctImproveSlowEvidence(ad, lat[i])
+      # A slow process the model has driving this latent too, tried before
+      # one of its own: the Fisher search gave PA a slow process beside
+      # NegA's, their innovations correlated at 1.000 on the boundary, and PA
+      # driven by NegA's fitted within 3 log likelihood units of that for two
+      # parameters fewer. The score screen's fixed cells hold the effect, but
+      # it scored LM 1 there against a gain of 44.
+      for (s in slows) {
+        if (!.ctSlowShareFree(model, i, s)) next
+        out[[length(out) + 1L]] <- list(key = paste0('slowshare:', lat[i], ':', lat[s]),
+          family = 'slow', label = paste0(lat[i], ' driven by the slow process of ',
+            sub('^slow_', '', lat[s])), p = evidence,
+          rank = if (is.finite(evidence)) evidence else 1,
+          edit = local({ i <- i; s <- s; function(model, data, covs, args = list())
+            list(model = .ctSlowShare(model, i, s), data = data) }))
+      }
+      out[[length(out) + 1L]] <- list(key = paste0('slow:', lat[i]), family = 'slow',
+        label = paste0(lat[i], ' driven by a slow process'), p = evidence,
+        rank = if (is.finite(evidence)) evidence else 1,
+        starts = c(list(.ctImproveSlowStart(model, current, i)),
+          .ctImproveStartsAt(scales['long'], function(h)
+            .ctImproveSlowStart(model, current, i, halflife = h))),
+        edit = local({ i <- i; function(model, data, covs, args = list())
+          list(model = ctModelSlowComponent(model, i), data = data) }))
+    }
+  }
+  if ('order' %in% relax && isTRUE(model$continuoustime)) {
+    for (i in seq_len(model$n.latent)) {
+      if (!i %in% noisy || paste0('d', model$latentNames[i]) %in% model$latentNames) next
+      out[[length(out) + 1L]] <- list(key = paste0('order:', model$latentNames[i]),
+        family = 'order', label = paste0(model$latentNames[i], ' made second order'),
+        p = NA_real_, rank = 1,
+        starts = .ctImproveOrderStarts(model, current, i, scales[['short']]),
+        edit = local({ i <- i; function(model, data, covs,
+          args = list()) list(model = ctModelHigherOrder(model, i), data = data) }))
+    }
+  }
+  for (k in seq_along(candidates)) {
+    out[[length(out) + 1L]] <- list(key = paste0('candidate:', k), family = 'candidate',
+      label = paste0('candidate model ', k), p = NA_real_, rank = 1,
+      edit = local({ k <- k; function(model, data, covs, args = list()) {
+        list(model = candidates[[k]], data = data) } }))
+  }
+  out
+}
+
+# A cycle proposal scored at the current fit, before any refit, and tried
+# first if it scores. Its clock turns as written, so its couplings into the
+# processes have an ordinary score at zero: their joint robust test, with the
+# estimation removed exactly from the few couplings by the Hessian's columns
+# along them. The statistic, about twice the gain a refit would find, ranks it
+# ahead of the proposals that keep the adequacy check's ranking.
+#
+# Processes added at no effect -- a slow process uncoupled, a process of an
+# item's own with no variance -- are not scored: their gain is not local. On
+# the Fisher search's eighth round a slow process for each affect lost
+# likelihood at every step along its start with the rest of the model held
+# (-0.11 and -0.21 at the smallest, 1/1000 of its coupling), where their
+# refits gained 51 and 25: the slow component pays only once the process's
+# own persistence and noise give way to it, a region a test at the current
+# fit cannot see. Ranked by such a test, the best change would be tried last.
+.ctImproveScoreStructural <- function(current, proposals, data, covariates, cores) {
+  if (!.ctFitIsJulia(current)) return(proposals)
+  est <- .ctFitRawEstimate(current)
+  nm1 <- as.character(.ctFitRawParNames(current))
+  for (k in seq_along(proposals)) {
+    prop <- proposals[[k]]
+    if (!identical(prop$family, 'periodic')) next
+    sc <- tryCatch(.ctImproveCycleScore(current, prop, data, covariates, cores, est, nm1),
+      error = function(e) NULL)
+    if (is.null(sc) || !is.finite(sc$statistic)) next
+    proposals[[k]]$rank <- -sc$statistic - 1
+    proposals[[k]]$scored <- sc
+  }
+  proposals
+}
+
+# A cycle proposal's score test (`.ctImproveScoreStructural`): the robust
+# statistic, its degrees of freedom and bootstrap p. NULL where the extended
+# model cannot be prepared or does not reproduce the fit at zero coupling.
+.ctImproveCycleScore <- function(current, prop, data, covariates, cores, est, nm1) {
+  model <- .ctFitBaseModel(current)
+  e <- prop$edit(model, data, covariates)
+  sp <- .ctImproveSpec(current, e$model, e$data, cores, e$args)
+  nm2 <- sp$names
+  if (!all(nm1 %in% nm2)) return(NULL)
+  x0 <- stats::setNames(numeric(length(nm2)), nm2)
+  x0[nm1] <- est
+  pars <- e$model$pars
+  newlat <- which(!e$model$latentNames %in% model$latentNames)
+  new <- setdiff(nm2, nm1)
+  at <- pars[match(new, pars$param), , drop = FALSE]
+  test <- new[at$matrix %in% 'DRIFT' & !at$row %in% newlat & at$col %in% newlat]
+  if (!length(test)) return(NULL)
+  # At zero coupling the extended model must reproduce the fit -- up to the
+  # normal(0, 1) prior's constant for each new parameter, with priors on
+  # every parameter.
+  value1 <- ctJuliaEvaluate(current, est, gradient = FALSE, cores = cores)$value
+  offset <- if (isTRUE(current$args$resolved$priors)) length(new) * stats::dnorm(0, log = TRUE) else 0
+  ev <- ctJuliaEvaluate(sp$spec, x0, gradient = TRUE, cores = cores)
+  if (!isTRUE(abs(ev$value - value1 - offset) <= 1e-6 * max(1, abs(value1)))) return(NULL)
+  module <- .ctJuliaModule(current$model_spec$project)
+  objective <- .ctJuliaObjective(sp$spec, hybrid = TRUE)
+  units <- as.matrix(.ctBackendWithMaxChunks(cores, .ctJuliaGet(module$ctsem_subject_gradients(
+    objective, .ctJuliaVector(as.numeric(x0)))))$scores)
+  theta <- match(nm1, nm2); delta <- match(test, nm2)
+  Hc <- .ctBackendWithMaxChunks(cores, as.matrix(.ctBackendJuliaValue(
+    module$ctsem_hessian_columns(objective, .ctJuliaNumericVector(as.numeric(x0)),
+      .ctJuliaVector(as.integer(delta))))))
+  Iinv <- .ctScorePinv(-.ctBackendHessian(current, est))$inv
+  A <- -t(Hc[theta, , drop = FALSE]) %*% Iinv
+  grad <- as.numeric(ev$gradient)
+  U <- grad[delta] - as.numeric(A %*% grad[theta])
+  C <- units[, delta, drop = FALSE] - units[, theta, drop = FALSE] %*% t(A)
+  j <- .ctScorePinv(.ctScoreSpread(C))
+  if (!j$rank) return(NULL)
+  list(statistic = as.numeric(t(U) %*% j$inv %*% U), df = j$rank, p = .ctScoreBoot(C, 999L))
+}
+
+# The adequacy check's evidence for a slow process in latent `name`: the
+# smallest p of its updates' positive correlations with its own at other times,
+# over every gap bin. NA when the check did not run the latent family.
+.ctImproveSlowEvidence <- function(ad, name) .ctImproveOwnEvidence(ad, 'latent', name)
+
+# The smallest p of a variable's positive correlations with itself at other
+# times, over every gap bin, in one family of the adequacy check (`latent`
+# for a latent's updates, `residuals` for an item's errors), times the number
+# of gap bins it is the smallest of. Structural proposals are ranked against
+# each other by this, and a cycle by its strongest period on the same terms
+# (`.ctImprovePeriodicEvidence`). NA when the check did not run the family.
+.ctImproveOwnEvidence <- function(ad, family, name) {
+  s <- if (is.null(ad)) NULL else ad$statistics
+  if (is.null(s) || !nrow(s)) return(NA_real_)
+  all <- s$family == family & s$variable %in% name & s$with %in% name & !is.na(s$gap) &
+    is.finite(s$z)
+  own <- all & s$z > 0
+  if (!any(own)) return(NA_real_)
+  min(1, min(s$p[own]) * sum(all))
+}
+
+# The periodic family's evidence for a cycle: the period of its strongest
+# positive statistic, and that statistic's p times the number of periods
+# scanned -- on the terms an item's or a latent's own correlations are ranked
+# by (`.ctImproveOwnEvidence`). The family's p, which the bootstrap floors at
+# 1 / (nboot + 1), put a daily rhythm at z = 11 behind every item process on
+# the Fisher data. Periods within one per cent of one in `exclude` -- a cycle
+# the model has -- are passed over: a second 24 hour clock was proposed after
+# the first was kept. NULL when the family did not run or found no positive
+# statistic at another period.
+.ctImprovePeriodicEvidence <- function(ad, exclude = numeric()) {
+  if (is.null(ad) || is.null(ad$families)) return(NULL)
+  f <- ad$families[ad$families$family == 'periodic', , drop = FALSE]
+  s <- ad$statistics[ad$statistics$family == 'periodic' & is.finite(ad$statistics$z) &
+    ad$statistics$z > 0, , drop = FALSE]
+  # To three figures, as the proposal's label and key give it.
+  at <- signif(s$period, 3)
+  keep <- is.finite(at) & !vapply(at, function(a) any(abs(a - exclude) <= 0.01 * a),
+    logical(1))
+  s <- s[keep, , drop = FALSE]; at <- at[keep]
+  if (!nrow(f) || !nrow(s)) return(NULL)
+  best <- which.max(s$z)
+  period <- at[best]
+  scanned <- sum(ad$statistics$family == 'periodic' & is.finite(ad$statistics$z))
+  list(p = min(1, s$p[best] * scanned), period = period)
+}
+
+# The latents with innovations of their own: not a cycle's clock, not the
+# level of a higher order process.
+.ctImproveNoisyLatents <- function(model) {
+  p <- model$pars
+  value <- suppressWarnings(as.numeric(p$value))
+  quiet <- p$row[p$matrix %in% 'DIFFUSION' & p$row == p$col &
+    (is.na(p$param) | !nzchar(p$param)) & !is.na(value) & value == 0]
+  setdiff(seq_len(model$n.latent), quiet)
+}
+
+# The time scales a study's design resolves, from the current fit's data: the
+# median interval between a subject's rows, the shortest a process can be told
+# from noise at, and a quarter of the median subject's span from first to last
+# row, the longest the records still cover several times over. A component
+# with a time scale of its own -- a process of an item's own or shared by
+# several, a slow process -- is refitted from both ends of that range and the
+# better fit kept: from one start, the refit keeps to whichever time scale it
+# began nearest, and the data can hold several. On the tutorial's empirical
+# example a shared process added from the short end came out at 0.0025 hours
+# and gained 30 log likelihood units, from a week 116 hours and 79; with one
+# time scale in simulated data (1.5, 8 or 48 hours) both ends found it.
+.ctImproveTimescales <- function(model, current) {
+  d <- try(.ctFitLongData(current), silent = TRUE)
+  if (inherits(d, 'try-error') || is.null(d)) return(c(short = NA_real_, long = NA_real_))
+  times <- split(d[[model$timeName]], d[[model$subjectIDname]])
+  gaps <- unlist(lapply(times, function(t) diff(sort(t))))
+  span <- vapply(times, function(t) diff(range(t)), 0)
+  short <- stats::median(gaps[is.finite(gaps) & gaps > 0])
+  long <- stats::median(span[is.finite(span) & span > 0]) / 4
+  # Two ends only where they are apart: on a short record one start serves.
+  if (!is.finite(long) || !is.finite(short) || long < 3 * short) long <- NA_real_
+  c(short = short, long = long)
+}
+
+# A component's starts at each end of the time scales (`.ctImproveTimescales`),
+# by `fun(halflife)`; one where the design spans no range.
+.ctImproveStartsAt <- function(scales, fun) {
+  out <- Filter(Negate(is.null), lapply(scales[is.finite(scales)], fun))
+  if (length(out)) out else NULL
+}
+
+# Latent `i`'s own drift at the current fit: its fixed value, or its
+# parameter through its transform; NA where it is neither.
+.ctImproveOwnDrift <- function(model, current, i) {
+  cell <- model$pars[model$pars$matrix == 'DRIFT' & model$pars$row == i &
+    model$pars$col == i, , drop = FALSE]
+  if (nrow(cell) != 1L) return(NA_real_)
+  if (is.na(cell$param)) return(suppressWarnings(as.numeric(cell$value)))
+  if (is.null(current)) return(NA_real_)
+  est <- setNames(.ctFitRawEstimate(current), .ctFitRawParNames(current))
+  raw <- est[cell$param]
+  tryCatch(as.numeric(eval(parse(text = cell$transform),
+    list(param = raw, log1p_exp = log1p_exp))), error = function(e) NA_real_)
+}
+
+# Raw starts for latent `i` made second order (ctModelHigherOrder()), whose
+# level keeps its drift `a` and diffusion at the current fit's values: the
+# inertia time, through the inverse of its transform, log1p_exp(2 raw). A
+# tenth of the median interval between a subject's rows (`short`, from
+# `.ctImproveTimescales`), where the process is nearly the first order one
+# fitted; and 1 / (2|a|), where it oscillates with a period of 2 pi / |a|
+# and decays at |a|. Refitted from each and the better kept, as a component
+# with a time scale is: the likelihood can hold a maximum near either. One
+# start where the other cannot be worked out, NULL where neither can.
+.ctImproveOrderStarts <- function(model, current, i, short) {
+  a <- .ctImproveOwnDrift(model, current, i)
+  tau <- c(if (is.finite(short) && short > 0) short / 10,
+    if (is.finite(a) && a < 0) 1 / (2 * -a))
+  if (!length(tau)) return(NULL)
+  name <- paste0('inertia_', model$latentNames[i])
+  lapply(tau, function(t) setNames(log(expm1(t)) / 2, name))
+}
+
+# Raw starts for a slow process added to latent `i`: its effect at one (zero
+# is a stationary point of both it and the slow process), its persistence a
+# tenth of the latent's own. Where ctModelSlowComponent() orders the two, the
+# slow drift is the latent's times inv_logit(raw), so a tenth is qlogis(0.1)
+# whatever the latent's rate; where it leaves the slow drift free (the
+# latent's drift is an expression), a tenth through the inverse of ctsem's
+# default drift transform, -(1e-6 + 2 log1p_exp(-2 raw)), the latent's drift
+# read off the current fit, and where it cannot be, -0.2, the pilot's start.
+# `halflife`, where given, puts the slow process there instead -- the fraction
+# of the latent's rate that gives it, read off the current fit, where that is
+# under a tenth; NULL where it is not, the tenth already being slower.
+.ctImproveSlowStart <- function(model, current, i, halflife = NULL) {
+  name <- model$latentNames[i]
+  slow <- paste0('slow_', name)
+  fast <- .ctImproveOwnDrift(model, current, i)
+  fraction <- 0.1
+  if (!is.null(halflife)) {
+    if (!is.finite(fast) || fast >= 0) return(NULL)
+    fraction <- (log(2) / halflife) / -fast
+    if (!is.finite(fraction) || fraction >= 0.1 || fraction <= 0) return(NULL)
+  }
+  ordered <- try(ctModelSlowComponent(model, i), silent = TRUE)
+  if (!inherits(ordered, 'try-error') && any(ordered$pars$matrix == 'PARS' &
+    ordered$pars$param %in% paste0('drift_', slow)))
+    return(c(setNames(stats::qlogis(fraction), paste0('drift_', slow)),
+      setNames(1, paste0('drift_', name, '_', slow))))
+  target <- -0.2
+  if (is.finite(fast) && fast < 0) target <- fast * fraction
+  a <- max(-target - 1e-6, 1e-8) / 2
+  c(setNames(-log(expm1(a)) / 2, paste0('drift_', slow)),
+    setNames(1, paste0('drift_', name, '_', slow)))
+}
+
+# Raw starts for a process of its own for `item`. At raw zero ctsem's drift
+# transform gives -1.39 an hour, a process that forgets within the hour, so on
+# prompts hours apart it is indistinguishable from measurement error and the
+# likelihood is flat in its persistence: on the Fisher data, processes for
+# items whose errors correlate 0.2-0.3 with their own over a day gained 0.01
+# to 2 log likelihood units from there, and none was kept. So it starts with
+# a half-life of the median time between a subject's rows, and a stationary
+# variance of a quarter of the item's error variance at the current fit, with
+# the innovation and initial sds that implies, each through the inverse of its
+# transform. NULL, and raw zero, when they cannot be worked out. A process
+# `shared` by `item` (two or more) is placed on the first; each other loading
+# starts where the item gets the same share of its own error variance, with
+# the `sign` of the covariance the screen pointed to.
+# `halflife` sets the process's half-life (the median interval when NULL), and
+# `name` the new latent's name, for a second process on the same items.
+.ctImproveUniqueStart <- function(model, current, item, shared = FALSE, sign = 1,
+  halflife = NULL, name = NULL) {
+  if (is.null(current)) return(NULL)
+  j <- match(item, model$manifestNames)
+  m1 <- try(ctModelUniqueProcess(model, item, shared = shared, name = name), silent = TRUE)
+  if (anyNA(j) || inherits(m1, 'try-error')) return(NULL)
+  value <- function(transform, raw) tryCatch(as.numeric(eval(parse(text = transform),
+    list(param = raw, log1p_exp = log1p_exp))), error = function(e) NA_real_)
+  inverse <- function(transform, target) tryCatch(stats::uniroot(
+    function(r) value(transform, r) - target, c(-20, 20), tol = 1e-10)$root,
+    error = function(e) NA_real_)
+  d <- try(.ctFitLongData(current), silent = TRUE)
+  if (inherits(d, 'try-error') || is.null(d)) return(NULL)
+  gaps <- unlist(lapply(split(d[[model$timeName]], d[[model$subjectIDname]]),
+    function(t) diff(sort(t))))
+  gap <- stats::median(gaps[is.finite(gaps) & gaps > 0])
+  est <- setNames(.ctFitRawEstimate(current), .ctFitRawParNames(current))
+  errsd <- function(jj) {
+    cell <- model$pars[model$pars$matrix == 'MANIFESTVAR' & model$pars$row == jj &
+      model$pars$col == jj, , drop = FALSE]
+    if (nrow(cell) != 1L) return(NA_real_)
+    if (is.na(cell$param)) as.numeric(cell$value) else value(cell$transform, est[[cell$param]])
+  }
+  sd <- vapply(j, errsd, 0)
+  if (!is.finite(gap) || !all(is.finite(sd)) || any(sd <= 0)) return(NULL)
+  rate <- log(2) / if (is.null(halflife)) gap else halflife
+  v <- sd[1]^2 / 4
+  u <- length(m1$latentNames)
+  # The initial variance is the stationary one these imply (ctModelUniqueProcess).
+  target <- data.frame(matrix = c('DRIFT', 'DIFFUSION'), row = u,
+    value = c(-rate, sqrt(2 * rate * v)))
+  if (isTRUE(shared)) target <- rbind(target, data.frame(matrix = 'LAMBDA', row = j[-1],
+    value = sign * sd[-1] / sd[1]))
+  out <- numeric()
+  for (k in seq_len(nrow(target))) {
+    r <- m1$pars[m1$pars$matrix == target$matrix[k] & m1$pars$row == target$row[k] &
+      m1$pars$col == u, , drop = FALSE]
+    if (nrow(r) != 1L || is.na(r$param)) next
+    raw <- inverse(r$transform, target$value[k])
+    if (is.finite(raw)) out[r$param] <- raw
+  }
+  if (length(out)) out else NULL
+}
+
+# Each edited model refitted (`.ctImproveRefit`), a try-error where the edit or
+# the refit failed, with the longest refit made in this session as attribute
+# `seconds`. Side by side in worker processes when there are two or more, the
+# cores to share, and a refit has already taken `slowest` seconds above
+# `.ctWorkerFitSeconds`: the refits of a round are independent, and one fit of
+# the Fisher example's model with random dynamics kept about 6 of its 10 cores
+# busy. The threshold is the one every worker decision shares: a worker takes
+# 30-60 s to start, and three refits of a few seconds each took 46 s in fresh
+# workers against 27 s here. Each worker takes `cores %/% workers` threads. The
+# pool is the sampling chains' (`.ctBackendWarmWorkers`), which persists, so
+# later rounds find it started; a fit made there rebuilds its objective in this
+# session when it is next evaluated, the cache being keyed on the specification.
+# At most `width` workers: past that a refit waits for a free one (`future()`
+# blocks), and each worker's Julia holds its own objective, several GB on the
+# Fisher example.
+.ctImproveRefits <- function(current, edits, starts, cores, slowest = 0, width = Inf,
+    progress = NULL) {
+  seconds <- 0
+  here <- function(i) {
+    if (inherits(edits[[i]], 'try-error')) return(edits[[i]])
+    started <- proc.time()[['elapsed']]
+    out <- try(.ctImproveRefit(current, edits[[i]]$model, edits[[i]]$data, cores,
+      starts[[i]], edits[[i]]$args, progress = progress), silent = TRUE)
+    seconds <<- max(seconds, proc.time()[['elapsed']] - started)
+    out
+  }
+  inhere <- function() structure(lapply(seq_along(edits), here), seconds = seconds)
+  ok <- which(!vapply(edits, inherits, logical(1), 'try-error'))
+  if (!.ctImproveSideBySide(current, min(length(ok), width), cores, slowest)) return(inhere())
+  workers <- min(length(ok), as.integer(cores), width)
+  threads <- max(1L, as.integer(cores) %/% workers)
+  handles <- .ctBackendWarmWorkers(current, workers, values = .ctFitRawEstimate(current),
+    threads = threads)
+  if (.ctBackendWarmWait(handles) < 1L) return(inhere())
+  # Side by side, the refits' wall time is the batch's.
+  started <- proc.time()[['elapsed']]
+  # A worker's stderr goes nowhere, so each refit's progress goes to a file of
+  # its own and this session prints it while it waits (`.ctImproveRelay`).
+  files <- if (!is.null(progress)) vapply(seq_along(edits), function(i)
+    tempfile('ctimprove', fileext = '.rds'), '') else character()
+  on.exit(unlink(files), add = TRUE)
+  wait <- if (length(files)) .ctImproveRelay(files, progress)
+  futures <- lapply(seq_along(edits), function(i) if (!i %in% ok) NULL else {
+    point <- if (length(files)) list(label = progress$label, file = files[i],
+      change = progress$change)
+    tryCatch(future::future(utils::getFromNamespace('.ctImproveRefit', 'ctsem')(current,
+      edits[[i]]$model, edits[[i]]$data, threads, starts[[i]], edits[[i]]$args,
+      progress = point), seed = TRUE), error = function(e) NULL)
+  })
+  out <- lapply(seq_along(edits), function(i) {
+    if (!i %in% ok) return(edits[[i]])
+    if (is.null(futures[[i]])) return(here(i))
+    if (!is.null(wait)) wait(futures[[i]])
+    tryCatch(future::value(futures[[i]]), error = function(e)
+      structure(conditionMessage(e), class = 'try-error', condition = e))
+  })
+  structure(out, seconds = max(seconds, proc.time()[['elapsed']] - started))
+}
+
+# The best of each proposal's refits by log likelihood (`which` gives the
+# proposal each refit belongs to); a try-error only where every one failed.
+.ctImproveBestOf <- function(refits, which, n) {
+  lapply(seq_len(n), function(b) {
+    own <- refits[which == b]
+    ll <- vapply(own, function(f) if (inherits(f, 'try-error') ||
+      !is.finite(.ctFitOptimisedLoglik(f))) -Inf else .ctFitOptimisedLoglik(f), 0)
+    if (all(!is.finite(ll))) own[[1]] else own[[which.max(ll)]]
+  })
+}
+
+# Whether `.ctImproveRefits` would send `n` refits to worker processes rather
+# than make them here: two or more of them and of the cores, a refit here has
+# taken longer than `.ctWorkerFitSeconds`, and the fit is on julia with a pool
+# to hand.
+.ctImproveSideBySide <- function(current, n, cores, slowest) {
+  min(n, as.integer(cores)) >= 2L && isTRUE(slowest > .ctWorkerFitSeconds) &&
+    isTRUE(getOption('ctsem.improve.processes', TRUE)) &&
+    .ctFitIsJulia(current) && .ctBackendCanWarm()
+}
+
+# Refit with an edited model, prepared as the current fit was but on `cores`,
+# and warm started from its estimates, matched by name; new parameters start at
+# zero, or where the proposal says (`start`, by raw name). A worker's refit gets
+# its share of the cores; replaying the fit's own `cores` gave each worker all
+# of them. A warm start can still fail -- a
+# new random effect at an arbitrary scale can leave a Laplace unit's inner mode
+# unconverged at the start, which ended two of three refits in testing -- so a
+# refit that fails from there is tried once from ctsem's own start.
+.ctImproveRefit <- function(current, model, data, cores, start = NULL, args = NULL,
+    progress = NULL) {
+  prepared <- .ctImproveSpec(current, model, data, cores, args)
+  args <- prepared$args
+  # A refit can run for hours, and says nothing while it does unless asked.
+  if (!is.null(progress)) args$optimcontrol <- utils::modifyList(
+    if (is.list(args$optimcontrol)) args$optimcontrol else list(),
+    list(callback = .ctImproveProgress(progress$label, file = progress$file,
+      change = progress$change)))
+  names2 <- prepared$names
+  est <- setNames(.ctFitRawEstimate(current), .ctFitRawParNames(current))
+  init <- setNames(numeric(length(names2)), names2)
+  shared <- intersect(names(est), names2)
+  init[shared] <- est[shared]
+  start <- start[names(start) %in% names2]
+  init[names(start)] <- start
+  args$fit <- TRUE
+  args$inits <- unname(init)
+  out <- try(suppressMessages(suppressWarnings(do.call(ctFit, args))), silent = TRUE)
+  if (inherits(out, 'try-error')) {
+    args$inits <- NULL
+    out <- suppressMessages(suppressWarnings(do.call(ctFit, args)))
+  }
+  .ctImproveDropCallback(out)
+}
+
+# The fit without the progress callback in its recorded call, so that a later
+# refit or update of it does not report under this search's label.
+.ctImproveDropCallback <- function(fit) {
+  for (slot in c('input', 'resolved')) if (is.list(fit$args[[slot]]$optimcontrol))
+    fit$args[[slot]]$optimcontrol$callback <- NULL
+  fit
+}
+
+# The optimiser callback for a refit's progress: a line every `every` seconds,
+# with the iteration, the objective and the gradient's norm. Written to stderr
+# with the time rather than as a message, which the refit's
+# suppressMessages() would swallow, as it did a four-hour refit's on the
+# cluster. With `file`, the point reached is saved there too, so a refit that
+# stalls can be examined where it stalled.
+.ctImproveProgress <- function(label, every = 600, file = NULL, change = NULL) {
+  start <- last <- proc.time()[['elapsed']]
+  function(iteration, total, objective, gradient_norm, parameters) {
+    now <- proc.time()[['elapsed']]
+    if (now - last < every) return(invisible(NULL))
+    last <<- now
+    point <- list(round = label, change = change, minutes = (now - start) / 60,
+      iteration = as.integer(iteration), objective = objective,
+      gradient_norm = gradient_norm, parameters = as.numeric(parameters))
+    cat(.ctImproveProgressLine(label, point), file = stderr())
+    if (!is.null(file)) .ctImproveCheckpointSave(file, point)
+    invisible(NULL)
+  }
+}
+
+.ctImproveProgressLine <- function(label, point) paste0(format(Sys.time(), '%H:%M:%S'),
+  ' ', label, sprintf("refit at %.0f min: iteration %d, objective %.2f, |g| %.3g\n",
+    point$minutes, point$iteration, point$objective, point$gradient_norm))
+
+# For refits side by side: a function that waits for one future, printing the
+# line for every point a refit's callback has written to its file (`files`, in
+# the order of the refits) since the last, and saving it to `progress$file`
+# with the start it came from. A two-start refit of the Fisher search said
+# nothing for over an hour without it.
+.ctImproveRelay <- function(files, progress, every = 5) {
+  seen <- rep(-Inf, length(files))
+  relay <- function() for (i in seq_along(files)) {
+    t <- suppressWarnings(as.numeric(file.mtime(files[i])))
+    if (!isTRUE(t > seen[i])) next
+    point <- tryCatch(readRDS(files[i]), error = function(e) NULL)
+    if (is.null(point)) next
+    seen[i] <<- t
+    cat(.ctImproveProgressLine(paste0(progress$label, 'start ', i, ' of ', length(files),
+      ': '), point), file = stderr())
+    if (!is.null(progress$file)) .ctImproveCheckpointSave(progress$file,
+      c(point, list(start = i)))
+  }
+  function(f) {
+    while (!future::resolved(f)) {
+      relay()
+      Sys.sleep(every)
+    }
+    relay()
+  }
+}
+
+# One line on a round's refits: how long they took, and how each ended.
+.ctImproveRefitReport <- function(refits) {
+  what <- vapply(refits, function(r) {
+    if (inherits(r, 'try-error')) return('failed')
+    o <- r$optim
+    if (is.null(o)) return('done')
+    paste0(o$iterations, ' iterations', if (isTRUE(o$overshot > 0)) ', overshot' else '',
+      if (!isTRUE(as.logical(o$converged))) ', not converged' else '')
+  }, '')
+  paste0(round(attr(refits, 'seconds') / 60, 1), ' min (', paste(what, collapse = '; '), ')')
+}
+
+# What identifies a search's starting fit, for its checkpoint.
+.ctImproveFingerprint <- function(fit) list(loglik = signif(fit$estimate$loglik, 10),
+  estimate = signif(unname(.ctFitRawEstimate(fit)), 8), names = .ctFitRawParNames(fit))
+
+# Written whole to a temporary file and then moved over the checkpoint, so a
+# search killed while saving leaves the previous round's.
+.ctImproveCheckpointSave <- function(path, value) {
+  tmp <- paste0(path, '.tmp')
+  saveRDS(value, tmp)
+  if (!file.rename(tmp, path)) {
+    file.copy(tmp, path, overwrite = TRUE)
+    unlink(tmp)
+  }
+  invisible(path)
+}
+
+# An edited model prepared as the current fit was, on `cores`, and not fitted:
+# the ctFit arguments and the raw parameter names.
+.ctImproveSpec <- function(current, model, data, cores, args = NULL) {
+  extra <- args
+  args <- .ctFitReplayArgs(current)
+  if (length(extra)) args <- utils::modifyList(args, extra)
+  args$model <- model
+  args$datalong <- data
+  args$cores <- cores
+  args$verbose <- 0
+  if (is.list(args$optimcontrol)) args$optimcontrol$callback <- NULL
+  args$fit <- FALSE
+  args$inits <- NULL
+  spec <- suppressMessages(suppressWarnings(do.call(ctFit, args)))
+  list(args = args, spec = spec, names = as.character(.ctBackendRawParameterNames(
+    list(model_spec = spec), .ctBackendNpar(spec))))
+}
+
+# The raw start for a new random effect's population sd: the heterogeneity
+# test's one-step sd, through the inverse of the model's sd transform
+# (`log1p_exp(2 * raw - 1) * sdscale`), floored so the optimiser does not start
+# on the boundary where the sd's gradient vanishes.
+.ctImprovePopsdStart <- function(model, par, sd) {
+  sdscale <- suppressWarnings(as.numeric(model$pars$sdscale[.ctParamRows(model, par)]))
+  if (!is.finite(sdscale) || sdscale <= 0) sdscale <- 1
+  s <- max(if (is.finite(sd)) sd else 0, 0.05) / sdscale
+  setNames((log(expm1(s)) + 1) / 2, paste0('popsd_', par))
+}
+
+.ctImproveCompare <- function(current, refit, criterion, alpha) {
+  bad <- function(note) list(accept = FALSE, dloglik = NA_real_, dpar = NA_integer_,
+    value = NA_real_, score = -Inf, note = note)
+  if (inherits(refit, 'try-error')) return(bad(paste('failed:',
+    trimws(conditionMessage(attr(refit, 'condition'))))))
+  # The maximised values: a model that contains another cannot end below it on
+  # those, which the check's integrals, each a draw from its own error, need
+  # not keep (`.ctFitOptimisedLoglik()`).
+  ll0 <- .ctFitOptimisedLoglik(current); ll1 <- .ctFitOptimisedLoglik(refit)
+  k0 <- length(.ctFitRawEstimate(current)); k1 <- length(.ctFitRawEstimate(refit))
+  dll <- ll1 - ll0; dk <- k1 - k0
+  if (!is.finite(dll)) return(bad('log likelihood not finite'))
+  # A model that contains the current one cannot fit worse at its optimum: a
+  # refit that ends below it stopped short, and says nothing about the change.
+  if (dk > 0 && dll < -0.01 * max(1, sqrt(abs(ll0)) / 10)) {
+    out <- bad(sprintf(paste('ended %.3g below the model it extends: not an optimum,',
+      'so no evidence either way'), -dll))
+    out$dloglik <- dll; out$dpar <- dk
+    return(out)
+  }
+  n <- .ctFitNsubjects(current)
+  if (criterion == 'LR' && dk > 0) {
+    p <- stats::pchisq(2 * dll, dk, lower.tail = FALSE)
+    return(list(accept = p < alpha, dloglik = dll, dpar = dk, value = p,
+      score = -log(p), note = sprintf('LR p = %.3g against %.3g', p, alpha)))
+  }
+  penalty <- if (criterion == 'BIC') log(n) else 2
+  delta <- -2 * dll + penalty * dk
+  list(accept = delta < 0, dloglik = dll, dpar = dk, value = delta, score = -delta,
+    note = sprintf('%s change %.3g', if (criterion == 'BIC') 'BIC' else 'AIC', delta))
+}
+
+#' Plot a model improvement search
+#'
+#' The search's path: one row per refit, in the order tried, from the log
+#' likelihood its round started at to the one the refit reached, both as
+#' gained over the starting fit; kept changes filled, rejected ones open.
+#' Pruning's decisions are in the subtitle.
+#'
+#' @param x A \code{ctModelImprove}.
+#' @param ... Unused.
+#' @return A ggplot.
+#' @export
+plot.ctModelImprove <- function(x, ...) {
+  h <- x$history
+  h <- h[!is.na(h$round) & is.finite(h$dloglik), , drop = FALSE]
+  if (!nrow(h)) stop("The search refitted nothing.", call. = FALSE)
+  # The gain before each round, from the changes kept in the rounds before it.
+  rounds <- sort(unique(h$round))
+  keptgain <- vapply(rounds, function(r) sum(h$dloglik[h$round == r & h$kept]), 0)
+  before <- stats::setNames(c(0, cumsum(keptgain))[seq_along(rounds)], rounds)
+  h$from <- before[as.character(h$round)]
+  h$gain <- h$from + h$dloglik
+  labels <- make.unique(paste0(h$round, '. ', h$change))
+  h$label <- factor(labels, levels = rev(labels))
+  pr <- x$history[x$history$family %in% 'prune', , drop = FALSE]
+  sub <- if (nrow(pr)) paste0('Pruning dropped ', sum(pr$kept), ' of ', nrow(pr),
+    ' changes') else NULL
+  ggplot(h, aes(y = .data$label)) +
+    geom_segment(aes(x = .data$from, xend = .data$gain, yend = .data$label,
+      linetype = .data$kept), colour = 'grey50') +
+    geom_point(aes(x = .data$gain, shape = .data$kept), size = 2.5) +
+    scale_shape_manual(values = c(`FALSE` = 1, `TRUE` = 16),
+      labels = c(`FALSE` = 'rejected', `TRUE` = 'kept'), name = NULL) +
+    scale_linetype_manual(values = c(`FALSE` = 'dotted', `TRUE` = 'solid'), guide = 'none') +
+    scale_y_discrete(labels = function(k) vapply(k, function(s)
+      paste(strwrap(s, 45), collapse = '\n'), '')) +
+    labs(x = 'Log likelihood gained over the starting fit', y = NULL,
+      title = paste0('Search: ', x$stopped), subtitle = sub) +
+    theme_bw() + theme(plot.title.position = 'plot', legend.position = 'bottom')
+}
+
+#' @export
+print.ctModelImprove <- function(x, digits = 3, ...) {
+  cat("Model improvement: stopped because ", x$stopped, "\n", sep = "")
+  # With held-out subjects the start and the search's result are fits to the
+  # subjects searched on, and the final fit is to every subject: compare the
+  # first two.
+  end <- if (is.null(x$selected)) x$fit else x$selected
+  cat("Log likelihood ", signif(x$start$estimate$loglik, 7), " -> ",
+    signif(end$estimate$loglik, 7), " (", length(.ctFitRawEstimate(x$start)), " -> ",
+    length(.ctFitRawEstimate(end)), " parameters)",
+    if (!is.null(x$selected)) paste0(", on the ", .ctFitNsubjects(x$start),
+      " subjects searched"), "\n\n", sep = "")
+  if (nrow(x$history)) {
+    h <- x$history
+    h[c('screen_p', 'dloglik', 'criterion')] <- lapply(h[c('screen_p', 'dloglik', 'criterion')],
+      signif, digits)
+    h$round <- ifelse(is.na(h$round), 'prune', as.character(h$round))
+    names(h)[names(h) == 'kept'] <- 'done'
+    print(h[, c('round', 'change', 'screen_p', 'dloglik', 'dpar', 'done', 'note')],
+      row.names = FALSE)
+  }
+  if (!is.null(x$confirmation)) {
+    cat("\nConfirmed on ", length(x$holdout), " held-out subjects:\n", sep = "")
+    cf <- x$confirmation
+    cf[c('dloglik', 'p')] <- lapply(cf[c('dloglik', 'p')], signif, digits)
+    print(cf[, c('change', 'dloglik', 'dpar', 'p', 'confirmed')], row.names = FALSE)
+  }
+  if (!is.null(x$adequacy)) { cat("\n"); print(x$adequacy) }
+  invisible(x)
+}

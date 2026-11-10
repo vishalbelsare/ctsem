@@ -1,0 +1,1503 @@
+"""
+state_sampling.jl
+
+The state-explicit path: latent states are *sampled* rather than integrated
+out, which is what ctsem's `intoverstates=FALSE` asks for.
+
+# What this is an alternative to
+
+Everything else in this engine marginalises the latent states as it goes. The
+EKF carries a Gaussian `(mean, covariance)` and, at each row, replaces it with
+the moments of the posterior given that row's observation. For a Gaussian
+indicator that update is exact. For a categorical one it is an *assumed
+density* step: the true conditional is not Gaussian, so the filter integrates
+the observation against the predicted state (`binary_measurement.jl`) and then
+projects the answer back onto a Gaussian. The result is a legitimate
+approximate marginal likelihood, and generation through it draws from that
+approximation -- the density the fit maximises, which is why the round trip in
+`kalman_trace.jl` holds exactly.
+
+It is not, however, the model. A count observation far into its own tail moves
+the projected state a long way, the next row's rate is larger still, and the
+walk can run away; bounded indicators (binary, ordinal) hide it because their
+support does not change with the state. Nothing here can do that, because
+nothing here conditions the state on an observation at all.
+
+# The parameterisation
+
+States are built from standard normal *innovations*, not sampled directly:
+
+    eta_1 = T0MEANS + M0 z_1,             M0 M0' = T0VAR
+    eta_t = A_dt eta_{t-1} + b_dt + L z_t, L L'  = Q_dt
+
+so the joint density of everything the model does not observe is
+
+    log p(y, z | theta) = sum_t log p(y_t | eta_t(z, theta))
+                          - z'z / 2 - dim(z) / 2 log 2pi
+
+with `p(y_t | eta_t)` the *conditional* observation model: Gaussian for a
+Gaussian indicator, Bernoulli for a binary one, cumulative logit for an
+ordinal, Poisson for a count, Tobit for a censored one. Every one of those
+already exists as `_category_loglikelihood`, evaluated at a known linear
+predictor -- which is exactly what a sampled state provides.
+
+This is the non-centred form, and it is the right one for three separate
+reasons. It needs no inverse and no determinant of the process noise, so a
+singular one -- every `intoverpop='augmented'` model has one, and so does any
+model with a DIFFUSION entry fixed at zero -- is not a special case but simply
+a direction the innovation cannot move. It is the parameterisation a
+Hamiltonian sampler needs, for the reason `sample_density.jl` gives about the
+random effects. And it is what generation wants anyway: draw the innovations,
+walk the trajectory forward, draw the observations given the states.
+
+It is also, deliberately, the object the generated Stan model builds for
+`intoverstates=0`, where `etaupdbasestates` is standard normal and the states
+are reconstructed from it.
+
+# One innovation per substep, not per row
+
+`max_timestep` splits a long interval into bounded substeps and re-materialises
+the local affine model at each one. For a nonlinear model those substeps *are*
+the process, so each gets its own innovation: putting a single innovation at
+the end of the interval would run a deterministic trajectory through a
+state-dependent drift and perturb it afterwards, which is a different process.
+The count is deterministic given the data, so `ctsem_state_dimension` reports
+it and the caller draws that many standard normals -- rather than both sides
+recomputing the substep arithmetic and eventually disagreeing about it.
+
+With no `maxtimestep` set, which is the ordinary case, this is one innovation
+per row and the arithmetic disappears.
+
+# What is drawn where
+
+Only the caller has a random number generator. Every standard normal arrives
+from outside, as it does for `ctsem_generate`, so `set.seed()` in R governs
+generation completely.
+"""
+
+using LinearAlgebra, DiffResults
+
+export ctsem_state_dimension, ctsem_state_layout, ctsem_joint_loglikelihood,
+    ctsem_joint_evaluate, ctsem_generate_states
+
+"""
+Poisson rate above which a count is drawn from its normal approximation rather
+than by inverting its distribution function.
+
+Inversion walks upward one value at a time, so its cost is the value drawn, and
+its first term `exp(-lambda)` underflows to zero at `lambda = 745` -- which
+makes the walk not merely slow but wrong. The normal approximation has skewness
+`1/sqrt(lambda)`, so at five hundred it is 0.045, far finer than the gap
+between two adjacent counts out there.
+
+Both forms are driven by the *same* standard normal, one through `Phi` and one
+directly, so the value drawn moves continuously as a rate crosses the boundary
+instead of jumping.
+"""
+const _CTSEM_POISSON_NORMAL_RATE = Ref(500.0)
+
+"""
+    _ctsem_normal_cdf(z)
+
+`Phi(z)`, from `erfc` rather than from the rational approximation
+`_standard_normal_cdf` uses.
+
+That one is accurate to 8e-8 absolute, which is ample against a Bernoulli
+threshold and is not ample for inverting a count distribution: once the rate is
+large enough that individual masses are smaller than 8e-8, that much misplaced
+probability is a whole category. `erfc` is already a dependency here
+(`_norm_logcdf` is written with `logerfc`), so the accurate form is free.
+"""
+@inline _ctsem_normal_cdf(z::Real) = erfc(-z / sqrt(oftype(float(z), 2))) / 2
+
+"""
+    _ctsem_substeps(dt, rule, t)
+
+Number of prediction substeps for the interval `dt` ending at row `t`.
+
+`rule` is either `maxtimestep` (a positive real: the interval is split into
+steps no longer than it) or a mesh, an integer vector with one entry per row
+giving the count directly. The mesh is what `ctsem_auto_substeps` produces;
+it travels in the same slot as the rule so every consumer of the objective --
+the filter, the tape, the state-explicit dimension count, generation -- sees
+one policy without a second code path.
+"""
+@inline _ctsem_substeps(dt, rule::Real, t::Int) = max(1, ceil(Int, dt / rule))
+@inline _ctsem_substeps(dt, mesh::AbstractVector, t::Int) = Int(mesh[t])
+
+"""NaN, for the reason `_invalid_ekf_loglikelihood` is NaN."""
+@inline _ctsem_invalid(::Type{T}) where {T} = -one(T) * NaN
+
+"""
+    _ctsem_lower_chol!(L, d)
+
+Overwrite the leading `d` by `d` block of `L` with a lower-triangular factor
+satisfying `L L' = A`, and report whether every pivot was positive.
+
+Unlike `_ctsem_cholesky!` this does not give up on a non-positive pivot: it
+zeroes that column and carries on, which produces a valid factor of a
+*positive semi-definite* matrix. That is what the state path needs. A process
+noise covariance is legitimately singular whenever a state has no diffusion of
+its own -- every augmented random-effect coordinate, and any model with a
+DIFFUSION entry fixed at zero -- and the right behaviour there is an innovation
+direction with no effect, not a failure.
+
+The flag still matters, because a *density* over a singular Gaussian block does
+not exist: the observation model uses it to refuse, while generation ignores it
+and draws from the degenerate distribution, which is perfectly well defined.
+
+Only the lower triangle is written and only the lower triangle is read.
+"""
+function _ctsem_lower_chol!(L::AbstractMatrix{T}, d::Int) where {T}
+    definite = true
+    @inbounds for j in 1:d
+        s = L[j, j]
+        for p in 1:(j - 1)
+            s -= L[j, p] * L[j, p]
+        end
+        # Value-only comparison, as everywhere else in this engine: a Dual
+        # orders on its value, so the branch a gradient takes is the branch the
+        # primal took.
+        if s > zero(real(T))
+            u = sqrt(s)
+            L[j, j] = u
+            for i in (j + 1):d
+                v = L[i, j]
+                for p in 1:(j - 1)
+                    v -= L[i, p] * L[j, p]
+                end
+                L[i, j] = v / u
+            end
+        else
+            definite = false
+            L[j, j] = zero(T)
+            for i in (j + 1):d
+                L[i, j] = zero(T)
+            end
+        end
+    end
+    return definite
+end
+
+"""
+    _ctsem_mvn_logpdf(L, resid, scratch, d, log2pi)
+
+`log N(resid; 0, L L')` by forward substitution, for lower-triangular `L`.
+"""
+@inline function _ctsem_mvn_logpdf(L::AbstractMatrix{T}, resid, scratch, d::Int,
+    log2pi) where {T}
+    quad = zero(T)
+    logdet_half = zero(T)
+    @inbounds for i in 1:d
+        acc = resid[i]
+        for j in 1:(i - 1)
+            acc -= L[i, j] * scratch[j]
+        end
+        scratch[i] = acc / L[i, i]
+        quad += scratch[i] * scratch[i]
+        logdet_half += log(L[i, i])
+    end
+    return -quad / 2 - logdet_half - d * log2pi / 2
+end
+
+"""
+    _ctsem_sdcor_factor!(dest, mat, buffer, dim)
+
+The factor `M` with `M M'` equal to `sdcovsqrt2cov(mat)`, written to `dest`.
+
+The same two lines `sdcovsqrt2cov!` uses to *form* the covariance, stopped one
+step earlier: it builds `M` from the standard deviations on the diagonal and
+the constrained correlation square root, then returns `M M'`. So this is not an
+approximation of that covariance nor a re-factorisation of it -- it is the
+factor the covariance was built from, which means a state drawn through it has
+exactly the covariance `sdcovsqrt2cov` would have formed, and a zero standard
+deviation gives a zero row rather than a failed Cholesky.
+
+That is the covariance the filter carries only when the model has no population
+block. Where one exists the filter writes it over the carrier states' rows and
+columns afterwards, so an initial state belongs to `_ctsem_t0_factor!`
+(kalman_filters.jl) and not to this function.
+
+Reading it out of `sdcovsqrt2cov!`'s own scratch buffer would work today and
+would break silently the first time that function reuses the buffer.
+"""
+@inline function _ctsem_sdcor_factor!(dest, mat, buffer, dim::Int)
+    d = dim
+    constraincorsqrt1_vec!(buffer, mat, 1e-5, dim)
+    @inbounds for j in 1:d, i in 1:d
+        dest[i, j] = mat[i, i] * buffer.out[i, j]
+    end
+    return dest
+end
+
+"""State-only form of `_apply_td_impulse!`: there is no covariance to carry."""
+@inline function _ctsem_td_impulse!(ws, pars, tdpreds)
+    isempty(tdpreds) && return nothing
+    # The hand kernel, as `_apply_td_impulse!`: a runtime `Val` boxed both views.
+    _ctsem_mulvec!(ws.bufferQ.r, pars.TDPREDEFFECT, tdpreds)
+    ws.state .+= ws.bufferQ.r
+    return nothing
+end
+
+# A pass that draws the states -- the state-explicit pass and the particle
+# filter -- advances them through the filter's row contract step for step
+# (`_ctsem_state_pass!`'s docstring says why the order matters). The steps are
+# here once; the two passes differ in where the noise comes from (a vector of
+# innovations, or a particle's own draws) and in what they do at a row.
+
+"""
+    _ctsem_state_initial!(factor, ws, pars, all_params, sp, tdpreds, tipreds,
+                          time, subject)
+
+The initial state's factor into `factor`, for drawing the initial state as
+T0MEANS plus `factor` times standard normals (`_ctsem_initial_draw!`).
+Through `_ctsem_t0_factor!` rather than straight from T0VAR, so that a model
+carrying random effects as augmented states draws them -- see that function
+for what building it from T0VAR alone silently did. A stationary model runs
+the predict group first, as the filter does, so the stationary moments read
+DRIFT, CINT and DIFFUSION at their values; they read no state, so the
+placeholder one is harmless.
+"""
+@inline function _ctsem_state_initial!(factor, ws, pars,
+    all_params::AbstractVector{T}, sp, tdpreds, tipreds, time, subject::Int) where {T}
+    if sp.stationary || _stationary_elements_on(sp.stationary_elements)
+        copyto!(ws.state, pars.T0MEANS)
+        apply_complex_transforms_at_indices!(all_params, ws.predict_param_indices,
+            sp.predict_transforms, CTSEMRowContext(ws.state, pars,
+                view(tdpreds, :, 1), tipreds, time, zero(T), subject, 1))
+    end
+    _ctsem_t0_factor!(factor, ws, pars, all_params, sp.stationary,
+        sp.stationary_elements)
+    return factor
+end
+
+"""T0MEANS plus `factor` times `z[at + 1:at + n]`, into `dest`."""
+@inline function _ctsem_initial_draw!(dest, pars, factor, z, at::Int, n::Int,
+    ::Type{T}) where {T}
+    @inbounds for i in 1:n
+        acc = T(pars.T0MEANS[i])
+        for j in 1:n
+            acc += factor[i, j] * T(z[at + j])
+        end
+        dest[i] = acc
+    end
+    return dest
+end
+
+"""
+    _ctsem_state_row_groups!(ws, pars, all_params, sp, tdpreds, tipreds, time,
+                             dt, subject, t)
+
+At row `t`, once the state is there: the time-dependent group, the TD
+impulse, and the update group, at the state the impulse leaves. `tdpreds` is
+the row's column.
+"""
+@inline function _ctsem_state_row_groups!(ws, pars, all_params, sp, tdpreds, tipreds,
+    time, dt, subject::Int, t::Int)
+    context = CTSEMRowContext(ws.state, pars, tdpreds, tipreds, time, dt, subject, t)
+    apply_complex_transforms_at_indices!(all_params, ws.td_param_indices,
+        sp.td_transforms, context)
+    _ctsem_td_impulse!(ws, pars, context.tdpreds)
+    apply_complex_transforms_at_indices!(all_params, ws.update_param_indices,
+        sp.update_transforms, context)
+    return nothing
+end
+
+"""
+    _ctsem_state_first_row!(ws, pars, all_params, sp, tdpreds, tipreds, time,
+                            dt, subject)
+
+Row 1's groups: all three, in the loop's own order, even though row 1 has no
+interval to predict over, since a group supplies *values* as well as a
+prediction. PARS is in the predict group, and an update-group or td-group
+cell -- LAMBDA, MANIFESTMEANS, MANIFESTVAR, Jy, TDPREDEFFECT, Jtd -- may be
+written by a transform that reads one. Running td and update only left that
+read pointing at a parameter slot nothing had written, so it took the zero
+the buffer is filled with: 6.0 log units on one row of a LAMBDA-reads-PARS
+model, and this is the path `intoverstates` takes for a categorical model.
+The filter's row 1 carries the same three groups in the same order. The
+interval `dt` is zero, which no predict-group transform can object to:
+generate_complex_transform_string substitutes only state, PARS and the model
+matrices, so no transform expression can reference the context's interval or
+time.
+"""
+@inline function _ctsem_state_first_row!(ws, pars, all_params, sp, tdpreds, tipreds,
+    time, dt, subject::Int)
+    apply_complex_transforms_at_indices!(all_params, ws.predict_param_indices,
+        sp.predict_transforms, CTSEMRowContext(ws.state, pars, tdpreds, tipreds,
+            time, dt, subject, 1))
+    _ctsem_state_row_groups!(ws, pars, all_params, sp, tdpreds, tipreds, time, dt,
+        subject, 1)
+    return nothing
+end
+
+"""
+    _ctsem_state_substep!(ws, pars, all_params, sp, tdpreds, tipreds, time, h,
+                          subject, t, transition, qfactor, z, at, T)
+
+One substep of length `h` ending at `time`, towards row `t`: the predict
+group at the state, the diffusion's covariance, the step, and the process
+noise from `z[at + 1:at + k]`, `k` the diffusing states. Returns `at + k`.
+
+Euler-Maruyama (`transition = :euler`, continuous time) is `x += f(x) h + L
+sqrt(h) z` with `L L'` the diffusion covariance at `x`: no exponential and no
+Lyapunov solve, so nothing is linearised over the step -- a reference that
+shares no approximation with the filter's mean step. It needs a finer mesh
+than the exponential step for the same accuracy, and is stable only for `h`
+below 2 over the largest drift eigenvalue. Otherwise the filter's
+discretisation at the state, and noise over the diffusing states only:
+everything else is a static coordinate whose covariance the filter propagates
+through the transition alone, and which correspondingly gets no innovation of
+its own here.
+"""
+@inline function _ctsem_state_substep!(ws, pars, all_params, sp, tdpreds, tipreds,
+    time, h, subject::Int, t::Int, transition::Symbol, qfactor, z, at::Int,
+    ::Type{T}) where {T}
+    n = ws.state_dim
+    indices = ws.diffusion_state_indices
+    k = length(indices)
+    apply_complex_transforms_at_indices!(all_params, ws.predict_param_indices,
+        sp.predict_transforms, CTSEMRowContext(ws.state, pars, tdpreds, tipreds,
+            time, h, subject, t))
+    ContinuousTimeSEM.sdcovsqrt2cov!(ws.bufferQ, pars.DIFFUSION, ws.sp.covmatcode,
+        ws.state_dim)
+    if transition === :euler && ws.continuous_time
+        _ctsem_mulvec!(ws.bufferQ.r, pars.DRIFT, ws.state)
+        for i in 1:n
+            ws.state[i] += (ws.bufferQ.r[i] + pars.CINT[i]) * h
+        end
+        _ctsem_add_process_noise!(ws.state, indices, qfactor, ws.bufferQ.out, z, at, k,
+            sqrt(h), T)
+        return at + k
+    end
+    if ws.continuous_time
+        _compute_discrete_time_form!(ws.discrete_ca, ws.bufferQ, ws.bufferQ.out, pars, h,
+            ws.exp_buffer, ws.lyap_buffer, ws.state, indices, ws.diffusion_buffer,
+            ws.discretization_buffer, ws.state_dim, ws.discretization_cache,
+            ws.affine_buffer)
+    else
+        _compute_one_step_form!(ws.discrete_ca, ws.bufferQ.out, pars, ws.state, indices,
+            ws.state_dim)
+    end
+    _ctsem_deterministic_step!(ws, n)
+    _ctsem_add_process_noise!(ws.state, indices, qfactor, ws.discrete_ca.dDIFFUSION, z,
+        at, k, one(T), T)
+    return at + k
+end
+
+
+################################################################################
+# Layout
+################################################################################
+
+"""
+    CTSEMStateLayout
+
+Where each subject's innovations and data columns sit, and how many there are
+in total.
+
+The innovation count is a property of the *design* -- the observation times and
+`maxtimestep` -- and not of the parameters, so it is computed once and holds
+for every evaluation of a given objective.
+"""
+struct CTSEMStateLayout
+    nlatent::Int
+    ndiffusion::Int
+    nmanifest::Int
+    nrows::Int
+    ndim::Int
+    zoffsets::Vector{Int}
+    rowoffsets::Vector{Int}
+end
+
+function _ctsem_subject_innovations(sub, nlatent::Int, ndiffusion::Int)
+    timesteps = sub.timesteps
+    nsteps = min(length(timesteps), size(sub.data, 2))
+    total = nlatent
+    prev = timesteps[1]
+    @inbounds for t in 2:nsteps
+        dt = timesteps[t] - prev
+        total += ndiffusion * _ctsem_substeps(dt, sub.max_timestep, t)
+        prev = timesteps[t]
+    end
+    return total
+end
+
+function _ctsem_state_layout(objective::CTSEMObjective)
+    sp = objective.params
+    pars = CTSEMPars(zeros(Float64, length(sp.mutables)), sp.parameter_axis)
+    nlatent = size(pars.DRIFT, 1)
+    nmanifest = size(pars.LAMBDA, 1)
+    ndiffusion = isempty(sp.diffusion_state_indices) ? nlatent :
+        length(sp.diffusion_state_indices)
+    subjects = objective.subject_objectives
+    zoffsets = Vector{Int}(undef, length(subjects))
+    rowoffsets = Vector{Int}(undef, length(subjects))
+    at = 0
+    rows = 0
+    for (i, sub) in enumerate(subjects)
+        zoffsets[i] = at
+        rowoffsets[i] = rows
+        at += _ctsem_subject_innovations(sub, nlatent, ndiffusion)
+        rows += size(sub.data, 2)
+    end
+    return CTSEMStateLayout(nlatent, ndiffusion, nmanifest, rows, at, zoffsets,
+        rowoffsets)
+end
+
+"""
+    ctsem_state_dimension(objective)
+
+How many standard normal innovations the state path needs for this design.
+
+`nlatent` for each subject's first row, and one per diffusing state per
+bounded substep thereafter. The caller draws exactly this many and hands them
+back; nothing on this side has an RNG.
+"""
+ctsem_state_dimension(objective::CTSEMObjective) =
+    _ctsem_state_layout(objective).ndim
+
+"""
+    ctsem_state_layout(objective)
+
+Where each subject's innovations sit inside the vector `ctsem_generate_states`
+takes, so that a caller can hold part of a draw fixed and redraw the rest.
+
+Returns `ndim` (the whole length, as `ctsem_state_dimension` reports it),
+`nlatent` (the augmented state dimension), `ndiffusion`, and the zero-based
+`zoffsets` and `rowoffsets` of each subject's block. Subject `i` owns the
+entries from `zoffsets[i] + 1`, and the first `nlatent` of those are its
+initial state draw: the pass forms `T0MEANS + factor * z` from them, `factor`
+being the T0VAR factor, before any innovation is used.
+
+That is what a caller needs to draw one person and several paths for it. An
+individually varying parameter is carried as a state with no drift and no
+diffusion, so pinning the carrier entries of a subject's initial block and
+redrawing everything after them gives the same person a second trajectory.
+Holding those entries fixed pins the carrier *values* only when T0VAR has no
+covariance between the dynamic states and the carriers, since the factor is
+triangular; the caller is responsible for checking that, and
+ctVarianceDecomposition() in the R package does.
+"""
+function ctsem_state_layout(objective::CTSEMObjective)
+    layout = _ctsem_state_layout(objective)
+    return (ndim = layout.ndim, nlatent = layout.nlatent,
+        ndiffusion = layout.ndiffusion, nmanifest = layout.nmanifest,
+        nrows = layout.nrows, zoffsets = layout.zoffsets,
+        rowoffsets = layout.rowoffsets)
+end
+
+
+################################################################################
+# Generation record
+################################################################################
+
+"""
+    CTSEMStateGenerate(base, out, states, llrow)
+
+The generation half of the state pass.
+
+`base` is `nmanifest` by `nrows` standard normals, used exactly as
+`CTSEMGenerateSpec` uses them -- one entry per manifest cell, turned into a
+uniform where the draw needs one. `out` receives the generated observations and
+keeps `NaN` wherever the skeleton had no observation, `states` receives the
+sampled latent state at each row, and `llrow` each row's *conditional* log
+likelihood given that state.
+
+`llrow` is therefore not comparable with the `llrow` `ctsem_generate` returns:
+that one is a marginal one-step-ahead density, this one conditions on the state
+that produced the row. It is `NaN` for a row whose Gaussian block is singular,
+which is a real answer rather than an error -- with no measurement error a
+Gaussian indicator is a deterministic function of the state, so the draw exists
+and its density with respect to Lebesgue measure does not.
+"""
+mutable struct CTSEMStateGenerate
+    base::Matrix{Float64}
+    out::Matrix{Float64}
+    states::Matrix{Float64}
+    llrow::Vector{Float64}
+    offset::Int
+    rng::MersenneTwister
+end
+
+CTSEMStateGenerate(base, out, states, llrow) =
+    CTSEMStateGenerate(base, out, states, llrow, 0, MersenneTwister(0))
+
+"""
+    _ctsem_draw_count(rate, u, z)
+
+One Poisson draw, by inverting the distribution function below
+`_CTSEM_POISSON_NORMAL_RATE` and from the normal approximation above it.
+
+Inversion is exact and needs no rejection step, which is what keeps a draw
+reproducible from the caller's standard normal alone.
+"""
+function _ctsem_draw_count(rate::T, u::T, z::T) where {T}
+    if !(rate < T(_CTSEM_POISSON_NORMAL_RATE[]))
+        return max(zero(T), round(rate + sqrt(rate) * z))
+    end
+    p = exp(-rate)
+    cumulative = p
+    k = 0
+    limit = _CTSEM_COUNT_GENERATE_MAX[]
+    while cumulative < u && k < limit
+        k += 1
+        p *= rate / k
+        cumulative += p
+    end
+    return T(k)
+end
+
+"""
+    _ctsem_state_loglikelihood(eta, y, thresholds, kind)
+
+`log P(y | state)` for one non-Gaussian observation on the state-explicit path.
+
+The same density the filter integrates, at a state that is known rather than
+predicted -- so for every kind but one there is nothing left to integrate and
+this is `_category_loglikelihood` unchanged. The exception is a count carrying a
+dispersion: that term is not part of the state, so knowing the state does not
+remove it and `y | x` stays a Poisson-lognormal mixture. It is then the same
+scalar quadrature the filter uses, over the dispersion alone.
+"""
+@inline function _ctsem_state_loglikelihood(eta::T, y::Real, thresholds,
+    kind::Int) where {T}
+    if kind == CTSEM_OBS_COUNT
+        σc = _count_dispersion(thresholds, T)
+        if σc > zero(σc)
+            nodes, weights = _binary_rule()
+            logZ, _, _ = _binary_moments(promote(eta, σc)..., y, nodes,
+                weights, (), kind)
+            return logZ
+        end
+    end
+    return _category_loglikelihood(eta, y, thresholds, kind)
+end
+
+"""
+    _ctsem_draw_categorical(gen, eta, row, col, thresholds, kind)
+
+One non-Gaussian observation drawn from its conditional distribution given the
+state, through the standard normal the caller supplied for this cell.
+
+Inverting the *conditional* distribution rather than the marginal one: the state
+is known here, so for every kind but one there is nothing to integrate and no
+quadrature is involved. That is the difference from `_generate_binary!`, which
+has to integrate the state's own uncertainty out before it can invert anything.
+The exception is an overdispersed count, whose dispersion survives knowing the
+state -- see `_ctsem_state_loglikelihood`, which scores what this draws.
+"""
+function _ctsem_draw_categorical(gen::CTSEMStateGenerate, eta::T, row::Int,
+    col::Int, thresholds, kind::Int) where {T}
+    z = T(gen.base[row, col])
+    u = _ctsem_normal_cdf(z)
+    if kind == CTSEM_OBS_COUNT
+        # With a dispersion the conditional is a Poisson-lognormal, which needs
+        # two sources of randomness where this cell's deviate is one. The second
+        # comes from `gen.rng`, seeded in R, which is what lets this be the two
+        # stages the distribution is actually defined by -- the predictor, then
+        # the count given it -- rather than a walk inverting the mixture. The
+        # walk that stood here cost a Gauss-Hermite quadrature per value and
+        # could not be sized without converting a rate of up to `exp(200)` to an
+        # `Int`, which is the `InexactError` this route inherited from the
+        # filter route's copy of it.
+        #
+        # Without a dispersion there is nothing to mix over: the conditional is
+        # a plain Poisson and the cell's own deviate is the whole of it, so the
+        # stream is not touched and an existing count model generates exactly
+        # what it generated before.
+        #
+        # The *density* a few lines up stays a quadrature over the dispersion,
+        # and that is not an inconsistency with drawing in two stages here.
+        # Generating gets to choose epsilon and then report the count it
+        # implies; scoring an observed count does not know which epsilon
+        # produced it and has to integrate over all of them.
+        σc = _count_dispersion(thresholds, T)
+        σc > zero(σc) || return _ctsem_draw_count(
+            exp(min(eta, T(_CTSEM_COUNT_MAX_LOG_RATE[]))), u, z)
+        η = eta + σc * z
+        return _ctsem_draw_count(exp(min(η, T(_CTSEM_COUNT_MAX_LOG_RATE[]))),
+            rand(gen.rng), randn(gen.rng))
+    elseif kind == CTSEM_OBS_CENSORED
+        lower, upper, sd = _censor_limits(thresholds, T)
+        half, power = _censor_response(thresholds, T)
+        return _censored_record(eta + sd * z, lower, upper, half, power)
+    elseif kind == CTSEM_OBS_BINARY || isempty(thresholds)
+        # `(0, 1)` when the item has no asymptotes, so this is the plain
+        # Bernoulli draw; with them it is the three or four parameter response
+        # probability, which generation has to honour or the data would come
+        # from a different model than the one that is fitted to it.
+        c, d = _binary_asymptotes(thresholds, T)
+        return u < c + (d - c) * inv(one(T) + exp(-eta)) ? one(T) : zero(T)
+    end
+    # Cumulative logit, the same identity `_category_loglikelihood` evaluates:
+    # P(y <= k) is the logistic CDF at `thresholds[k] - eta`. The thresholds
+    # arrive already cumulated and so are increasing, which makes this walk a
+    # single pass.
+    K = length(thresholds) + 1
+    @inbounds for k in 1:(K - 1)
+        u < inv(one(T) + exp(eta - thresholds[k])) && return T(k)
+    end
+    return T(K)
+end
+
+
+################################################################################
+# The pass
+################################################################################
+
+"""
+    _ctsem_state_row!(ws, pars, data, col, buffers..., gen)
+
+One row: the conditional log likelihood of its observations given the sampled
+state, drawing them first when generating.
+
+Gaussian indicators are handled as one block, because their measurement errors
+are correlated through MANIFESTVAR; every other kind is scalar given the state
+and is handled on its own. Only the observed entries take part, and generation
+writes only where an observation already exists -- the same contract
+`_generate_row!` follows, so a generated dataset keeps the missingness pattern
+it was given.
+"""
+function _ctsem_state_row!(ws, pars, data::AbstractMatrix, col::Int,
+    pred::AbstractVector{T}, theta::AbstractMatrix{T}, chol::AbstractMatrix{T},
+    resid::AbstractVector{T}, scratch::AbstractVector{T},
+    gaussian::AbstractVector{Int}, log2pi, gen) where {T}
+
+    m = ws.manifest_dim
+    n = ws.state_dim
+    types = ws.sp.manifesttype
+    row = gen === nothing ? col : gen.offset + col
+
+    # The linear predictor. `pars.LAMBDA` rather than `pars.Jy`, matching the
+    # filter's own distinction: LAMBDA evaluated at the current state gives the
+    # manifest mean, and the Jacobian exists only to propagate a covariance --
+    # of which there is none here.
+    @inbounds for i in 1:m
+        acc = pars.MANIFESTMEANS[i]
+        for j in 1:n
+            acc += pars.LAMBDA[i, j] * ws.state[j]
+        end
+        pred[i] = acc
+    end
+
+    ContinuousTimeSEM.sdcovsqrt2cov!(ws.bufferΘ, pars.MANIFESTVAR, ws.sp.covmatcode,
+        ws.manifest_dim)
+    @inbounds for j in 1:m, i in 1:m
+        theta[i, j] = ws.bufferΘ.out[i, j]
+    end
+
+    total = zero(T)
+    ngauss = 0
+    @inbounds for i in 1:m
+        _ctsem_observed(data[i, col]) || continue
+        kind = i <= length(types) ? types[i] : 0
+        if kind == 0
+            ngauss += 1
+            gaussian[ngauss] = i
+            continue
+        end
+        thresholds = _ordinal_thresholds!(ws, pars, i)
+        y = gen === nothing ? data[i, col] :
+            _ctsem_draw_categorical(gen, pred[i], i, row, thresholds, kind)
+        gen === nothing || (gen.out[i, row] = y)
+        contribution = _ctsem_state_loglikelihood(pred[i], y, thresholds, kind)
+        # Generating, an unusable contribution is reported and stepped over:
+        # the draw itself is valid whatever its density came out as, and the
+        # remaining indicators in this row still have to be drawn. Evaluating,
+        # it ends the pass, exactly as a bad row ends the filter's.
+        if gen === nothing && !isfinite(contribution)
+            return _ctsem_invalid(T)
+        end
+        total += contribution
+    end
+
+    ngauss == 0 && return total
+
+    @inbounds for j in 1:ngauss, i in 1:ngauss
+        chol[i, j] = theta[gaussian[i], gaussian[j]]
+    end
+    definite = _ctsem_lower_chol!(chol, ngauss)
+    if gen === nothing
+        # No measurement error means no density: with the state known, the
+        # indicator is a deterministic function of it, and a point mass has no
+        # log likelihood with respect to Lebesgue measure to contribute. So a
+        # Gaussian indicator with MANIFESTVAR fixed at zero -- perfectly
+        # ordinary under the marginal filter, where the state's own uncertainty
+        # supplies the variance -- has no joint density here at all, and this
+        # is an invalid evaluation rather than a small number.
+        definite || return _ctsem_invalid(T)
+        @inbounds for i in 1:ngauss
+            resid[i] = data[gaussian[i], col] - pred[gaussian[i]]
+        end
+        return total + _ctsem_mvn_logpdf(chol, resid, scratch, ngauss, log2pi)
+    end
+
+    # The draw is `mean + L z` with `z` indexed by the Gaussian rows only, so
+    # each manifest cell's standard normal is consumed by exactly one draw --
+    # the same discipline `_generate_row!` keeps, and what stops a Gaussian
+    # indicator and a categorical one in the same row from sharing a deviate
+    # and coming out correlated.
+    @inbounds for i in 1:ngauss
+        acc = pred[gaussian[i]]
+        for j in 1:i
+            acc += chol[i, j] * T(gen.base[gaussian[j], row])
+        end
+        gen.out[gaussian[i], row] = acc
+        resid[i] = acc - pred[gaussian[i]]
+    end
+    definite || return T(NaN)
+    return total + _ctsem_mvn_logpdf(chol, resid, scratch, ngauss, log2pi)
+end
+
+"""
+The transition a state-explicit pass uses between substeps: `:exponential`
+(the filter's own discretisation applied at the sampled state -- exact for
+the linear parts of the model, second order otherwise) or `:euler`
+(Euler-Maruyama, nothing linearised over the step, needs a finer mesh). Strings
+are accepted because the selector crosses the R bridge as one.
+"""
+function _ctsem_transition(transition)
+    s = Symbol(transition)
+    s in (:exponential, :euler) ||
+        throw(ArgumentError("transition must be :exponential or :euler, got $(transition)"))
+    return s
+end
+
+"""
+    _ctsem_state_pass!(ws, params, data, timesteps, sp, tdpreds, tipreds,
+                       subject, max_timestep, z, zoffset, gen)
+
+One subject's forward pass with the states built from `z`, returning the total
+conditional log likelihood of its observations.
+
+The row contract is the filter's, step for step -- predict, time-dependent
+impulse, measurement, with the bounded substeps in between and the same three
+groups of state-dependent transforms materialised at the same three points. The
+only difference is what the state is: here it is a draw, so the transforms see
+a sampled state rather than a filtered mean, and the measurement conditions on
+it rather than updating it.
+
+Keeping that ordering identical is what makes the two paths comparable. A
+nonlinear model's parameters are functions of the state, so a pass that
+materialised them at a different point would be fitting a different model and
+would still return a perfectly plausible number.
+"""
+function _ctsem_state_pass!(ws, params::AbstractVector{T}, data::AbstractMatrix,
+    timesteps, sp, tdpreds::AbstractMatrix, tipreds::AbstractVector,
+    subject::Int, max_timestep, z::AbstractVector, zoffset::Int, gen,
+    transition::Symbol=:exponential) where {T}
+
+    _materialize_subject_values!(ws.subject_values, params, sp, tipreds)
+    _materialize_all_params!(ws.all_params, ws.subject_values, sp)
+    pars = ws.pars
+    all_params = getdata(pars)
+    all_params .= ws.all_params
+
+    n = ws.state_dim
+    m = ws.manifest_dim
+    indices = ws.diffusion_state_indices
+    k = length(indices)
+    log2pi = log(2 * T(pi))
+
+    # Allocated once per subject, not once per row: a handful of small matrices
+    # against a pass over every observation. The filter's own row loop
+    # allocates its observed-index vector on the same terms.
+    factor = Matrix{T}(undef, n, n)
+    qfactor = Matrix{T}(undef, k, k)
+    theta = Matrix{T}(undef, m, m)
+    chol = Matrix{T}(undef, m, m)
+    pred = Vector{T}(undef, m)
+    resid = Vector{T}(undef, m)
+    scratch = Vector{T}(undef, m)
+    gaussian = Vector{Int}(undef, m)
+
+    # Initial state: T0MEANS plus the initial covariance's factor applied to the
+    # first block of innovations.
+    _ctsem_state_initial!(factor, ws, pars, all_params, sp, tdpreds, tipreds,
+        timesteps[1], subject)
+    at = zoffset
+    _ctsem_initial_draw!(ws.state, pars, factor, z, at, n, T)
+    at += n
+    _ctsem_state_first_row!(ws, pars, all_params, sp, view(tdpreds, :, 1), tipreds,
+        timesteps[1], zero(T), subject)
+
+    gen === nothing || _ctsem_record_state!(gen, ws, 1, n)
+    total = _ctsem_state_row!(ws, pars, data, 1, pred, theta, chol, resid,
+        scratch, gaussian, log2pi, gen)
+    if gen === nothing
+        isfinite(total) || return _ctsem_invalid(T)
+    else
+        gen.llrow[gen.offset + 1] = total
+    end
+
+    prev = timesteps[1]
+    nsteps = min(length(timesteps), size(data, 2))
+    @inbounds for t in 2:nsteps
+        dt = timesteps[t] - prev
+        nsub = _ctsem_substeps(dt, max_timestep, t)
+        substep_dt = dt / nsub
+        for substep in 1:nsub
+            at = _ctsem_state_substep!(ws, pars, all_params, sp, view(tdpreds, :, t),
+                tipreds, prev + substep * substep_dt, substep_dt, subject, t, transition,
+                qfactor, z, at, T)
+        end
+        _ctsem_state_row_groups!(ws, pars, all_params, sp, view(tdpreds, :, t), tipreds,
+            timesteps[t], dt, subject, t)
+
+        gen === nothing || _ctsem_record_state!(gen, ws, t, n)
+        row_ll = _ctsem_state_row!(ws, pars, data, t, pred, theta, chol, resid,
+            scratch, gaussian, log2pi, gen)
+        if gen === nothing
+            isfinite(row_ll) || return _ctsem_invalid(T)
+        else
+            gen.llrow[gen.offset + t] = row_ll
+        end
+        total += row_ll
+        prev = timesteps[t]
+    end
+    return total
+end
+
+@inline function _ctsem_record_state!(gen::CTSEMStateGenerate, ws, col::Int,
+    n::Int)
+    @inbounds for i in 1:n
+        gen.states[i, gen.offset + col] = Float64(ws.state[i])
+    end
+    return nothing
+end
+
+
+################################################################################
+# The joint density
+################################################################################
+
+"""
+    ctsem_joint_loglikelihood(objective, values, z)
+
+`log p(y, z | theta)`: the observations given the states the innovations `z`
+build, plus the standard normal density of `z` itself, plus whatever prior the
+objective carries on `theta`.
+
+This is a proper joint density, not a profile or a penalised likelihood: it
+integrates to the marginal likelihood over `z`, which is what makes it usable
+as a sampling target and what makes a mode of it interpretable. Nothing is
+approximated anywhere in it -- the Gaussian assumption the EKF makes about the
+state posterior has no counterpart here.
+
+`values` and `z` are promoted together, so a gradient may be taken with respect
+to either or both.
+
+Serial over subjects, unlike the filter objective. Each subject's innovations
+are a disjoint block and each already owns its workspace, so the same
+cost-weighted chunking would apply unchanged -- it is left out because nothing
+calls this in a loop yet. A fit over this target is what would want it.
+"""
+function ctsem_joint_loglikelihood(objective::CTSEMObjective,
+    values::AbstractVector, z::AbstractVector; transition=:exponential)
+    trans = _ctsem_transition(transition)
+    T = promote_type(eltype(values), eltype(z), Float64)
+    parameters = collect(T, values)
+    innovations = collect(T, z)
+    layout = _ctsem_state_layout(objective)
+    length(innovations) == layout.ndim || throw(DimensionMismatch(
+        "z must have $(layout.ndim) entries for this design, got $(length(innovations))"))
+
+    subjects = objective.subject_objectives
+    sp = objective.params
+    total = zero(T)
+    @inbounds for (i, sub) in enumerate(subjects)
+        ws = _get_or_init_objective_workspace!(sub, T)
+        contribution = _ctsem_state_pass!(ws, parameters, sub.data,
+            sub.timesteps, sp, sub.tdpreds,
+            _ctsem_tipred_vector(sub.tipreds, parameters, ws.tipred_row), sub.subject,
+            sub.max_timestep, innovations, layout.zoffsets[i], nothing, trans)
+        isfinite(contribution) || return _ctsem_invalid(T)
+        total += contribution
+    end
+
+    # The innovations' own density. Written out rather than folded into the
+    # subject loop so that a subject whose pass fails cannot leave a partial
+    # prior behind.
+    prior = zero(T)
+    @inbounds for value in innovations
+        prior -= value * value / 2
+    end
+    prior -= layout.ndim * log(2 * T(pi)) / 2
+    return total + prior + _ctsem_log_prior(objective, parameters)
+end
+
+"""
+    ctsem_joint_evaluate(objective, values, z; gradient=true)
+
+The joint density and, optionally, its gradient with respect to `[values; z]`.
+
+Forward mode, because there is no adjoint for this pass yet and because the
+gradient a sampler needs is with respect to a vector whose length is dominated
+by `z` -- for which reverse mode is the only sensible answer eventually. The
+value alone is cheap and is what generation and testing use.
+
+The pieces are returned alongside the total: `observation` is the conditional
+log likelihood of the data, `state_prior` the innovations' own density, and
+`parameter_prior` whatever prior the objective carries. They sum to `value`.
+"""
+function ctsem_joint_evaluate(objective::CTSEMObjective, values::AbstractVector,
+    z::AbstractVector; gradient::Bool=true)
+    npar = length(values)
+    parameters = collect(Float64, values)
+    innovations = collect(Float64, z)
+    packed = vcat(parameters, innovations)
+    target = x -> ctsem_joint_loglikelihood(objective, view(x, 1:npar),
+        view(x, (npar + 1):length(x)))
+    value = target(packed)
+    grad = gradient ? _ctsem_gradient(target, packed) : nothing
+
+    layout = _ctsem_state_layout(objective)
+    state_prior = -sum(abs2, innovations) / 2 - layout.ndim * log(2pi) / 2
+    parameter_prior = _ctsem_log_prior(objective, parameters)
+    return (value=value, gradient=grad,
+        observation=value - state_prior - parameter_prior,
+        state_prior=state_prior, parameter_prior=parameter_prior,
+        ndim=layout.ndim, npar=npar)
+end
+
+
+################################################################################
+# Generation
+################################################################################
+
+"""
+    ctsem_generate_states(objective, values, z, base)
+
+One dataset drawn from the model itself: the trajectory the innovations `z`
+build, and then each observation from its conditional distribution given the
+state at its row.
+
+`z` is `ctsem_state_dimension(objective)` standard normals and `base` is
+`nmanifest` by `nrows` more, one per manifest cell. Returns the generated
+observations `Y` (`NaN` wherever the input had no observation), the sampled
+`states`, each row's conditional log likelihood `llrow`, and the per-subject
+totals.
+
+# How this differs from `ctsem_generate`
+
+That one draws each row from the filter's one-step-ahead predictive and then
+lets the filter condition on what it drew, which makes the dataset an exact
+draw from the density the filter maximises. Here the state is drawn from the
+process and the observation from the state, which makes the dataset a draw from
+the *model* -- and for a Gaussian model those are the same thing, since the
+filter's predictive is then exact.
+
+For a non-Gaussian one they are not, and the difference is not a subtlety. The
+filter's categorical update is an assumed-density projection: it can move the
+state a long way on one improbable observation, and with an unbounded indicator
+the row after that is drawn from a rate that has already moved. Nothing of the
+kind can happen here, because no observation ever moves a state.
+
+`workspace`, when given, is used for every subject in place of each subject's
+own: `ctsem_generate_draws` runs draws side by side, and two draws of one
+subject must not share that subject's workspace.
+"""
+function ctsem_generate_states(objective::CTSEMObjective,
+    values::AbstractVecOrMat, z::AbstractVector, base::AbstractMatrix;
+    transition=:exponential, seed::Integer=1, workspace=nothing)
+    trans = _ctsem_transition(transition)
+
+    sp = objective.params
+    # One shared vector, or one row per subject -- the second form exactly as
+    # `ctsem_generate` accepts it, and for the same reason: a fit whose random
+    # effects were sampled has a parameter vector per subject rather than one
+    # shared vector, and generating its trajectory means generating at that
+    # subject's own parameters.
+    persubject = values isa AbstractMatrix
+    if persubject
+        size(values, 1) == length(objective.subject_objectives) ||
+            throw(DimensionMismatch(
+                "one row of parameters per subject is required"))
+    end
+    parameters = persubject ? Vector{Float64}(view(values, 1, :)) :
+        collect(Float64, values)
+    innovations = collect(Float64, z)
+    layout = _ctsem_state_layout(objective)
+    length(innovations) == layout.ndim || throw(DimensionMismatch(
+        "z must have $(layout.ndim) entries for this design, got $(length(innovations))"))
+    size(base) == (layout.nmanifest, layout.nrows) || throw(DimensionMismatch(
+        "base must be $(layout.nmanifest) by $(layout.nrows)"))
+
+    gen = CTSEMStateGenerate(Matrix{Float64}(base),
+        fill(NaN, layout.nmanifest, layout.nrows),
+        zeros(Float64, layout.nlatent, layout.nrows),
+        fill(NaN, layout.nrows))
+    subjects = objective.subject_objectives
+    loglik = zeros(Float64, length(subjects))
+
+    for (i, sub) in enumerate(subjects)
+        gen.offset = layout.rowoffsets[i]
+        gen.rng = _ctsem_generate_rng(seed, i)
+        persubject && copyto!(parameters, view(values, i, :))
+        ws = workspace === nothing ? _get_or_init_objective_workspace!(sub, Float64) :
+            workspace
+        loglik[i] = _ctsem_state_pass!(ws, parameters, sub.data, sub.timesteps,
+            sp, sub.tdpreds, _ctsem_tipred_vector(sub.tipreds, parameters),
+            sub.subject, sub.max_timestep,
+            innovations, layout.zoffsets[i], gen, trans)
+    end
+    return (Y=gen.out, states=gen.states, llrow=gen.llrow,
+        subject_loglik=loglik)
+end
+
+"""
+    ctsem_generate_draws(objective, values, base, seeds; z, effects, normals, transition)
+
+Many datasets in one call. Draw `s` is the dataset `ctsem_generate` -- or,
+given `z`, `ctsem_generate_states` -- makes at column `s` of `values`, with
+`base[:, :, s]`, `seeds[s]`, and column `s` of `z`, `effects` or `normals`:
+the same numbers, since each subject's stream is seeded by its draw's seed and
+its own index whichever task runs it.
+
+One call because the caller is R's posterior predictive, which made a bridge
+round trip a draw, and side by side because the draws are independent: they
+run on up to the subject-chunk ceiling's tasks (`_ctsem_pull_blocks`), each
+with a workspace of its own rather than the objective's per-subject ones,
+which two draws of one subject would share.
+
+On a Laplace objective a draw's subjects sit at its random effects: `effects`,
+natural deviations as `ctsem_generate` takes them; or `normals`, standard
+coordinates made into deviations at that draw's population covariance
+(`ctsem_laplace_population_deviations`), which is a draw of new subjects; or,
+given neither, their conditional modes. Modes are solved one draw at a time,
+because a solve writes the objective's own state, and once for a run of draws
+that share one vector, which a point-estimate predictive is.
+
+Returns `Y`, `nmanifest x nrows x ndraws`, and `llrow`, `nrows x ndraws`.
+"""
+function ctsem_generate_draws(objective::Union{CTSEMObjective,CTSEMLaplaceObjective},
+    values::AbstractMatrix, base::AbstractArray{<:Real,3},
+    seeds::AbstractVector{<:Integer}; z::Union{Nothing,AbstractMatrix}=nothing,
+    effects::Union{Nothing,AbstractMatrix}=nothing,
+    normals::Union{Nothing,AbstractMatrix}=nothing, transition=:exponential)
+    ndraws = size(values, 2)
+    size(base, 3) == ndraws && length(seeds) == ndraws || throw(DimensionMismatch(
+        string("values has ", ndraws, " draws, base ", size(base, 3), " and seeds ",
+            length(seeds))))
+    for (name, x) in (("z", z), ("effects", effects), ("normals", normals))
+        x === nothing || size(x, 2) == ndraws || throw(DimensionMismatch(
+            string(name, " has ", size(x, 2), " draws for ", ndraws)))
+    end
+    laplace = objective isa CTSEMLaplaceObjective
+    laplace || (effects === nothing && normals === nothing) || throw(ArgumentError(
+        "effects and normals are random effects, which only a Laplace objective places"))
+    plain = laplace ? objective.objective : objective
+    modes = laplace && effects === nothing && normals === nothing ?
+        _ctsem_generate_modes(objective, values) : nothing
+
+    nmanifest, nrows = size(base, 1), size(base, 2)
+    Y = fill(NaN, nmanifest, nrows, ndraws)
+    llrow = fill(NaN, nrows, ndraws)
+    nworkers = min(_ctsem_nchunks(ndraws), ndraws)
+    workspaces = [_init_continuous_ekf_workspace(Float64, plain.params)
+        for _ in 1:nworkers]
+    _ctsem_pull_blocks(ndraws, nworkers) do s, w
+        # The caller's task only: the check's throttle is not shared safely.
+        w == 1 && _ctsem_interrupt_check()
+        theta = collect(Float64, view(values, :, s))
+        drawvalues = if modes !== nothing
+            modes[s]
+        elseif effects !== nothing
+            _laplace_filter_values(objective, theta; effects=view(effects, :, s))
+        elseif normals !== nothing
+            _laplace_filter_values(objective, theta;
+                effects=ctsem_laplace_population_deviations(objective, theta,
+                    view(normals, :, s)))
+        else
+            theta
+        end
+        drawn = z === nothing ?
+            ctsem_generate(plain, drawvalues, view(base, :, :, s); seed=seeds[s],
+                workspace=workspaces[w]) :
+            ctsem_generate_states(plain, drawvalues, view(z, :, s),
+                view(base, :, :, s); transition=transition, seed=seeds[s],
+                workspace=workspaces[w])
+        Y[:, :, s] .= drawn.Y
+        llrow[:, s] .= drawn.llrow
+    end
+    return (Y=Y, llrow=llrow)
+end
+
+# Each draw's subjects at their conditional modes, solved in draw order and
+# reused across a run of identical vectors.
+function _ctsem_generate_modes(laplace::CTSEMLaplaceObjective, values::AbstractMatrix)
+    modes = Vector{Matrix{Float64}}(undef, size(values, 2))
+    for s in axes(values, 2)
+        modes[s] = s > 1 && view(values, :, s) == view(values, :, s - 1) ?
+            modes[s - 1] :
+            _laplace_filter_values(laplace, collect(Float64, view(values, :, s)))
+    end
+    return modes
+end
+
+
+################################################################################
+# Fitting over the joint density
+################################################################################
+#
+# The optimiser and the sampler both want the same thing from an objective: a
+# value and a gradient at a vector. `CTSEMJointObjective` supplies them over
+# `x = [theta; z]`, so `ctsem_optimize` and `ctsem_sample_marginal` drive the
+# state-explicit target with no changes at all -- the first is typed on
+# `CTSEMOptimisable`, which this is, and the second was already duck-typed.
+#
+# What that buys, for `optimize=FALSE`, is the estimator this path is actually
+# for: NUTS over parameters *and* states, which is the exact posterior with no
+# Gaussian assumption about the state anywhere. `optimize=TRUE` gives the joint
+# mode instead -- the same thing Stan's optimiser does at `intoverstates=0`,
+# and carrying the same caveat, which ctFit already states: maximising over
+# `z` rather than integrating it out biases the variance parameters downward,
+# because a variance whose realisations are also being chosen can always be
+# made to look smaller.
+
+export CTSEMJointObjective, ctsem_joint_objective,
+    ctsem_joint_hessian, ctsem_joint_states, ctsem_joint_dimension
+
+"""
+    CTSEMJointObjective(objective, npar)
+
+The joint density as something to optimise or sample: `x = [theta; z]`, the
+`npar` population parameters first and then every subject's innovations in
+subject order.
+
+`npar` is supplied rather than inferred. The engine cannot infer it -- the raw
+vector's length is decided by ctsem's parameter layout on the R side, which
+counts population scales and TI-predictor coefficients the parameter table
+alone does not reach -- and inferring it from the largest `parnumber` would
+silently shorten the vector for exactly the models where that is wrong.
+"""
+struct CTSEMJointObjective{O} <: CTSEMOptimisable
+    objective::O
+    layout::CTSEMStateLayout
+    npar::Int
+    # `:exponential` or `:euler`; see `_ctsem_transition`.
+    transition::Symbol
+end
+
+function ctsem_joint_objective(objective::CTSEMObjective, npar::Integer;
+    transition=:exponential)
+    npar = Int(npar)
+    npar >= 0 || throw(ArgumentError("npar must be non-negative"))
+    return CTSEMJointObjective(objective, _ctsem_state_layout(objective), npar,
+        _ctsem_transition(transition))
+end
+
+"""Total dimension optimised or sampled: parameters plus innovations."""
+ctsem_joint_dimension(o::CTSEMJointObjective) = o.npar + o.layout.ndim
+
+"""One subject's slice of the innovation vector, as a range into `x`."""
+@inline function _ctsem_joint_range(o::CTSEMJointObjective, i::Int)
+    layout = o.layout
+    first = o.npar + layout.zoffsets[i] + 1
+    last = i < length(layout.zoffsets) ? o.npar + layout.zoffsets[i + 1] :
+        o.npar + layout.ndim
+    return first:last
+end
+
+"""
+    _ctsem_joint_subject(o, i, theta, z, offset)
+
+One subject's contribution: the conditional log likelihood of its observations
+plus the density of its own innovations.
+
+The innovation prior is split across subjects rather than added once at the
+end, so a subject's term is self-contained and its gradient can be taken
+against `[theta; z_i]` alone.
+"""
+function _ctsem_joint_subject(o::CTSEMJointObjective, i::Int,
+    theta::AbstractVector{T}, z::AbstractVector{T}, offset::Int) where {T}
+    sub = o.objective.subject_objectives[i]
+    ws = _get_or_init_objective_workspace!(sub, T)
+    value = _ctsem_state_pass!(ws, theta, sub.data, sub.timesteps,
+        o.objective.params, sub.tdpreds,
+        _ctsem_tipred_vector(sub.tipreds, theta, ws.tipred_row),
+        sub.subject, sub.max_timestep, z, offset, nothing, o.transition)
+    isfinite(value) || return value
+    prior = zero(T)
+    @inbounds for k in eachindex(z)
+        prior -= z[k] * z[k] / 2
+    end
+    return value + prior - length(z) * log(2 * T(pi)) / 2
+end
+
+function (o::CTSEMJointObjective)(x::AbstractVector{T}) where {T}
+    length(x) == ctsem_joint_dimension(o) || throw(DimensionMismatch(
+        "x must have $(ctsem_joint_dimension(o)) entries, got $(length(x))"))
+    theta = view(x, 1:o.npar)
+    total = zero(T)
+    @inbounds for i in eachindex(o.layout.zoffsets)
+        range = _ctsem_joint_range(o, i)
+        contribution = _ctsem_joint_subject(o, i, theta, view(x, range), 0)
+        isfinite(contribution) || return _ctsem_invalid(T)
+        total += contribution
+    end
+    return total + _ctsem_log_prior(o.objective, theta)
+end
+
+"""
+    ctsem_evaluate(objective::CTSEMJointObjective, x; gradient=true, ...)
+
+The joint density and its gradient with respect to `[theta; z]`.
+
+Forward mode, but *per subject*, over `[theta; z_i]` rather than over the whole
+vector at once. Both are exact and they differ by an enormous constant factor.
+A subject's innovations enter no other subject's likelihood, so a dual pass
+seeded with the whole vector carries `dim(z)` partials through every subject to
+compute the `dim(z_i)` of them that are not structurally zero. On thirty
+subjects with twenty innovations each and ten parameters that is 610 seeded
+partials through thirty subjects, against thirty passes of thirty seeded
+partials through one subject -- twenty times less arithmetic, and the ratio
+grows with the subject count without bound.
+
+`gradient_method` is accepted and ignored: there is no reverse pass for this
+target. The filter's adjoint is built around the covariance recursion, which
+this path does not have.
+"""
+function ctsem_evaluate(o::CTSEMJointObjective, x::AbstractVector;
+    gradient::Bool=true, contributions::Bool=false, gradient_method=:forward)
+    ndim = ctsem_joint_dimension(o)
+    length(x) == ndim || throw(DimensionMismatch(
+        "x must have $(ndim) entries, got $(length(x))"))
+    values = collect(Float64, x)
+    theta = collect(Float64, view(values, 1:o.npar))
+    nsubjects = length(o.layout.zoffsets)
+    subject = zeros(Float64, nsubjects)
+    grad = gradient ? zeros(Float64, ndim) : nothing
+    total = 0.0
+    valid = true
+
+    for i in 1:nsubjects
+        range = _ctsem_joint_range(o, i)
+        if gradient
+            # `[theta; z_i]`, so the population partials come back from the
+            # same pass and are accumulated across subjects.
+            packed = vcat(theta, values[range])
+            target = function (v)
+                return _ctsem_joint_subject(o, i, view(v, 1:o.npar),
+                    view(v, (o.npar + 1):length(v)), 0)
+            end
+            result = DiffResults.GradientResult(packed)
+            result = ForwardDiff.gradient!(result, target, packed)
+            value = DiffResults.value(result)
+            partials = DiffResults.gradient(result)
+            subject[i] = value
+            if !isfinite(value) || !all(isfinite, partials)
+                valid = false
+                break
+            end
+            total += value
+            @inbounds for k in 1:o.npar
+                grad[k] += partials[k]
+            end
+            @inbounds for (position, k) in enumerate(range)
+                grad[k] = partials[o.npar + position]
+            end
+        else
+            value = _ctsem_joint_subject(o, i, theta, view(values, range), 0)
+            subject[i] = value
+            if !isfinite(value)
+                valid = false
+                break
+            end
+            total += value
+        end
+    end
+
+    if !valid
+        # The same contract `ctsem_optimize`'s `fg!` expects of the marginal
+        # objective: a non-finite value is a rejected trial point, not an error.
+        nan = _ctsem_invalid(Float64)
+        gradient && fill!(grad, nan)
+        return contributions ?
+            (value=nan, gradient=grad, subject_loglik=subject,
+                row_loglik=Float64[]) :
+            (value=nan, gradient=grad)
+    end
+
+    total += _ctsem_log_prior(o.objective, theta)
+    if gradient && !isempty(o.objective.prior_index)
+        _ctsem_log_prior_gradient!(view(grad, 1:o.npar), o.objective, theta, 1.0)
+    end
+    contributions || return (value=total, gradient=grad)
+    # Row likelihoods, for the summaries that read them. Conditional on the
+    # sampled state, like `ctsem_generate_states`' own `llrow` and unlike the
+    # filter's -- so they sum to the observation term rather than to a marginal
+    # log likelihood, which is the honest thing for them to sum to here.
+    return (value=total, gradient=grad, subject_loglik=subject,
+        row_loglik=_ctsem_joint_record(o, values).llrow)
+end
+
+"""
+    _ctsem_joint_record(o, x)
+
+One recording pass at `x`: the states it implies and each row's conditional log
+likelihood.
+
+The generation record is used as a *recorder* here -- `_ctsem_state_row!`
+writes `llrow` and `states` only on that path -- and the data it would draw is
+written into a buffer that is thrown away. The alternative is a second copy of
+the row loop that records instead of drawing, which is the kind of duplicate
+that drifts.
+"""
+function _ctsem_joint_record(o::CTSEMJointObjective, x::AbstractVector)
+    layout = o.layout
+    theta = collect(Float64, view(x, 1:o.npar))
+    innovations = collect(Float64, view(x, (o.npar + 1):length(x)))
+    gen = CTSEMStateGenerate(zeros(Float64, layout.nmanifest, layout.nrows),
+        fill(NaN, layout.nmanifest, layout.nrows),
+        zeros(Float64, layout.nlatent, layout.nrows), fill(NaN, layout.nrows))
+    for (i, sub) in enumerate(o.objective.subject_objectives)
+        gen.offset = layout.rowoffsets[i]
+        ws = _get_or_init_objective_workspace!(sub, Float64)
+        _ctsem_state_pass!(ws, theta, sub.data, sub.timesteps,
+            o.objective.params, sub.tdpreds, _ctsem_tipred_vector(sub.tipreds, theta),
+            sub.subject, sub.max_timestep, innovations, layout.zoffsets[i], gen,
+            o.transition)
+    end
+    return gen
+end
+
+"""
+    ctsem_joint_states(objective, x)
+
+The latent states `x` implies, `nlatent` by `nrows`.
+
+What a fit over this target has that a marginal one does not: the trajectory
+itself, at the estimate, with no smoother needed to recover it.
+"""
+ctsem_joint_states(o::CTSEMJointObjective, x::AbstractVector) =
+    _ctsem_joint_record(o, x).states
+
+"""
+    ctsem_joint_hessian(objective, x; profile=true)
+
+The second derivatives of the joint density at `x`.
+
+Built subject by subject, over `[theta; z_i]`, and scattered: the innovation
+blocks of two different subjects are *structurally* zero, not merely small, so
+a dense Hessian over the whole vector would spend almost all of its arithmetic
+confirming that.
+
+With `profile=true` (the default) the answer is the `npar` by `npar` Schur
+complement
+
+    H_pp - H_pz inv(H_zz) H_zp
+
+rather than the whole matrix. That is the curvature of the *profile* function
+`max_z log p(y, z | theta)`, and it is strictly better than reading `H_pp`
+alone, which reports the curvature at fixed states and so treats a trajectory
+that was estimated as though it had been observed.
+
+It is **not** the observed information for `theta`, and must not be presented
+as one. The Laplace approximation to the marginal adds `-log det(-H_zz)/2`,
+whose own curvature in `theta` this omits -- and that omitted term is what
+identifies the parameters. With roughly as many innovations as observations the
+profile is nearly flat without it: measured on fifteen subjects of six Gaussian
+rows, four free parameters, the largest eigenvalue of the profiled curvature was
+0.05, against 22.8 for a single well-determined parameter in a count model. The
+R side does not report standard errors from an optimised state-explicit fit for
+that reason; sampling the same density is what gives usable intervals.
+
+The inner block is inverted per subject, which is what makes this affordable:
+`H_zz` is block diagonal by subject, so the complement is a sum of per-subject
+terms and no matrix of the full innovation dimension is ever formed.
+
+Returns `nothing` if any subject's inner block is not negative definite, which
+a caller must treat as "no Hessian available" rather than as a number.
+"""
+function ctsem_joint_hessian(o::CTSEMJointObjective, x::AbstractVector;
+    profile::Bool=true)
+    ndim = ctsem_joint_dimension(o)
+    length(x) == ndim || throw(DimensionMismatch(
+        "x must have $(ndim) entries, got $(length(x))"))
+    values = collect(Float64, x)
+    theta = collect(Float64, view(values, 1:o.npar))
+    nsubjects = length(o.layout.zoffsets)
+    npar = o.npar
+
+    full = profile ? zeros(Float64, npar, npar) : zeros(Float64, ndim, ndim)
+    for i in 1:nsubjects
+        range = _ctsem_joint_range(o, i)
+        k = length(range)
+        packed = vcat(theta, values[range])
+        target = function (v)
+            return _ctsem_joint_subject(o, i, view(v, 1:npar),
+                view(v, (npar + 1):length(v)), 0)
+        end
+        block = _ctsem_dual_hessian(target, packed)
+        block = (block .+ transpose(block)) ./ 2
+        all(isfinite, block) || return nothing
+        Hpp = view(block, 1:npar, 1:npar)
+        Hpz = view(block, 1:npar, (npar + 1):(npar + k))
+        Hzz = view(block, (npar + 1):(npar + k), (npar + 1):(npar + k))
+        if profile
+            # `-Hzz` is positive definite at a maximum, so the solve is a
+            # Cholesky on it. A subject whose inner curvature is singular has a
+            # direction of its trajectory the data does not determine, and no
+            # arithmetic here produces a standard error from that.
+            factor = cholesky(Symmetric(-Matrix(Hzz)), check=false)
+            issuccess(factor) || return nothing
+            full .+= Hpp .+ Hpz * (factor \ transpose(Hpz))
+        else
+            full[1:npar, 1:npar] .+= Hpp
+            full[1:npar, range] .= Hpz
+            full[range, 1:npar] .= transpose(Hpz)
+            full[range, range] .= Hzz
+        end
+    end
+    # The prior is over the parameters alone and is not a per-subject term, so
+    # it is added once. Its second derivative is `-weight / scale^2` on the
+    # diagonal, matching `_ctsem_log_prior`.
+    @inbounds for (position, index) in enumerate(o.objective.prior_index)
+        1 <= index <= npar || continue
+        scale = o.objective.prior_scale[position]
+        full[index, index] -= o.objective.prior_weight / (scale * scale)
+    end
+    return full
+end
+
+"""
+`ctsem_hessian` for the joint target: the whole arrow-shaped matrix, which is
+what a sampler metric over `[theta; z]` needs.
+
+`ctsem_joint_hessian(o, x)` is the profiled `npar` by `npar` form, which is
+what a standard error needs. They are different objects for different callers,
+and neither is a default for the other.
+"""
+function ctsem_hessian(o::CTSEMJointObjective, values::AbstractVector;
+    chunk::Integer=0, progress=nothing)
+    # `progress` unused -- see `ctsem_hessian(objective::CTSEMObjective, ...)`
+    # in adjoint.jl. Accepted so the generic entry point `hessof` in
+    # optimiser.jl can call every method the same way without asking which
+    # route it dispatched to; the state-explicit route never reaches
+    # `_ctsem_newton_finish` in practice (`newton` is off there), but a
+    # signature that only sometimes accepts the argument is the trap this
+    # avoids.
+    result = ctsem_joint_hessian(o, values; profile=false)
+    result === nothing && throw(ArgumentError(
+        "the joint Hessian was not finite at this point"))
+    return result
+end
+
+"""
+Only the population block can saturate: the innovations carry no transform.
+
+See `_ctsem_saturation_range` in `ctsem_backend.jl` for what the check is for.
+Without this an ordinary trajectory excursion -- five standard deviations is
+one row in a few hundred -- would be reported as a parameter pinned at the
+floating-point limit of its transform, and the fit declared not converged.
+"""
+_ctsem_saturation_range(o::CTSEMJointObjective, minimizer) = 1:o.npar
+
+"""
+Unwrap to the `CTSEMObjective` the joint objective is built on -- see
+`_ctsem_params` in `ctsem_backend.jl`. The population block's raw coordinates
+are exactly that objective's, so no separate lookup is needed.
+"""
+_ctsem_params(o::CTSEMJointObjective) = _ctsem_params(o.objective)

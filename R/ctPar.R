@@ -1,0 +1,449 @@
+# Writing a parameter specification without counting pipes.
+#
+# ctsem's matrix cells carry more than a name. A cell can say what the parameter
+# is called, how it is transformed, whether it varies over subjects, how its
+# prior is scaled, and which time-independent predictors act on it -- and it
+# says all of that in one string, with the fields separated by `|` and absent
+# fields left empty:
+#
+#   'mm||TRUE||TI1'
+#
+# That is a parameter named `mm`, default transform, individually varying,
+# default sdscale, with an effect from TI1. It is compact and it is completely
+# unreadable: the meaning of `TRUE` depends on counting the pipes before it, and
+# a reader has no way to know how many fields there are or what order they come
+# in. Writing one means consulting the documentation every time; reading someone
+# else's means counting.
+#
+# `ctPar()` builds the same string from named arguments. It is not a new
+# specification language -- the output is exactly the string the parser already
+# takes, and hand-written strings keep working -- it just moves the field names
+# from the documentation into the call.
+#
+# The same named fields can also be written straight into a cell, so nothing has
+# to be called at all. These three specify the same parameter:
+#
+#   'mm||TRUE|0.5'                            the `|` form
+#   ctPar('mm', indvarying = TRUE, sdscale = 0.5)
+#   'mm, indvarying=TRUE, sdscale=0.5'        the named form, in the cell
+#
+# `.ctCellSpecToPipe()` below normalises the named form to the `|` form, so
+# there stays exactly one thing for the model parser to read.
+#
+# `mean` states a varying parameter's population mean instead of estimating
+# it. It has no `|` field of its own -- the fields are positional, and a sixth
+# after tipreds would make an empty tipreds field mean "no effects" -- so it
+# rides in the name field, 'lev=0||TRUE', and the model holds it in
+# `fixedpopmeans`.
+#
+# `indvarying` says at which levels of the id hierarchy a parameter varies.
+# TRUE is every level the model has and FALSE none; anything else is a list of
+# id names, 'cross||couple' or 'cross||person,couple'. That is also what the
+# model's `pars$indvarying` column holds, one value per row, however it was
+# set -- a cell, ctPar(), or the column edited directly. With a single id, TRUE
+# and the id's name mean the same. `.ctIndvaryingLevels()` is the one reader of
+# a value; `.ctResolveLevels()` (R/ctStanModel.R) turns the column into the
+# per-level logicals the rest of ctsem reads.
+
+#' Write a parameter specification
+#'
+#' Builds the \code{|}-separated cell specification ctsem's model matrices use,
+#' from named arguments rather than positional fields.
+#'
+#' @param name Parameter name. Two cells given the same name are the same
+#'   parameter, which is how equality constraints are written.
+#' @param transform Transform expression in terms of \code{param}, e.g.
+#'   \code{'exp(param)'}. Omitted leaves the default for that matrix, which
+#'   depends on the cell -- a variance, a drift diagonal and a mean all differ.
+#' @param indvarying Where the parameter varies: \code{TRUE} at every level of
+#'   the model's \code{id} hierarchy, \code{FALSE} at none, or the names of the
+#'   levels it varies at. With \code{id = c('person', 'couple')} in
+#'   \code{\link{ctModel}}, \code{indvarying = 'couple'} gives a parameter
+#'   that differs between couples but not between the persons within one, and
+#'   \code{TRUE} is the same as \code{c('person', 'couple')}. With a single id
+#'   the two forms mean the same thing. The model's \code{pars$indvarying}
+#'   column holds the same values and may be edited directly.
+#' @param sdscale Multiplier on the population standard deviation's prior, at
+#'   every level where the parameter varies. Only meaningful when it varies.
+#' @param tipreds Time-independent predictors acting on this parameter: a
+#'   character vector of names for effects to estimate, e.g. \code{'age'} or
+#'   \code{c('age', 'sex')}. Naming any predictor switches the rest off for
+#'   this cell, so the list is the whole set of effects on it. A name must be
+#'   one of the model's \code{TIpredNames}; anything else is an error when the
+#'   model is built. \code{character(0)} (or \code{tipreds=} with nothing
+#'   after it, in a cell) means no predictor acts on this cell, which is not
+#'   the same as leaving the argument out -- that keeps the model's default.
+#' @param mean A population mean stated rather than estimated, for a parameter
+#'   that varies (\code{indvarying}): a number on the scale
+#'   \code{summary()} reports population means on. Only the random effects
+#'   about it are then fitted, as for a person-level intercept with mean zero.
+#'   Written into the cell as \code{'name=value|...'}, and held by the model
+#'   in \code{fixedpopmeans}, a named vector that may also be set directly.
+#'   Fits with \code{backend = 'julia'}.
+#'
+#' @return A single character string, suitable for a model matrix cell.
+#'
+#' @details The output is the same string the \code{|} syntax produces, so this
+#'   is a way of writing one rather than an alternative to it. Fields left at
+#'   their default are emitted empty, which is what the parser reads as
+#'   "unspecified".
+#'
+#'   The same named fields can also be written directly into a model matrix
+#'   cell, in which case nothing needs to be called. A cell containing
+#'   \code{|} is read as a \code{|}-separated specification; otherwise a cell
+#'   with a field of the form \code{name=value} is read as a named
+#'   specification, and anything else as a plain parameter name. All three of
+#'   these specify the same parameter:
+#'
+#'   \preformatted{
+#'   MANIFESTMEANS = matrix('mm||TRUE|0.5')
+#'   MANIFESTMEANS = matrix(ctPar('mm', indvarying = TRUE, sdscale = 0.5))
+#'   MANIFESTMEANS = matrix('mm, indvarying=TRUE, sdscale=0.5')
+#'   }
+#'
+#'   In the named form, fields are separated by commas (commas inside brackets
+#'   belong to the value, so \code{transform=pnorm(param, 0, 1)} is one field),
+#'   the parameter name comes first, and several predictors or levels are given
+#'   as \code{tipreds=c(age, sex)} or \code{indvarying=c(person, couple)}; in
+#'   the \code{|} form they are separated by commas, as in
+#'   \code{'cross||person,couple'}. A field name that is not one of the above is
+#'   an error naming the nearest valid field, so a misspelling such as
+#'   \code{topreds=age} is refused rather than becoming part of a parameter
+#'   name. Comparisons are unaffected: a state-dependent cell may contain
+#'   \code{==}, \code{>=}, \code{<=} or \code{!=}, and a named argument
+#'   inside a call belongs to the value it appears in.
+#'
+#' @examples
+#' ctPar('mm', indvarying = TRUE)
+#' ctPar('drift11', transform = '-exp(param)')
+#' ctPar('mm', indvarying = TRUE, tipreds = c('age', 'sex'))
+#' # varying between couples only, in a model with id = c('person', 'couple')
+#' ctPar('cross', indvarying = 'couple')
+#' # a person-level intercept whose population mean is zero
+#' ctPar('lev', indvarying = TRUE, mean = 0)
+#'
+#' \dontrun{
+#' # These two models are identical.
+#' model <- ctModel(type = 'ct', n.latent = 1, n.manifest = 1,
+#'   LAMBDA = matrix(1),
+#'   MANIFESTMEANS = matrix(ctPar('mm', indvarying = TRUE, sdscale = 0.5)))
+#'
+#' model <- ctModel(type = 'ct', n.latent = 1, n.manifest = 1,
+#'   LAMBDA = matrix(1),
+#'   MANIFESTMEANS = matrix('mm, indvarying=TRUE, sdscale=0.5'))
+#' }
+#'
+#' @seealso \code{\link{ctModel}} for the matrices these cells go in.
+#' @export
+ctPar <- function(name, transform = NA, indvarying = NA, sdscale = NA,
+  tipreds = NULL, mean = NA) {
+
+  if (missing(name) || length(name) != 1L || is.na(name) || !nzchar(name)) {
+    stop("ctPar() needs a parameter name.", call. = FALSE)
+  }
+  meangiven <- length(mean) == 1L && !is.na(mean)
+  if (meangiven) {
+    if (!is.numeric(mean) || !is.finite(mean)) {
+      stop("ctPar(mean=) takes one finite number.", call. = FALSE)
+    }
+    name <- paste0(name, "=", format(mean, digits = 15))
+  }
+  field <- function(x) {
+    if (length(x) != 1L || is.na(x)) return("")
+    if (is.logical(x)) return(if (x) "TRUE" else "FALSE")
+    as.character(x)
+  }
+  # Several levels are one field, comma separated, as a cell writes them; which
+  # names the model's id actually has is checked when the model is built.
+  levels <- if (is.character(indvarying) && length(indvarying)) {
+    if (anyNA(indvarying) || any(grepl("[|,[:space:]]", indvarying))) {
+      stop("ctPar(indvarying=) takes TRUE, FALSE or the names of id levels.",
+        call. = FALSE)
+    }
+    paste(indvarying, collapse = ",")
+  } else field(indvarying)
+  parts <- c(as.character(name), field(transform), levels, field(sdscale))
+
+  # NULL is "not stated"; character(0) is "no predictors act on this cell".
+  # They are different cells -- the first leaves the model's default alone, the
+  # second switches every effect off -- and the `|` form has always been able
+  # to say both ('mm' against 'mm||||'). Only the named form could not, so
+  # `tipreds=` was silently read as the default.
+  tipredsgiven <- !is.null(tipreds)
+  if (tipredsgiven) {
+    if (!is.character(tipreds)) {
+      stop("ctPar(tipreds=) takes predictor names. An effect is estimated; ",
+        "to fix one to a value, set it in the model's matrices afterwards.",
+        call. = FALSE)
+    }
+    parts <- c(parts, paste(tipreds, collapse = ","))
+  }
+
+  # Trailing empty fields carry no information and only add pipes to read past
+  # -- except an empty tipreds field, which is the whole of how "no predictor
+  # effects" is written and must survive.
+  # A stated mean keeps one `|`, which is what says the name field is a field.
+  keep <- if (tipredsgiven) length(.ctCellSpecKeys) else if (meangiven) 2L else 1L
+  while (length(parts) > keep && !nzchar(parts[length(parts)])) {
+    parts <- parts[-length(parts)]
+  }
+  paste(parts, collapse = "|")
+}
+
+# --- reading a cell, either way it was written -------------------------------
+#
+# The fields a cell can carry are exactly ctPar()'s arguments, in the order
+# the `|` form puts them.
+.ctCellSpecKeys <- c('name', 'transform', 'indvarying', 'sdscale', 'tipreds')
+
+# A cell is a named specification when one of its comma-separated fields opens
+# with `<name>=`. Deliberately not keyed on the field being one of the *known*
+# names: a misspelling then went undetected, and `'mm, topreds=age'` became a
+# free parameter literally named "mm, topreds=age" carrying whatever tipred
+# effects the model defaults to. Nothing warned, and the eventual failure was
+# `Could not retrieve body of '=()'` from the symbolic differentiator, which
+# names neither the cell nor the typo. An unrecognised name is now an error
+# from .ctCellSpecToPipe(), which can say what was meant.
+#
+# Two things must still keep meaning what they say, and the shape of the test
+# is what protects them:
+#
+#  * A comparison. `state[1]>=2`, `x==0` and `a!=b` have no `<name>=` at the
+#    start of a field -- the character before the `=` is an operator, and
+#    `=(?!=)` rules out the `==` case besides.
+#  * The ordered form, whose tipreds field may itself contain `name=value`
+#    ('mm||||age=4.3,sex=2'). A `|` anywhere says the cell is that form, so it
+#    is never read as a named specification.
+#
+# Fields are split bracket-aware, so a named argument inside a call --
+# `transform=pnorm(param, mean=0)` -- is part of a value and not a field of
+# its own.
+.ctCellSpecIsNamed <- function(x) {
+  if (!is.character(x) || length(x) != 1L || is.na(x)) return(FALSE)
+  if (grepl('|', x, fixed = TRUE)) return(FALSE)
+  parts <- trimws(.ctCellSpecSplit(x))
+  any(grepl('^[A-Za-z.][A-Za-z0-9._]*[[:space:]]*=(?!=)', parts, perl = TRUE))
+}
+
+# Split on commas that are not inside brackets, so a value may contain commas:
+# `transform=pnorm(param, 0, 1)` is one field, not three.
+.ctCellSpecSplit <- function(x) {
+  chars <- strsplit(x, '', fixed = TRUE)[[1]]
+  depth <- 0L
+  parts <- character(0)
+  start <- 1L
+  for (i in seq_along(chars)) {
+    ch <- chars[i]
+    if (ch %in% c('(', '[', '{')) depth <- depth + 1L
+    else if (ch %in% c(')', ']', '}')) depth <- depth - 1L
+    else if (ch == ',' && depth <= 0L) {
+      parts <- c(parts, paste(chars[start:(i - 1L)], collapse = ''))
+      start <- i + 1L
+    }
+  }
+  c(parts, if (start <= length(chars)) paste(chars[start:length(chars)],
+    collapse = '') else '')
+}
+
+# Named form -> `|` form. Anything that is not a named form is returned
+# untouched, so this is safe to run over every cell of every matrix.
+.ctCellSpecToPipe <- function(x) {
+  if (!.ctCellSpecIsNamed(x)) return(x)
+  parts <- trimws(.ctCellSpecSplit(x))
+  parts <- parts[nzchar(parts)]
+  # 'lev=0' alone is a name with a stated mean, not a named field: the `|`
+  # form of the same cell, with the separator that makes it one.
+  if (length(parts) == 1L && !is.na(.ctCellSpecNameMean(parts)$mean) &&
+      !.ctCellSpecNameMean(parts)$name %in% c(.ctCellSpecKeys, 'mean')) {
+    return(paste0(parts, '|'))
+  }
+  args <- list()
+  for (i in seq_along(parts)) {
+    part <- parts[i]
+    keyed <- regmatches(part,
+      regexpr('^[A-Za-z.][A-Za-z0-9._]*[[:space:]]*=(?!=)', part, perl = TRUE))
+    if (!length(keyed)) {
+      if (i != 1L) {
+        stop("In the parameter specification '", x, "', the field '", part,
+          "' has no name. Only the parameter name is positional, and it comes ",
+          'first; write the rest as ',
+          paste(paste0(.ctCellSpecKeys[-1], '='), collapse = ', '),
+          call. = FALSE)
+      }
+      args$name <- part
+      next
+    }
+    key <- trimws(sub('=$', '', keyed))
+    value <- trimws(substring(part, nchar(keyed) + 1L))
+    if (!key %in% c(.ctCellSpecKeys, 'mean')) {
+      stop("In the parameter specification '", x, "', '", key, "' is not a ",
+        'field. Valid fields are: ',
+        paste(c(.ctCellSpecKeys, 'mean'), collapse = ', '), '.',
+        .ctCellSpecDidYouMean(key), call. = FALSE)
+    }
+    if (key %in% names(args)) {
+      stop("Field '", key, "' given twice in the parameter specification '",
+        x, "'.", call. = FALSE)
+    }
+    args[[key]] <- switch(key,
+      indvarying = .ctCellSpecIndvarying(value),
+      sdscale = .ctCellSpecNumeric(value, x),
+      mean = .ctCellSpecNumeric(value, x, 'mean'),
+      tipreds = .ctCellSpecNames(value),
+      value)
+  }
+  if (is.null(args$name)) {
+    stop("The parameter specification '", x, "' has no parameter name. It ",
+      'comes first, before any named field.', call. = FALSE)
+  }
+  do.call(ctPar, args)
+}
+
+# A misspelled field name is the common case, so say which field was probably
+# meant rather than only listing all of them. `tipred` for `tipreds` and
+# `indvarying` for `indvaring` are both one edit away.
+.ctCellSpecDidYouMean <- function(key) {
+  keys <- c(.ctCellSpecKeys, 'mean')
+  d <- as.integer(utils::adist(tolower(key), keys)[1, ])
+  if (min(d) > max(1L, nchar(key) %/% 3L)) return('')
+  paste0(" Did you mean '", keys[which.min(d)], "'?")
+}
+
+# A name field with a stated population mean, 'lev=0' (ctPar(mean=)): the
+# name, and the mean or NA when the field is a plain name.
+.ctCellSpecNameMean <- function(x) {
+  out <- list(name = x, mean = NA_real_)
+  if (!is.character(x) || length(x) != 1L || is.na(x)) return(out)
+  m <- regmatches(x, regexec(paste0('^[[:space:]]*([A-Za-z.][A-Za-z0-9._]*)',
+    '[[:space:]]*=[[:space:]]*([-+]?([0-9]+[.]?[0-9]*|[.][0-9]+)',
+    '([eE][-+]?[0-9]+)?)[[:space:]]*$'), x))[[1]]
+  if (!length(m)) return(out)
+  list(name = m[2], mean = as.numeric(m[3]))
+}
+
+# `indvarying=TRUE`, `indvarying=couple` and `indvarying=c(person, couple)`.
+# A single TRUE or FALSE is the logical; anything else is level names, checked
+# against the model's id when the model is built (.ctIndvaryingLevels()).
+.ctCellSpecIndvarying <- function(value) {
+  out <- .ctCellSpecNames(value)
+  if (length(out) == 1L && toupper(out) %in% c('TRUE', 'T', 'FALSE', 'F')) {
+    return(toupper(out) %in% c('TRUE', 'T'))
+  }
+  out
+}
+
+# The one reader of an `indvarying` field, however the cell was written: TRUE
+# (or "TRUE") is every level of the model's id, FALSE none, and anything else
+# names the levels -- a character vector, or one string with the names comma
+# separated as the `|` form writes them. Returns a logical per level, named by
+# level, subject first. `levels` is c(subjectIDname, groupIDnames).
+.ctIndvaryingLevels <- function(value, levels, where = NULL) {
+  if (is.character(value)) {
+    value <- trimws(unlist(strsplit(value, ',', fixed = TRUE)))
+    value <- value[nzchar(value)]
+    if (length(value) == 1L && toupper(value) %in% c('TRUE', 'T', 'FALSE', 'F')) {
+      value <- toupper(value) %in% c('TRUE', 'T')
+    }
+  }
+  if (is.logical(value)) {
+    if (length(value) != 1L || is.na(value)) {
+      stop("indvarying", if (!is.null(where)) paste0(" in ", where),
+        " must be TRUE, FALSE or the names of id levels.", call. = FALSE)
+    }
+    return(stats::setNames(rep(value, length(levels)), levels))
+  }
+  unknown <- setdiff(value, levels)
+  if (length(unknown)) {
+    stop("indvarying", if (!is.null(where)) paste0(" in ", where), " names ",
+      paste(unknown, collapse = ", "), ", which ",
+      if (length(unknown) > 1L) "are not id levels" else "is not an id level",
+      " of this model. Its levels are: ", paste(levels, collapse = ", "),
+      " (from ctModel's id argument).", call. = FALSE)
+  }
+  stats::setNames(levels %in% value, levels)
+}
+
+# What `pars$indvarying` holds for a resolved `.ctIndvaryingLevels()`: TRUE for
+# every level, FALSE for none, and otherwise the levels' names, comma
+# separated as a cell writes them.
+.ctIndvaryingValue <- function(levels) {
+  if (all(levels)) return(TRUE)
+  if (!any(levels)) return(FALSE)
+  paste(names(levels)[levels], collapse = ',')
+}
+
+# The `indvarying` column tidied: logical while every entry is TRUE or FALSE,
+# which is every single-level model; otherwise character, with TRUE and FALSE
+# written as such beside the level names.
+.ctIndvaryingColumn <- function(x) {
+  if (is.logical(x)) return(x)
+  text <- toupper(trimws(as.character(x)))
+  flag <- !is.na(x) & text %in% c('TRUE', 'T', 'FALSE', 'F')
+  if (all(flag | is.na(x))) return(ifelse(is.na(x), NA, text %in% c('TRUE', 'T')))
+  out <- trimws(as.character(x))
+  out[flag] <- ifelse(text[flag] %in% c('TRUE', 'T'), 'TRUE', 'FALSE')
+  out
+}
+
+.ctCellSpecNumeric <- function(value, x, key = 'sdscale') {
+  out <- suppressWarnings(as.numeric(value))
+  if (is.na(out)) stop(key, "=", value, " in '", x, "' must be a number.",
+    call. = FALSE)
+  out
+}
+
+# `tipreds=age`, `tipreds=c(age, sex)` and `tipreds=c('age','sex')` all mean the
+# same list of names. An empty value gives character(0), which is not the same
+# as NULL: it says no predictor acts on this cell.
+.ctCellSpecNames <- function(value) {
+  value <- sub('^c\\(', '', sub('\\)$', '', trimws(value)))
+  out <- trimws(strsplit(value, ',', fixed = TRUE)[[1]])
+  out <- gsub('^["\']|["\']$', '', out)
+  out[nzchar(out)]
+}
+
+# Read a cell into its fields, whichever way it was written. Fields the cell
+# leaves unspecified come back NA (NULL for tipreds). Used by the
+# `model$matrices <- ` / `ctModelMatrices() <- ` path, which assigns into an
+# existing pars row rather than building one; ctModel() normalises to the `|`
+# form instead and lets its own parser read the fields.
+.ctCellSpecFields <- function(x) {
+  out <- list(param = NA_character_, transform = NA_character_,
+    indvarying = NA, sdscale = NA_real_, tipreds = NULL, mean = NA_real_)
+  if (!is.character(x) || length(x) != 1L || is.na(x)) return(out)
+  x <- .ctCellSpecToPipe(x)
+  if (!grepl('|', x, fixed = TRUE)) {
+    out$param <- trimws(x)
+    return(out)
+  }
+  split <- gsub(' ', '', strsplit(x, '|', fixed = TRUE)[[1]], fixed = TRUE)
+  # strsplit drops trailing empties, so 'mm||||' arrives as four fields and the
+  # fifth -- an empty but present tipreds field, meaning no predictor effects
+  # -- would be indistinguishable from not stating one. Count the separators
+  # and pad back to the number of fields actually written.
+  nfields <- 1L + length(gregexpr('|', x, fixed = TRUE)[[1]][
+    gregexpr('|', x, fixed = TRUE)[[1]] > 0])
+  if (nfields > length(split)) {
+    split <- c(split, rep('', nfields - length(split)))
+  }
+  if (length(split) > length(.ctCellSpecKeys)) {
+    stop('Param spec has too many separators!  ', x, call. = FALSE)
+  }
+  for (i in seq_along(split)) {
+    key <- .ctCellSpecKeys[i]
+    if (identical(key, 'tipreds')) {
+      out$tipreds <- .ctCellSpecNames(split[i])
+      next
+    }
+    if (!nzchar(split[i])) next
+    if (identical(key, 'name')) {
+      namemean <- .ctCellSpecNameMean(split[i])
+      out$param <- namemean$name
+      out$mean <- namemean$mean
+    }
+    else if (identical(key, 'indvarying')) out$indvarying <- .ctCellSpecIndvarying(split[i])
+    else if (identical(key, 'sdscale')) out$sdscale <- as.numeric(split[i])
+    else out[[key]] <- split[i]
+  }
+  out
+}

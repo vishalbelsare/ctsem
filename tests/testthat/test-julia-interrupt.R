@@ -1,0 +1,374 @@
+# Escape during a julia call, and the session start (R/ctJuliaBridge.R).
+#
+# A real Escape cannot be sent from inside a test, so the state it leaves is
+# built directly: the request is written and the reply walked away from, which
+# is exactly what the interrupt handler does when Escape lands while R waits.
+# What is asserted is everything after that -- the reply collected rather than
+# read by the wrong call, the engine stopping at a checkpoint, the session and
+# its process kept -- which is where the old behaviour went wrong.
+
+send_and_walk_away <- function(expr) {
+  ns <- asNamespace("ctsem")
+  wire <- ns$.ctJuliaWire()
+  ns$.ctJuliaEnsureStarted(wire)
+  con <- wire$pkgLocal$con
+  writeBin(wire$CALL, con)
+  wire$writeString("RConnector.mainevalcmd")
+  wire$writeList(list(expr))
+  ns$.ctJuliaAbandon("RConnector.mainevalcmd")
+}
+
+process_exists <- function(pid) {
+  if (.Platform$OS.type == "windows") {
+    out <- suppressWarnings(system2("tasklist",
+      c("/FI", shQuote(paste("PID eq", pid)), "/NH"), stdout = TRUE))
+    any(grepl(paste0("\\b", pid, "\\b"), out))
+  } else {
+    isTRUE(tools::pskill(pid, 0L))
+  }
+}
+
+test_that("a reply left owed by Escape is collected before the next call", {
+  skip_without_julia()
+  ctJuliaSetup()
+  cache <- ctsem:::.ct_julia_cache
+  pid <- cache$pid
+  expect_true(is.numeric(pid) && !is.na(pid))
+  send_and_walk_away("sleep(2); :abandoned")
+  expect_false(is.null(cache$inflight))
+  expect_true(file.exists(cache$interrupt_file))
+  # Read by the next call and thrown away; before this existed, the next call
+  # read it as its own answer.
+  expect_message(x <- ctsem:::.ctJuliaEval("1 + 1"), "Waiting for Julia")
+  expect_equal(x, 2)
+  expect_null(cache$inflight)
+  expect_false(file.exists(cache$interrupt_file))
+  # Nothing was restarted, so nothing compiled was lost.
+  expect_identical(cache$pid, pid)
+})
+
+test_that("a restore deferred behind an owed reply runs before the next call", {
+  skip_without_julia()
+  ctJuliaSetup()
+  # Put back the ceiling it found, not 0: 0 is every thread the session has,
+  # which can be wider than the ceiling ctJuliaSetup() leaves, and every later
+  # file in the session would run its uncapped calls at that.
+  original <- ctsem:::.ctJuliaGet(ctsem:::.ctJuliaEval(
+    "ContinuousTimeSEM.ctsem_max_chunks()"))$max_chunks
+  on.exit(ctsem:::.ctJuliaCall("ContinuousTimeSEM.ctsem_set_max_chunks!",
+    as.integer(original)), add = TRUE)
+  send_and_walk_away("sleep(1); 0")
+  # As `.ctBackendRestoreMaxChunks()` does from `on.exit` while Escape unwinds.
+  expect_null(ctsem:::.ctJuliaCall("ContinuousTimeSEM.ctsem_set_max_chunks!", 3L,
+    .defer = TRUE))
+  expect_length(ctsem:::.ct_julia_cache$deferred, 1L)
+  now <- ctsem:::.ctJuliaGet(ctsem:::.ctJuliaEval("ContinuousTimeSEM.ctsem_max_chunks()"))
+  expect_equal(now$max_chunks, 3)
+  expect_null(ctsem:::.ct_julia_cache$deferred)
+})
+
+test_that("the engine stops at its next checkpoint once asked to", {
+  skip_without_julia()
+  ctJuliaSetup()
+  # A minute of iterations through the same hook the optimiser records its
+  # trace with. Without the checkpoint the next call would wait all of it.
+  send_and_walk_away(paste0("let t = ContinuousTimeSEM.CTSEMTrace(:a); ",
+    "for i in 1:6000; ContinuousTimeSEM._record!(t, i, 1.0); sleep(0.01); end; ",
+    ":finished end"))
+  elapsed <- system.time(x <- suppressMessages(ctsem:::.ctJuliaEval("2 + 2")))[["elapsed"]]
+  expect_equal(x, 4)
+  expect_lt(elapsed, 30)
+})
+
+test_that("an argument that is itself a Julia call is sent before the call it is for", {
+  skip_without_julia()
+  ctJuliaSetup()
+  # Left as a promise, the inner call used to run while the outer request was
+  # half written, and both ends then waited on each other indefinitely.
+  expect_equal(ctsem:::.ctJuliaCall("sum", ctsem:::.ctJuliaPut(c(1, 2, 3))), 6)
+  # And through the engine module, as every fit calls it.
+  module <- ctsem:::.ctJuliaModule()
+  expect_equal(module$scalar_square(ctsem:::.ctJuliaEval("3.0")), 9)
+})
+
+test_that("an interrupt raised in Julia arrives as an interrupt, not an error", {
+  skip_without_julia()
+  ctJuliaSetup()
+  got <- tryCatch(ctsem:::.ctJuliaEval("throw(InterruptException())"),
+    interrupt = function(e) "interrupt", error = function(e) conditionMessage(e))
+  expect_identical(got, "interrupt")
+  # The reply was read whole, so the session carries on.
+  expect_equal(ctsem:::.ctJuliaEval("5"), 5)
+})
+
+# A peer that sends a message's length, then, after `pause` seconds, its text
+# -- or with `pause = NA`, closes instead. JuliaConnectoR's output relay does
+# the first whenever Julia's main thread is busy, as while it loads the engine.
+framed_peer <- function(pause) {
+  port <- sample(20000:40000, 1L)
+  script <- paste0("s <- serverSocket(", port, "); ",
+    "con <- socketAccept(s, blocking = TRUE, open = 'r+b'); ",
+    "writeBin(4L, con, size = 4L); flush(con); ",
+    if (is.na(pause)) "" else paste0("Sys.sleep(", pause, "); writeBin(charToRaw('text'), con); flush(con); Sys.sleep(1); "),
+    "close(con); close(s)")
+  rscript <- file.path(R.home("bin"), if (.Platform$OS.type == "windows") "Rscript.exe" else "Rscript")
+  system2(rscript, c("-e", shQuote(script)), wait = FALSE, stdout = FALSE, stderr = FALSE)
+  for (i in 1:100) {
+    con <- tryCatch(suppressWarnings(socketConnection("127.0.0.1", port, blocking = TRUE,
+      open = "r+b", timeout = 2)), error = function(e) NULL)
+    if (!is.null(con)) return(con)
+    Sys.sleep(0.2)
+  }
+  skip("could not reach the helper process")
+}
+
+test_that("a pause partway through a message is waited out; an ending is not", {
+  skip_on_cran()
+  # Read with a five-second limit, as it once was during calls, this pause
+  # declared a session that was loading the engine dead.
+  con <- framed_peer(7)
+  on.exit(close(con), add = TRUE)
+  expect_identical(ctsem:::.ctJuliaReadText(con, wait = Inf), "text")
+  # The end of the stream partway through is still the end, and at once.
+  ended <- framed_peer(NA)
+  on.exit(close(ended), add = TRUE)
+  elapsed <- system.time(got <- ctsem:::.ctJuliaReadText(ended, wait = Inf))[["elapsed"]]
+  expect_null(got)
+  expect_lt(elapsed, 5)
+})
+
+test_that("relayed output cut partway through a character is still read", {
+  # An escape sequence, then 'a' and the first two bytes of an ellipsis.
+  cut <- rawToChar(as.raw(c(0x1b, 0x5b, 0x31, 0x6d, 0x61, 0xe2, 0x80)))
+  Encoding(cut) <- "UTF-8"
+  expect_false(validUTF8(cut))
+  expect_identical(charToRaw(ctsem:::.ctJuliaPlainOutput(cut)), as.raw(c(0x61, 0xe2, 0x80)))
+})
+
+test_that("an argument Julia cannot take leaves the connection usable", {
+  skip_without_julia()
+  ctJuliaSetup()
+  # Written a piece at a time, the call and its name reached the socket before
+  # the argument failed to translate, and Julia read the next request as the
+  # rest of this one. The request is now marshalled whole before any of it is
+  # sent.
+  expect_error(ctsem:::.ctJuliaCall("identity", new.env()), "environment")
+  expect_equal(ctsem:::.ctJuliaEval("1 + 1"), 2)
+})
+
+test_that("callbacks are answered, and one that fails does not take the session", {
+  skip_without_julia()
+  ctJuliaSetup()
+  expect_equal(ctsem:::.ctJuliaCall("map", function(x) x + 1, c(1, 2, 3)), c(2, 3, 4))
+  expect_error(ctsem:::.ctJuliaCall("map", function(x) stop("boom"), c(1, 2)), "boom")
+  expect_equal(ctsem:::.ctJuliaEval("2 + 2"), 4)
+})
+
+test_that("stopping Julia outright ends its process and the next call starts anew", {
+  skip_without_julia()
+  ctJuliaSetup()
+  cache <- ctsem:::.ct_julia_cache
+  old <- cache$pid
+  ctsem:::.ctJuliaKill()
+  Sys.sleep(1)
+  expect_false(process_exists(old))
+  msgs <- testthat::capture_messages(x <- ctsem:::.ctJuliaEval("3 + 3"))
+  expect_equal(x, 6)
+  expect_true(any(grepl("^Starting Julia \\d+\\.\\d+\\.\\d+ with \\d+ threads? \\.\\.\\.",
+    msgs)), info = paste(msgs, collapse = " | "))
+  expect_false(identical(cache$pid, old))
+  ctJuliaSetup()
+})
+
+test_that("the engine tells a running R process from one that has exited", {
+  skip_without_julia()
+  ctJuliaSetup()
+  rscript <- file.path(R.home("bin"), if (.Platform$OS.type == "windows") "Rscript.exe" else "Rscript")
+  gone <- as.integer(system2(rscript, c("-e", shQuote("cat(Sys.getpid())")), stdout = TRUE))
+  alive <- function(pid) ctsem:::.ctJuliaEval(sprintf(paste0(
+    "let p = ContinuousTimeSEM._CTSEM_PARENT_PID, old = p[]; p[] = %d; ",
+    "r = ContinuousTimeSEM._ctsem_parent_alive(); p[] = old; r end"), pid))
+  expect_true(alive(Sys.getpid()))
+  expect_false(alive(gone))
+})
+
+test_that("a newer Julia is offered only within the running or tested series", {
+  newer <- function(version, managed = FALSE, latest = function(series) NA_character_) {
+    got <- ctsem:::.ctJuliaNewerRelease(version, bin = "x", managed = managed,
+      pinned = "1.12.7", latest = latest)
+    if (is.null(got)) NA_character_ else paste0(got$version, got$how)
+  }
+  lookup <- function(table) function(series) {
+    if (series %in% names(table)) table[[series]] else NA_character_
+  }
+  # A patch of the running series, from the pin or from juliaup's list.
+  expect_identical(newer("1.12.5"), "1.12.7")
+  expect_identical(newer("1.12.5", latest = lookup(c(`1.12` = "1.12.8"))), "1.12.8")
+  # An older series is pointed at the tested one, and says so.
+  expect_identical(newer("1.11.9"), "1.12.7 (ctsem is tested on 1.12)")
+  # A newer series than the tested one hears only about its own patches.
+  expect_identical(newer("1.13.1", latest = lookup(c(`1.13` = "1.13.1"))), NA_character_)
+  expect_identical(newer("1.13.1", latest = lookup(c(`1.13` = "1.13.2"))), "1.13.2")
+  # Nothing newer than what is running.
+  expect_identical(newer("1.12.7"), NA_character_)
+  # A Julia ctsem installed is offered the pin, with the call that installs it.
+  expect_identical(newer("1.12.5", managed = TRUE,
+    latest = lookup(c(`1.12` = "1.12.9"))),
+    "1.12.7; ctJuliaInstall(force = TRUE) installs it")
+  expect_identical(newer(NA_character_), NA_character_)
+})
+
+test_that("the thread count a session will start with is read as Julia reads it", {
+  threads <- function(value) withr::with_envvar(c(JULIA_NUM_THREADS = value),
+    ctsem:::.ctJuliaStartThreads())
+  expect_identical(threads(NA), "1")
+  expect_identical(threads("4"), "4")
+  expect_identical(threads("4,1"), "4")
+  expect_identical(threads("auto"), "auto")
+  expect_identical(threads("x"), NA_character_)
+})
+
+# A session is started at the `cores` of the call that starts it and never below
+# the default, because idle threads spin whenever work is spawned; a count
+# somebody chose is left alone.
+test_that("a session nobody sized is provisioned at the cores of the call that starts it", {
+  cache <- ctsem:::.ct_julia_cache
+  previous <- cache$threads_from_cores
+  on.exit(cache$threads_from_cores <- previous, add = TRUE)
+  withr::local_options(mc.cores = 3L)
+  provision <- function(value, cores = NA_integer_) withr::with_envvar(
+    c(JULIA_NUM_THREADS = value), {
+      got <- ctsem:::.ctJuliaProvision(cores)
+      c(got = as.character(got), env = Sys.getenv("JULIA_NUM_THREADS"))
+    })
+  cache$threads_from_cores <- NULL
+  expect_identical(provision(NA), c(got = "3", env = "3"))
+  expect_identical(provision(NA, cores = 8L), c(got = "8", env = "8"))
+  # Never below what `cores` defaults to.
+  expect_identical(provision(NA, cores = 1L), c(got = "3", env = "3"))
+  # A count set deliberately wins, even a narrow one.
+  cache$threads_from_cores <- NULL
+  expect_identical(provision("2"), c(got = "2", env = "2"))
+  # One ctsem set itself is recomputed rather than obeyed.
+  cache$threads_from_cores <- "8"
+  expect_identical(provision("8", cores = 4L), c(got = "4", env = "4"))
+  # And taken back once the session it sized has started; a deliberate one is not.
+  withr::with_envvar(c(JULIA_NUM_THREADS = "4"), {
+    cache$threads_from_cores <- "4"
+    ctsem:::.ctJuliaUnprovision()
+    expect_identical(Sys.getenv("JULIA_NUM_THREADS", unset = NA), NA_character_)
+    expect_null(cache$threads_from_cores)
+  })
+  withr::with_envvar(c(JULIA_NUM_THREADS = "5"), {
+    ctsem:::.ctJuliaUnprovision()
+    expect_identical(Sys.getenv("JULIA_NUM_THREADS"), "5")
+  })
+})
+
+test_that("a session started for no call is the default width, and holds calls to it", {
+  skip_without_julia()
+  withr::local_envvar(JULIA_NUM_THREADS = NA)
+  withr::local_options(mc.cores = NULL)
+  cache <- ctsem:::.ct_julia_cache
+  cache$threads_from_cores <- NULL
+  ctsem:::.ctJuliaClearSession()
+  suppressMessages(ctJuliaSetup())
+  state <- ctsem:::.ctJuliaGet(ctsem:::.ctJuliaEval("ContinuousTimeSEM.ctsem_max_chunks()"))
+  expect_equal(state$nthreads, 2L)
+  expect_equal(state$max_chunks, 2L)
+  # The width it was started at is not left behind to size the next session.
+  expect_identical(Sys.getenv("JULIA_NUM_THREADS", unset = NA), NA_character_)
+  # Asking for threads makes them the ceiling as well.
+  suppressMessages(ctJuliaSetup(threads = 2L, force = TRUE))
+  state <- ctsem:::.ctJuliaGet(ctsem:::.ctJuliaEval("ContinuousTimeSEM.ctsem_max_chunks()"))
+  expect_equal(state$nthreads, 2L)
+  expect_equal(state$max_chunks, 2L)
+})
+
+# Resolving `cores` provisions the width before the session exists, and the
+# session's own start provisions again, without `cores`. Under a wide default
+# the two agreed; under this one the second would recompute the first back down
+# to two, and a `cores = 3` fit would start a two-thread session in silence.
+test_that("a session a fit starts is as wide as the fit's cores", {
+  skip_without_julia()
+  withr::local_envvar(JULIA_NUM_THREADS = NA)
+  withr::local_options(mc.cores = NULL)
+  cache <- ctsem:::.ct_julia_cache
+  cache$threads_from_cores <- NULL
+  ctsem:::.ctJuliaClearSession()
+  set.seed(5)
+  dat <- do.call(rbind, lapply(1:6, function(i)
+    data.frame(id = i, time = 0:4, Y1 = cumsum(stats::rnorm(5)) * .5)))
+  model <- suppressWarnings(suppressMessages(ctModel(type = "ct",
+    manifestNames = "Y1", latentNames = "eta1", LAMBDA = matrix(1))))
+  suppressWarnings(suppressMessages(ctFit(dat, model, backend = "julia",
+    cores = 3L, fit = FALSE)))
+  expect_equal(as.integer(ctsem:::.ctJuliaEval("Threads.nthreads()")), 3L)
+  expect_identical(Sys.getenv("JULIA_NUM_THREADS", unset = NA), NA_character_)
+})
+
+# Any call taking `cores` can be the first Julia call of an R session -- a fit
+# read back with readRDS() and handed to ctFitUncertainty() -- and only ctFit
+# passed its `cores` on before the session started, so the rest started it at
+# the default: a `cores = 16` call ran on two threads. The session's start
+# reads the width off the stack instead, from the outermost ctsem call holding
+# a usable `cores`.
+test_that("the call starting a session is found by its cores, outermost first", {
+  # Functions as ctsem's own: their top environment is its namespace.
+  own <- new.env(parent = asNamespace("ctsem"))
+  local(envir = own, {
+    inner <- function(cores = 1L) .ctJuliaCallCores()
+    resolving <- function(cores = NULL) {
+      if (is.null(cores)) cores <- 6L
+      inner(cores = 2L)
+    }
+    unresolved <- function(cores = NULL) inner(cores = 3L)
+  })
+  inner <- own$inner; resolving <- own$resolving; unresolved <- own$unresolved
+  # And one that is not ctsem's, whatever it calls its arguments.
+  other <- new.env(parent = globalenv())
+  other$inner <- inner
+  foreign <- local(envir = other, function(cores = 9L) inner(cores = 2L))
+
+  expect_identical(ctsem:::.ctJuliaCallCores(), NA_integer_)
+  expect_identical(inner(5L), 5L)
+  # The outermost is the request; an inner call's `cores` is a share of it.
+  expect_identical(resolving(4L), 4L)
+  # Read as the call holds it now, so a default it has resolved reads resolved,
+  expect_identical(resolving(), 6L)
+  # and one it has not yet resolved defers to the next call in.
+  expect_identical(unresolved(), 3L)
+  expect_identical(inner("maxneeded"), NA_integer_)
+  expect_identical(foreign(), 2L)
+})
+
+test_that("a session a call other than ctFit starts is as wide as that call's cores", {
+  skip_without_julia()
+  withr::local_envvar(JULIA_NUM_THREADS = NA)
+  # A default of one, so a session sized without the call's `cores` is narrower
+  # than one sized with it, on any machine with two cores.
+  withr::local_options(mc.cores = 1L, ctsem.julia.registry = withr::local_tempdir())
+  cache <- ctsem:::.ct_julia_cache
+  cache$threads_from_cores <- NULL
+  dat <- image_data(nsub = 6L, nobs = 5L, seed = 6L)
+  prepared <- suppressWarnings(suppressMessages(ctFit(dat, image_model(),
+    backend = "julia", cores = 1L, fit = FALSE)))
+  pars <- rep(0, ctsem:::.ctBackendNpar(prepared))
+  ctsem:::.ctJuliaClearSession()
+  out <- suppressMessages(ctJuliaEvaluate(prepared, pars = pars, cores = 2L))
+  expect_true(is.finite(out$value))
+  expect_equal(as.integer(ctsem:::.ctJuliaEval("Threads.nthreads()")), 2L)
+  expect_identical(Sys.getenv("JULIA_NUM_THREADS", unset = NA), NA_character_)
+})
+
+test_that("threads asked for by name are kept, whatever ctsem last provisioned", {
+  skip_without_julia()
+  withr::local_envvar(JULIA_NUM_THREADS = NA)
+  cache <- ctsem:::.ct_julia_cache
+  # The value provisioning last set happens to be the one asked for here. It
+  # was taken for ctsem's own and widened to the machine: 24 threads for 2.
+  cache$threads_from_cores <- "2"
+  suppressMessages(ctJuliaSetup(threads = 2L, force = TRUE))
+  expect_identical(Sys.getenv("JULIA_NUM_THREADS"), "2")
+  expect_equal(as.integer(ctsem:::.ctJuliaEval("Threads.nthreads()")), 2L)
+})

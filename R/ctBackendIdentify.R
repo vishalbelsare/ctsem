@@ -1,0 +1,1014 @@
+# What a fit can honestly say about its own credibility.
+#
+# An optimiser can stop somewhere the data does not determine, and the fit then
+# reports estimates and standard errors that look exactly like any other fit's.
+# Observed on a six-subject model: population standard deviations driven to
+# 1e-8, process parameters at plus or minus a hundred, `converged = TRUE`.
+#
+# The temptation is to call such a fit absurd and refuse it. That is the wrong
+# move, because "absurd" is a judgement about the model and the data that this
+# code is in no position to make -- a population standard deviation of zero is a
+# legitimate finding (no detectable individual differences), an extreme raw
+# value can be a perfectly ordinary value on a transformed scale, and a
+# likelihood that is flat in some direction may still be exactly what the
+# researcher wants to report.
+#
+# What can be said without assuming anything is narrower and more useful: which
+# directions the data does not identify, and therefore which reported intervals
+# do not mean what a reader will take them to mean. That is a property of the
+# information matrix, checkable, and it does not require deciding whether the
+# answer is sensible.
+
+# Which directions are named, and on what evidence.
+#
+# Two sources, and the report is their union. A direction the likelihood was
+# measured flat along -- `.ctOptimFlatDirectionScreen()`'s verdict, passed in
+# as `screen` -- is named whether or not its curvature has decayed below
+# `rtol` yet: on a flat ray the curvature at the estimate is a residue of
+# where the optimiser stopped, and a report that waited for it named a
+# six-subject fixture's ridge at one stopping point and not at another 4.4e-04
+# nats away. A direction below `rtol` is named whether or not the screen
+# confirmed it, because the screen is one-sided: a walk that rises proves
+# nothing, and dropping such a direction would be using it to declare
+# something identified. Each direction says which: `evidence` is "likelihood"
+# for the first, with the `change` the walk measured, and "curvature" for a
+# direction named by its eigenvalue alone.
+#
+# Saturation is a reason, not the condition. `saturated` lists the direction's
+# parameters whose transforms the optimiser reported flat -- empty when none
+# did, which is the usual case for a ridge between parameters. It used to take
+# a saturated coordinate for a fit to be told anything; see
+# R/ctBackendOptimGap.R for the status that is now called `saturated`.
+#
+# Which parameters are named: every coordinate carrying at least `nullmass`
+# (`.ctNullMassBar()`) of the flat subspace the directions span, largest share
+# first. That is the share and the bar the interval check names coordinates
+# with no width by, so wherever the directions named are the ones the
+# covariance dropped, the report and the NA intervals in summary() name the
+# same coordinates. A direction's own `parameters` are the coordinates
+# carrying that much of it. A share of a subspace does not depend on which
+# basis spans it, where a loading on one of its eigenvectors does.
+#
+# The bar sits at rounding rather than inside the spread of real loadings,
+# because a flat direction turns as the optimiser walks a ridge that is curved
+# in raw coordinates, and the weaker loadings move with it. Two bars inside
+# that spread failed on test-stan-julia-parity.R's fixture, whose one flat
+# direction runs through ten population correlations. An absolute loading of
+# 0.25 named nine of the ten at three stopping points and ten at two. A third
+# of the largest loading, which replaced it, named nine at the full fit and
+# seven at a `newton = FALSE` stop 1.4 raw units along the ridge and 1.7e-05
+# nats below it (Windows and dev2 alike): between the two the direction turned
+# by 4.3 to 4.8 degrees and the four correlations with t0a fell from 0.43-0.52
+# of the largest loading to 0.18-0.41. Their shares there, 0.005 to 0.043, sit
+# far above the bar, and the fourteen identified coordinates' 1.4e-08 and less
+# far below it.
+#' @keywords internal
+.ctBackendIdentifiability <- function(hessian, parnames = NULL, rtol = 1e-8,
+  nullmass = .ctNullMassBar(), fit = NULL, at = NULL, metric = NULL,
+  vectors = FALSE, screen = NULL, certification = NULL) {
+  empty <- list(nweak = 0L, condition = NA_real_, directions = list(),
+    parameters = character())
+  # The random-effect information check (`.ctEffectInformation()`) is part of
+  # this report but is not a property of the Hessian: it is taken once, during
+  # the fit, and every later rebuild of the report from a new curvature --
+  # `ctFitUncertainty()`, the fit's own last step -- carries it forward rather
+  # than dropping it. `[[`, because `ctIdentify()` passes a bare spec as `fit`.
+  carried <- if (is.list(fit) && is.list(fit[["identifiability"]]))
+    fit[["identifiability"]][["effects"]] else NULL
+  if (!is.null(carried)) empty$effects <- carried
+  if (is.null(hessian)) return(empty)
+  hessian <- as.matrix(hessian)
+  if (!all(is.finite(hessian)) || nrow(hessian) != ncol(hessian)) return(empty)
+  n <- nrow(hessian)
+  if (is.null(parnames) || length(parnames) != n) parnames <- paste0("par", seq_len(n))
+
+  # The information matrix, symmetrised. Eigenvalues rather than a determinant
+  # or a condition number alone: which direction is flat is the actionable part,
+  # and only the eigenvectors say that.
+  information <- -(hessian + t(hessian)) / 2
+  decomposition <- try(eigen(information, symmetric = TRUE), silent = TRUE)
+  if (inherits(decomposition, "try-error")) return(empty)
+  values <- decomposition$values
+  scale <- max(abs(values))
+  if (!is.finite(scale) || scale <= 0) return(empty)
+
+  # Exact access: `ctIdentify()` passes a bare spec as `fit`, which has no
+  # `$optim` for `$` to find and possibly a longer name that `$` would match.
+  run <- if (is.list(fit)) fit[["optim"]] else NULL
+  saturated <- if (is.list(run))
+    as.character(.ctJuliaOr(run[["saturated_parameters"]], character())) else
+    character()
+  describe <- function(vector, eigenvalue, evidence, change) {
+    share <- .ctIdentifySubspaceShare(list(list(vector = vector)), n)
+    involved <- which(is.finite(share) & share >= nullmass)
+    involved <- involved[order(share[involved], decreasing = TRUE)]
+    if (!length(involved)) involved <- which.max(abs(vector))
+    # The whole eigenvector, not only the loadings above the threshold. Two
+    # things need it: the partial-identification check below, which asks
+    # whether a functional of the parameters changes along this direction, and
+    # the subspace aggregation -- this report's `parameters`, and `ctIdentify()`
+    # across its evaluation points -- which asks how much of a coordinate lies
+    # in the flat *subspace* rather than on one of its axes.
+    list(eigenvalue = eigenvalue, relative = eigenvalue / scale,
+      parameters = parnames[involved], loadings = vector[involved],
+      vector = vector, evidence = evidence, change = change,
+      saturated = intersect(parnames[involved], saturated))
+  }
+
+  # A direction counts as unidentified when its curvature is negligible against
+  # the sharpest direction, or when it is negative -- a negative eigenvalue of
+  # the information matrix means the optimiser stopped somewhere that is not a
+  # maximum in that direction at all -- or when the likelihood was measured
+  # flat along it.
+  weak <- which(values <= rtol * scale)
+  measured <- .ctIdentifyMeasuredFlat(screen, decomposition$vectors)
+  directions <- lapply(weak, function(k) {
+    hit <- measured$index %in% k
+    describe(decomposition$vectors[, k], values[k],
+      evidence = if (any(hit)) "likelihood" else "curvature",
+      change = if (any(hit)) measured$change[which(hit)[1L]] else NA_real_)
+  })
+  # Confirmed flat and not below `rtol`: the directions the eigenvalue rule
+  # would have missed at this stopping point. Matched to this decomposition
+  # where one of its eigenvectors is the same direction, so the recorded
+  # curvature is this matrix's; otherwise described by the vector the screen
+  # walked, which is the direction the evidence is about.
+  for (m in seq_along(measured$change)) {
+    k <- measured$index[m]
+    if (!is.na(k) && k %in% weak) next
+    vector <- if (is.na(k)) measured$vectors[, m] else decomposition$vectors[, k]
+    eigenvalue <- if (is.na(k)) sum(vector * (information %*% vector)) else values[k]
+    directions[[length(directions) + 1L]] <- describe(vector, eigenvalue,
+      evidence = "likelihood", change = measured$change[m])
+  }
+  # The parameters named, read off the subspace rather than collected from the
+  # directions one at a time: see the head of this function. The directions'
+  # own lists stand in only when their vectors cannot be read, so a flat
+  # direction is never reported with no parameter at all.
+  share <- .ctIdentifySubspaceShare(directions, n)
+  named <- which(is.finite(share) & share >= nullmass)
+  named <- named[order(share[named], decreasing = TRUE)]
+  parameters <- as.character(if (length(named)) parnames[named] else
+    unique(unlist(lapply(directions, `[[`, "parameters"))))
+  # Which of those directions are a random-effect block trading its scale off
+  # against its correlations -- partially rather than completely unidentified.
+  # Only attempted when a caller supplies the model and the point, because it
+  # takes engine calls; without them every direction reads as complete
+  # non-identification, which is what this said before.
+  directions <- .ctIdentifyClassify(fit, at, directions, metric = metric)
+  # The eigenvectors go out only when a caller asked for them. A fit stores
+  # this report, and one length-`npar` vector per flat direction is
+  # `nweak * npar` doubles for something nothing downstream of a fit reads --
+  # 12 MB on a 1490-parameter model with a thousand flat directions. The
+  # naming and the classification above and `ctIdentify()`'s subspace
+  # aggregation are the readers, and only the last outlives this call.
+  if (!isTRUE(vectors)) {
+    directions <- lapply(directions, function(d) { d$vector <- NULL; d })
+  }
+  out <- list(
+    nweak = length(directions),
+    condition = scale / max(min(values[values > 0], na.rm = TRUE), .Machine$double.xmin),
+    # Negative *against the scale of the matrix*, not against zero. An
+    # eigenvalue of -3e-16 where the largest is 9e5 is what a symmetric
+    # eigendecomposition does to a direction whose true curvature is zero; it
+    # is the flat direction `nweak` already counts, not a saddle. Counting it
+    # as negative fired "this is not a maximum" on ordinary fits sitting at
+    # their optimum with a gradient of 5e-10, which is how a warning worth
+    # reading gets ignored.
+    #
+    # And not where the certification of this same curvature walked the
+    # negative directions with the saddle ladder and found them flat
+    # (`.ctBackendSaddleFlat()`): those are directions the data do not
+    # determine, counted in `nweak` already, whose curvature came out at
+    # rounding on the negative side.
+    negative = if (.ctBackendSaddleFlat(certification,
+      sum(values < -rtol * scale), .ctJuliaOr(certification[["tolerance"]], 0)))
+      0L else sum(values < -rtol * scale),
+    directions = directions,
+    parameters = parameters)
+  # What the likelihood was asked, when it was: the bar, the ladder and the
+  # candidate gate the verdicts above were reached with, and what they cost.
+  # `[[` throughout, not `$`: the stored summary has an `eigenvalue` field and
+  # no `eig`, and `$eig` would partially match it.
+  if (is.list(screen)) {
+    own <- !is.null(screen[["eig"]])
+    out$screen <- list(bar = screen[["bar"]], lengths = screen[["lengths"]],
+      rtol = screen[["rtol"]],
+      candidates = if (own) length(screen[["candidates"]]) else
+        as.integer(screen[["candidates"]]),
+      evaluations = screen[["evaluations"]])
+  }
+  if (!is.null(carried)) out$effects <- carried
+  out
+}
+
+# The directions `.ctOptimFlatDirectionScreen()` measured flat, located in a
+# decomposition of the same curvature.
+#
+# `screen` is either the screen's own result or the summary the uncertainty
+# stage keeps of it (`fit$uncertainty$details$flatdirections`); both carry the
+# confirmed directions and the change each moved the likelihood by. Each is
+# matched to an eigenvector of `vectors` when one is the same direction -- the
+# usual case, since both decompose the same Hessian -- and left unmatched,
+# `NA`, otherwise: the score-based routes, say, store a different matrix from
+# the one the screen walked.
+#' @keywords internal
+.ctIdentifyMeasuredFlat <- function(screen, vectors) {
+  none <- list(index = integer(), change = numeric(),
+    vectors = matrix(numeric(), nrow = nrow(vectors), ncol = 0L))
+  if (!is.list(screen) || is.null(vectors)) return(none)
+  # `[[`, not `$`: the summary has `eigenvalue` and no `eig`, and `$eig` would
+  # partially match it and read the summary as the screen's own result.
+  if (!is.null(screen[["eig"]])) {
+    # The screen's own result.
+    confirmed <- which(as.logical(screen[["flat"]]))
+    walked <- screen[["eig"]]$vectors[, confirmed, drop = FALSE]
+    change <- as.numeric(screen[["change"]][confirmed])
+  } else {
+    # The summary kept on a fit.
+    walked <- screen[["vectors"]]
+    change <- as.numeric(screen[["change"]])
+  }
+  if (is.null(walked) || !is.matrix(walked) || !ncol(walked) ||
+      nrow(walked) != nrow(vectors) || length(change) != ncol(walked)) {
+    return(none)
+  }
+  index <- vapply(seq_len(ncol(walked)), function(m) {
+    alignment <- abs(as.numeric(crossprod(vectors, walked[, m])))
+    best <- which.max(alignment)
+    if (length(best) && alignment[best] > 0.999) as.integer(best) else NA_integer_
+  }, integer(1))
+  list(index = index, change = change, vectors = walked)
+}
+
+# Partial against complete non-identification, and why the difference is worth
+# the engine calls it costs.
+#
+# A random effect on a *variance* cell -- DIFFUSION, MANIFESTVAR -- under
+# `intoverpop='augmented'` is a latent state whose value enters only the
+# predicted covariance. The observation mean function's Jacobian with respect
+# to it is zero, so the Kalman update can never move it, and it is learned
+# about only through its correlation with states the filter can update. The
+# consequence, measured: the population sd and the correlations trade off along
+# a ridge whose *cross-covariances* are pinned to five significant figures
+# while the sd runs over a factor of 16 and the log likelihood moves by 1.3e-06.
+#
+# So the data does determine something here, and the advice that fits complete
+# non-identification -- fix one of the set, or remove it -- throws that
+# something away. Telling the two cases apart is computable rather than
+# guessable: if every coordinate a flat direction loads on is a population
+# scale or correlation of one random-effect block, and the block's
+# cross-covariance functionals do not change along the direction, then the
+# covariances are what the data determines and their decomposition into scales
+# and correlations is what it does not.
+#
+# The one functional that legitimately *does* change along such a direction is
+# the implicated effect's own variance -- a variance is not a covariance
+# between two effects, and nothing in this mechanism identifies it. Any other
+# entry moving is a different problem, and then this reports nothing and the
+# complete-non-identification advice stands.
+
+# Which raw coordinates make up the population covariance block, and how to
+# materialise that covariance -- on the augmented route only.
+#
+# The finding is the augmented objective's, not the model's: the mechanism above
+# is the augmented filter's, which cannot update a variance cell's carrier. On
+# the Laplace route the likelihood depends on a level's scales and correlations
+# only through the covariance they build, so a flat direction that moves one of
+# its variances is that variance undetermined -- the complete case, and the
+# fix-or-remove advice is the right one. Classified as partial there, it was
+# reported under "intoverpop='augmented'" and advised to try the route it was
+# already on; that happened whenever a flat scale's correlations sat near zero,
+# since a cross-covariance through a zero correlation does not move with the
+# scale whatever the data say (AnomAuth S1 at its best-known point: the sds of
+# cint and drift, both flat, with the raw correlation between them at 8e-07). So
+# Laplace levels are not blocks.
+#
+# The augmented route holds the scales and correlations in
+# `spec$random_effects` (they are cells of the RAWPOPVAR matrix). A block is
+# the scales and correlations together, because a scale is identified or not
+# *jointly with the correlations it multiplies*.
+#' @keywords internal
+.ctIdentifyBlocks <- function(spec) {
+  if (is.null(spec)) return(list())
+  blocks <- list()
+  effects <- spec$random_effects
+  if (!is.null(effects) && length(effects) && nrow(effects)) {
+    sds <- effects[effects$type %in% "sd", , drop = FALSE]
+    cors <- effects[effects$type %in% "correlation", , drop = FALSE]
+    if (nrow(sds)) blocks[[length(blocks) + 1L]] <- list(
+      route = "augmented", level = 1L, name = "subject",
+      sd_index = as.integer(sds$parameter), cor_index = as.integer(cors$parameter),
+      param = as.character(sds$param),
+      # The carrier state each scale belongs to, which is where it sits in the
+      # augmented T0VAR and therefore in the population covariance.
+      state = as.integer(sds$row))
+  }
+  blocks
+}
+
+# The population covariance of one block at one raw vector.
+#' @keywords internal
+.ctIdentifyPopcov <- function(fit, block, values) {
+  # The augmented route's population covariance is the carrier block of the
+  # augmented model's T0cov, and `rows` keeps everything else off the bridge.
+  layout <- try(.ctBackendSummaryLayout(fit), silent = TRUE)
+  if (inherits(layout, "try-error")) return(NULL)
+  slot <- which(layout$matrix %in% "T0cov")
+  if (!length(slot)) return(NULL)
+  n <- layout$nrow[slot[1L]]
+  states <- block$state
+  if (!length(states) || any(!is.finite(states)) || any(states > n)) return(NULL)
+  grid <- expand.grid(i = seq_along(states), j = seq_along(states))
+  rows <- layout$offset[slot[1L]] +
+    (states[grid$j] - 1L) * n + states[grid$i]
+  flat <- try(.ctBackendParMatricesFlat(fit, values, rows = rows), silent = TRUE)
+  if (inherits(flat, "try-error")) return(NULL)
+  flat
+}
+
+# Central differences of every entry of the block's population covariance, over
+# the block's own coordinates only.
+#
+# Computed once per block and point rather than once per direction, because it
+# does not depend on the direction and a rank-limited model can have dozens.
+#' @keywords internal
+.ctIdentifyPopcovGradient <- function(fit, at, block, h = 1e-5) {
+  index <- c(block$sd_index, block$cor_index)
+  index <- index[is.finite(index) & index >= 1L & index <= length(at)]
+  if (!length(index)) return(NULL)
+  values <- matrix(as.numeric(at), nrow = length(at),
+    ncol = 2L * length(index) + 1L)
+  for (position in seq_along(index)) {
+    values[index[position], 2L * position] <-
+      values[index[position], 2L * position] + h
+    values[index[position], 2L * position + 1L] <-
+      values[index[position], 2L * position + 1L] - h
+  }
+  covariance <- .ctIdentifyPopcov(fit, block, values)
+  if (is.null(covariance) || !all(is.finite(covariance))) return(NULL)
+  k <- length(block$sd_index)
+  if (nrow(covariance) != k * k) return(NULL)
+  gradient <- matrix(0, nrow = k * k, ncol = length(index))
+  for (position in seq_along(index)) {
+    gradient[, position] <- (covariance[, 2L * position] -
+      covariance[, 2L * position + 1L]) / (2 * h)
+  }
+  list(index = index, gradient = gradient, size = sqrt(rowSums(gradient^2)),
+    entries = expand.grid(i = seq_len(k), j = seq_len(k)),
+    value = covariance[, 1L])
+}
+
+# How far each entry of the block's population covariance is from constant
+# along `direction`: zero means the direction preserves it.
+#
+# The direction has been checked to lie in the block already, so its components
+# elsewhere are zero and cannot contribute to the derivative along it.
+# Restricting the gradient to the block can therefore only make the reported
+# cosine larger, which is the safe side for a check that has to be convinced
+# before it will say the covariance is determined.
+#' @keywords internal
+.ctIdentifyPopcovCosines <- function(measured, direction) {
+  step <- direction[measured$index]
+  norm <- sqrt(sum(step^2))
+  if (!is.finite(norm) || norm <= 0) return(NULL)
+  along <- abs(as.numeric(measured$gradient %*% (step / norm)))
+  ifelse(measured$size > 0, along / measured$size, NA_real_)
+}
+
+# Tag each flat direction that is one random-effect block's scale/correlation
+# ridge rather than a parameter the data says nothing about.
+#' @keywords internal
+.ctIdentifyClassify <- function(fit, at, directions, metric = NULL,
+  mass = 0.99, cosine = 1e-4) {
+  if (is.null(fit) || is.null(at) || !length(directions)) return(directions)
+  blocks <- try(.ctIdentifyBlocks(.ctBackendSpec(fit)), silent = TRUE)
+  if (inherits(blocks, "try-error") || !length(blocks)) return(directions)
+  at <- as.numeric(at)
+  # One entry per block, filled the first time a direction needs it and NA
+  # once it is known not to be obtainable, so a failed probe is not retried
+  # for every remaining direction.
+  probes <- vector("list", length(blocks))
+  for (k in seq_along(directions)) {
+    v <- directions[[k]]$vector
+    if (length(v) != length(at)) next
+    total <- sum(v^2)
+    if (!is.finite(total) || total <= 0) next
+    for (b in seq_along(blocks)) {
+      block <- blocks[[b]]
+      index <- c(block$sd_index, block$cor_index)
+      index <- index[is.finite(index) & index >= 1L & index <= length(v)]
+      if (!length(index) || length(block$sd_index) < 2L) next
+      # Everything the direction loads on has to be in this block. A single
+      # random effect (`sd_index` shorter than two) is skipped above: with no
+      # partner there is no covariance for the data to determine, so its scale
+      # being flat is complete non-identification and reads as such.
+      if (sum(v[index]^2) < mass * total) next
+      if (is.null(probes[[b]])) {
+        probe <- .ctIdentifyPopcovGradient(fit, at, block)
+        probes[[b]] <- if (is.null(probe)) NA else probe
+      }
+      if (!is.list(probes[[b]])) next
+      measured <- probes[[b]]
+      # `metric` is the scaling the information matrix was put in before its
+      # eigenvectors were taken (`.ctIdentifyInformation`); the covariance
+      # functionals are differentiated in raw coordinates, so the direction has
+      # to come back to them before the two are compared.
+      raw <- if (is.null(metric)) v else v / as.numeric(metric)
+      measured$cosine <- .ctIdentifyPopcovCosines(measured, raw)
+      if (is.null(measured$cosine)) next
+      i <- measured$entries$i
+      j <- measured$entries$j
+      # Which sds are implicated is read off what actually moves rather than
+      # off the eigenvector's loadings. At one fitted estimate the ridge
+      # direction was 0.99 correlation and 0.16 scale in raw coordinates, so a
+      # loading threshold of 0.25 said the scale was not involved while the
+      # scale was exactly what was running -- the covariance it preserved says
+      # so unambiguously and a threshold on the basis does not.
+      present <- measured$size > 0 & is.finite(measured$cosine)
+      moving <- present & measured$cosine >= cosine
+      # A cross-covariance that moves along the direction is not determined
+      # either, and then this is complete non-identification of the block, not
+      # a scale trading against its correlations.
+      if (any(moving & i != j)) next
+      implicated <- sort(unique(i[moving]))
+      if (!length(implicated)) next
+      # Something has to be determined, or there is nothing to preserve and
+      # nothing to say: a block with no cross-covariance to hold constant
+      # tells us nothing about this direction.
+      if (!any(present & i != j)) next
+      directions[[k]]$partial <- list(route = block$route, level = block$level,
+        block = block$name, parameters = block$param[implicated],
+        partners = block$param[setdiff(seq_along(block$param), implicated)],
+        cosine = max(measured$cosine[present & i != j]))
+      break
+    }
+  }
+  directions
+}
+
+# Split a set of flat directions into the parameters whose covariances the data
+# still determines and the parameters it says nothing about.
+#
+# Two vocabularies meet here and they are not the same. `$partial` and
+# `$partners` are *model* parameter names -- `diff_eta1` -- because that is
+# what the sentence about population sds is about. `$covered` and
+# `$structural` are *raw coordinate* names -- `popsd_diff_eta1` --  because
+# that is what the eigenvectors are indexed by and what "parameters involved"
+# has always listed. Comparing one against the other silently produced an
+# empty intersection and the wrong message.
+#' @keywords internal
+.ctIdentifyPartition <- function(directions) {
+  empty <- list(partial = character(), covered = character(),
+    structural = character(), partners = character())
+  if (!length(directions)) return(empty)
+  partial <- character(); structural <- character()
+  partners <- character(); covered <- character()
+  for (direction in directions) {
+    if (!is.null(direction$partial)) {
+      partial <- c(partial, direction$partial$parameters)
+      partners <- c(partners, direction$partial$partners)
+      covered <- c(covered, direction$parameters)
+    } else {
+      structural <- c(structural, direction$parameters)
+    }
+  }
+  covered <- unique(covered)
+  list(partial = unique(partial), covered = covered,
+    # A coordinate on a partially identified ridge and on a genuinely flat
+    # direction elsewhere is reported under the stronger of the two.
+    structural = setdiff(unique(structural), covered),
+    # One direction's partner can be another's implicated scale; naming it in
+    # both halves of the same sentence would be worse than dropping it here.
+    partners = setdiff(unique(partners), unique(partial)))
+}
+
+# The wording, in one place, because it is said twice: before a fit by
+# `print.ctIdentify` and after one by `.ctBackendIdentifyWarn`. One paragraph
+# per element, so a caller can wrap it or run it together.
+#
+# `brief` is the same content in a phrase, for the second of those callers.
+# The two media are not the same size: `print.ctIdentify()` is a report the
+# user asked for and can run to a paragraph, while `warning()` is truncated by
+# R at `getOption("warning.length")` -- 1000 bytes by default. The full text
+# plus the interval note ran past that, so the end of the warning was cut off
+# mid-word, which is worse than either version. Still one function, so there
+# is still one place per element to change.
+# Both wordings name `intoverpop='augmented'`, and the full one says outright
+# that this is the objective's property rather than the model's, because the
+# difference is large and the earlier text did not carry it. Measured on one
+# ordinal model, 50 subjects and 20 occasions, by fitting each route and then
+# evaluating each objective at both points: the augmented objective separates a
+# population sd of 0.7 from one of 1900 by 0.066 log units, and the laplace
+# objective separates the same two points by 40.2. So the data holds the
+# information and the augmented route does not use it -- and augmented does
+# faintly prefer the runaway, which is why this is not an optimiser message.
+# With Gaussian indicators the two routes agree exactly (-4245.781 both), so
+# what saturates is the categorical link: once the prior sd exceeds the
+# threshold spacing the predicted category probabilities stop moving with it,
+# and nothing pays for a wider population. `log|Sigma|` under laplace is
+# explicit and never goes through the link.
+#
+# `zero` is the random-effect check's rows for population sds held small by
+# the data (`.ctEffectRows(effects, "zero")`). Such an sd's raw coordinate is
+# flat because it sits at the floor of its transform, where every smaller sd
+# is as good as zero, and not because the data say nothing: on AnomAuth the
+# CINT's sd is 8.5e-7 and at the starting spread its 800 subjects would carry
+# 794 subjects' worth of information about it. "Not estimable" said the
+# opposite of the check, which (rightly) stays silent there, so such a
+# coordinate is named as what it is.
+#' @keywords internal
+.ctIdentifyAdvice <- function(partition, brief = FALSE, zero = NULL) {
+  lines <- character()
+  held <- if (is.data.frame(zero))
+    zero[zero$coordinate %in% partition$structural, , drop = FALSE] else NULL
+  if (!is.null(held) && nrow(held)) {
+    partition$structural <- setdiff(partition$structural, held$coordinate)
+  } else held <- NULL
+  if (length(partition$partial)) {
+    many <- length(partition$partial) > 1L
+    # The correlation noun follows the number of *partners*, the covariance
+    # noun the number of pairs; one sd against one partner otherwise read
+    # "its correlations with drift_eta1; only the covariances are".
+    pairs <- max(1L, length(partition$partial)) *
+      max(1L, length(partition$partners))
+    if (brief) lines <- c(lines, paste0(
+      "The population ", if (many) "sds of " else "sd of ",
+      paste(partition$partial, collapse = ", "),
+      if (many) " are" else " is", " not separately identified from ",
+      if (many) "their" else "its", " correlation",
+      if (length(partition$partners) == 1L) " with " else "s with ",
+      if (length(partition$partners))
+        paste(partition$partners, collapse = ", ") else "each other",
+      " under intoverpop='augmented'",
+      if (pairs > 1L) "; only the covariances are. " else
+        "; only the covariance is. ",
+      "intoverpop='laplace' identifies ",
+      if (many) "them" else "it", " separately.")) else
+    lines <- c(lines, paste0(
+      "The population ", if (many) "sds of " else "sd of ",
+      paste(partition$partial, collapse = ", "),
+      if (many) " are" else " is",
+      " not separately identified from ", if (many) "their" else "its",
+      " correlations with ",
+      if (length(partition$partners)) paste0(
+        "the other individually varying parameters (",
+        paste(partition$partners, collapse = ", "), ")") else "each other",
+      " under intoverpop='augmented': only the covariances they generate ",
+      "are, and those the data determines. Reported sds and correlations for ",
+      "these parameters trade off along a ridge and will not repeat between ",
+      "runs. This is a property of the augmented objective rather than of the ",
+      "model or the data: intoverpop='laplace' identifies the ",
+      if (many) "sds" else "sd",
+      " separately from the same data, because there each subject's own ",
+      "random effect enters that subject's likelihood."))
+  }
+  if (length(partition$structural)) {
+    lines <- c(lines, if (brief) paste0("Not estimable as the model stands: ",
+      paste(partition$structural, collapse = ", "),
+      ". Fix one of each set, or remove it.") else paste0(
+      "Parameters involved: ",
+      paste(partition$structural, collapse = ", "),
+      ". These are not estimable from this data as the model stands. Fix one ",
+      "of each set to a value, or remove it."))
+  }
+  if (!is.null(held)) {
+    many <- nrow(held) > 1L
+    named <- paste0(held$coordinate, " (", signif(held$popsd, 2), ")",
+      collapse = ", ")
+    lines <- c(lines, if (brief) paste0("Held near zero by the data: ", named,
+      "; flat only along the floor of ", if (many) "their transforms" else
+      "its transform", ", since the data would see a spread of the starting ",
+      "size.") else paste0("Held near zero by the data: ", named, ". ",
+        if (many) "These directions are" else "This direction is",
+        " flat only along the floor of the population sd's transform, where ",
+        "every smaller sd is as good as zero: at the spread every fit starts ",
+        "from, the data would determine ", if (many) "these sds" else "the sd",
+        " (fit$identifiability$effects). A finding of no individual ",
+        "differences, not a failure to estimate; indvarying = FALSE states the ",
+        "same model without the flat direction."))
+  }
+  lines
+}
+
+# Is each reported interval as wide as the curvature at the estimate supports?
+#
+# Two standard errors can be computed for a parameter from the same Hessian.
+# The *conditional* one, `1 / sqrt(information[i, i])`, is what the curvature in
+# that one coordinate supports with every other parameter held. The *marginal*
+# one, `sqrt(cov[i, i])`, is what gets reported, and it is the conditional one
+# divided by `sqrt(1 - R^2)`, where `R^2` is how well the other parameters
+# reproduce this one in the information metric. So their ratio is a pure number
+# saying how much of the reported width comes from the data and how much from
+# the parameter not being separable from the rest: a ratio of 10 is `R^2` of
+# .99, and 100 is .9999.
+#
+# Why it earns its place. A benchmark fit reached the right optimum -- the same
+# log likelihood to eight decimal places as its twin, and Stan's -- and reported
+# a drift interval a hundred times too wide, with a point estimate that had
+# wandered with it. Nothing else about the fit looked wrong; it was caught only
+# because two runs on identical data could be compared, and a user gets one run.
+# This ratio separates the two cleanly: 1.0 to 1.5 across every parameter of the
+# healthy fits measured here, against 1e4 on the parameter that had gone.
+#
+# Cheap: one diagonal and one square root, no extra evaluation of anything.
+# Computed for julia fits, where the exact Hessian is already on the fit;
+# nothing prevents the stan path from using it, and `ctReport()` is where that
+# would show.
+#
+# The other half of the question: an interval far *narrower* than the truth.
+#
+# The ratio above only ever grows, so it cannot see the opposite failure, and
+# that one is worse because it reads as a result rather than as a problem.
+# `ctOptimCovFromHessian()` projects the no-curvature directions out of the
+# information matrix before inverting it (see `.ctOptimIdentifiedInverse()`),
+# which is the right thing to do with a direction whose variance is infinite --
+# but a coordinate lying mostly *along* such a direction then inherits almost
+# none of the variance that is left, and is reported with a tight interval and
+# a large z instead of as undetermined. Measured on a one-latent model with
+# `indvarying` on DRIFT and DIFFUSION under `intoverpop='augmented'`: the raw
+# correlation between the two random effects has a dead flat profile -- the log
+# likelihood is bit-identical at r = 0.597, 0.750, 0.958 and 0.998, the
+# population sd compensating to hold their product fixed -- and `summary()`
+# reported `mean 0.597, sd 0.009, z 65.3`. The spurious precision *grows* with
+# the sample: z was 21.2 at 50 occasions and 65.3 at 200, so more data buys
+# more confidence in a number the likelihood does not distinguish at all.
+# Before the projection went in the same coordinate got a fabricated variance
+# of 1e8; the projection fixed the blow-up and left this in its place.
+#
+# What says so is the coordinate's share of the projected-out subspace,
+# `sum over flat k of V[i, k]^2` -- the squared length of `e_i`'s projection
+# onto the null space, between 0 and 1, and unlike any single eigenvector's
+# loading it does not depend on the arbitrary basis the eigendecomposition
+# returns inside that subspace. Any of it that is not rounding means the
+# asymptotic variance of that coordinate is infinite, whatever the projected
+# covariance reports. `rtol` is therefore `.ctOptimIdentifiedInverse()`'s 1e-12
+# rather than `.ctBackendIdentifiability()`'s 1e-8, so the two branches
+# partition rather than overlap: a direction flatter than 1e-12 was dropped and
+# lands here, one between the two tolerances was inverted into an enormous
+# variance and lands in the ratio above. `nullmass` is `.ctNullMassBar()`, the
+# bar `.ctBackendIdentifiability()` names parameters by too; see there for
+# where it sits and why.
+#' @keywords internal
+# `mass` is the per-coordinate share of the dropped subspace, when the caller
+# already has it. `nullmass` is the threshold it is compared against; the two
+# names sit next to each other because one is the measurement and the other the
+# bar. Supplied by `.ctBackendUncertainty()` from the covariance the intervals
+# were actually built from, so this report names the same coordinates that
+# construction dropped. Recomputing it here instead would answer a different
+# question the moment the two disagree -- and they do disagree, because the
+# covariance now also drops directions the likelihood was *measured* flat along
+# rather than only those whose eigenvalue underflowed. See
+# `.ctOptimFlatDirectionScreen()`.
+.ctBackendIntervalCheck <- function(hessian, se, parnames = NULL,
+  threshold = 100, rtol = .ctFlatDirectionRtol(), nullmass = .ctNullMassBar(),
+  mass = NULL) {
+  empty <- list(threshold = threshold, nflagged = 0L, parameters = character(),
+    nullmass = nullmass, nunidentified = 0L, unidentified = character(),
+    table = data.frame(param = character(), se = numeric(),
+      curvature_se = numeric(), ratio = numeric(), nullmass = numeric(),
+      stringsAsFactors = FALSE))
+  if (is.null(hessian) || is.null(se)) return(empty)
+  hessian <- as.matrix(hessian)
+  se <- as.numeric(se)
+  if (nrow(hessian) != ncol(hessian) || nrow(hessian) != length(se)) return(empty)
+  if (!all(is.finite(hessian))) return(empty)
+  n <- length(se)
+  if (is.null(parnames) || length(parnames) != n) parnames <- paste0("par", seq_len(n))
+  information <- -(hessian + t(hessian)) / 2
+  diagonal <- diag(information)
+  # A non-positive diagonal is not a wider interval, it is no curvature at all;
+  # `.ctBackendIdentifiability()` is what reports that, so it is left NA here
+  # rather than counted as a ratio of infinity and reported twice.
+  # Indexed, not `ifelse()`, which takes the root of every entry and warns
+  # "NaNs produced" after the fit for the ones it then discards.
+  curvature <- rep(NA_real_, n)
+  positive <- which(diagonal > 0)
+  curvature[positive] <- 1 / sqrt(diagonal[positive])
+  ratio <- se / curvature
+  supplied <- suppressWarnings(as.numeric(mass))
+  mass <- if (length(supplied) == n && !all(is.na(supplied))) supplied else
+    .ctBackendNullMass(information, rtol = rtol)
+  table <- data.frame(param = as.character(parnames), se = se,
+    curvature_se = curvature, ratio = ratio, nullmass = mass,
+    stringsAsFactors = FALSE)
+  flagged <- which(is.finite(ratio) & ratio > threshold)
+  undetermined <- which(is.finite(mass) & mass >= nullmass)
+  list(threshold = threshold, nflagged = length(flagged),
+    parameters = as.character(parnames[flagged]),
+    # The threshold goes out with the column, so a caller reading `$table` does
+    # not have to know the default to read it.
+    nullmass = nullmass, nunidentified = length(undetermined),
+    unidentified = as.character(parnames[undetermined]),
+    # Undetermined coordinates first, then the widest ratios. Ordering the whole
+    # table by ratio put them at the bottom, which is where a reader stops
+    # looking, and their ratio is small precisely because their interval
+    # collapsed.
+    table = table[order(-as.integer(is.finite(mass) & mass >= nullmass),
+      -ifelse(is.finite(mass), mass, -Inf),
+      -ifelse(is.finite(ratio), ratio, -Inf)), , drop = FALSE])
+}
+
+# The one rule for "this direction has no curvature".
+#
+# Three functions ask an information matrix that question and each took the
+# eigenvalues, scaled by the largest, and cut at 1e-12: `.ctBackendNullMass()`
+# below, `.ctBackendInformationSplit()` in R/ctBackendOptimGap.R, and
+# `.ctOptimIdentifiedInverse()` in R/ctOptimUncertainty.R. They agreed because
+# each carried the literal and a comment saying the others carried the same one
+# -- two rules that can disagree is how a fit comes to be described one way by
+# its intervals and another by its convergence verdict, and a comment is not
+# what stops that.
+#
+# Only the constant is shared, deliberately. The three differ in what they do
+# around it in ways that are not incidental: this one takes a values-only pass
+# first and returns NA when the decomposition fails, because "nothing is flat"
+# and "could not tell" are opposite findings; `.ctBackendInformationSplit()`
+# falls back to `max(abs(values))` when nothing is positive, so a point that is
+# a maximum in no direction is reported as such rather than as an empty gap;
+# `.ctOptimIdentifiedInverse()` returns NULL and inverts the trusted subspace.
+# Merging those error contracts would cost more than the four shared lines are
+# worth.
+#
+# The engine floors an information matrix at `1e-8` rather than this, in
+# `_bounded_inverse` (sample_nuts.jl). Deliberate rather than a fourth copy that
+# drifted: it builds the sampler's *metric*, where a direction wrongly called
+# flat costs only efficiency, against a reported covariance here, where it costs
+# a standard error. The looser bar belongs to the cheaper mistake. Do not
+# reconcile the two without reading both.
+#' @keywords internal
+.ctFlatDirectionRtol <- function() 1e-12
+
+# The one rule for "this coordinate lies in a flat subspace": at least this
+# much of it does. A coordinate's share of a subspace is the squared length of
+# its unit vector's projection there -- the diagonal of the projector,
+# `rowSums(Q^2)` for an orthonormal basis `Q`, between 0 and 1 -- and unlike its
+# loading on one eigenvector it does not depend on which basis spans the
+# subspace (`.ctIdentifySubspaceShare()`).
+#
+# Four places ask, and they have to give one answer: `.ctBackendIntervalCheck()`
+# names the coordinates whose reported interval has no width, which summary()
+# prints as NA; `ctOptimCovFromHessian()` counts them in its warning; and
+# `.ctBackendIdentifiability()` and `ctIdentify()` name the parameters the data
+# do not determine. A fit that warned seven parameters were not estimable
+# beside intervals with no width for ten -- the parity fixture at an early
+# stopping point, before the report shared this bar -- is the disagreement.
+#
+# The bar separates rounding from involvement, not large involvement from
+# small. An identified coordinate carries rounding's share, roughly
+# `(eps * largest / gap)^2`, or a trace of the ridge's pull on it: below 1e-10
+# on every identified coordinate of the one-latent model
+# `.ctBackendIntervalCheck()` describes, and 1.4e-08 at most on the parity
+# fixture. Involvement is set by the shape of the flat set and moves as
+# the optimiser walks along it, so a bar inside its spread is crossed by where
+# the fit stopped. Measured by following the parity fixture's ridge from the
+# full fit's estimate, re-optimising the other directions every half raw unit
+# (Windows and dev2): the weakest of its ten correlations carried 0.066 to
+# 0.068 of the flat direction six raw units one way, where the likelihood is
+# flat to 3e-06, and 0.0011 to 0.0013 three and a half the other way, 4.8e-04
+# to 6.9e-04 nats below; it first fell under this bar four raw units along,
+# 1.1e-03 to 1.5e-03 nats below, far from where either fit stopped (2e-05
+# nats apart). ctIdentify()'s freed-loading model says the
+# same from the other side: T0var_eta1 is part of its scale trade-off and
+# carries 0.002 to 0.065 of the flat direction across the three evaluation
+# points -- never a third of the largest loading, and a norm over ctIdentify's
+# old 0.25 at one point only, by 0.004.
+#' @keywords internal
+.ctNullMassBar <- function() 1e-3
+
+# How much of each coordinate lies in the null space of an information matrix.
+#
+# Zero for every coordinate when nothing is flat, and NA when the
+# decomposition cannot be had -- never silently zero, because "no flat
+# directions" and "could not tell" are opposite findings and one of them is a
+# clean bill of health.
+#
+# The eigenvalues are taken first and the eigenvectors only if one of them is
+# flat, because the usual answer is "nothing is flat" and a values-only
+# decomposition is several times cheaper than a full one -- this runs on every
+# fit, and on a model with a thousand-odd parameters the difference is seconds
+# rather than milliseconds.
+#' @keywords internal
+.ctBackendNullMass <- function(information, rtol = .ctFlatDirectionRtol()) {
+  n <- nrow(information)
+  values <- try(eigen(information, symmetric = TRUE,
+    only.values = TRUE)$values, silent = TRUE)
+  if (inherits(values, "try-error")) return(rep(NA_real_, n))
+  scale <- max(values)
+  if (!is.finite(scale) || scale <= 0) return(rep(NA_real_, n))
+  if (!any(values <= rtol * scale)) return(rep(0, n))
+  decomposition <- try(eigen(information, symmetric = TRUE), silent = TRUE)
+  if (inherits(decomposition, "try-error")) return(rep(NA_real_, n))
+  flat <- decomposition$values <= rtol * max(decomposition$values)
+  if (!any(flat)) return(rep(0, n))
+  rowSums(decomposition$vectors[, flat, drop = FALSE]^2)
+}
+
+# Population standard deviations that have collapsed to the floor of their
+# transform.
+#
+# Reported as a finding rather than a fault. A zero population standard
+# deviation says the data show no individual differences in that parameter,
+# which is a result; what it also says is that the parameter sits at the edge of
+# its own transform, where the curvature is zero and the reported interval is
+# therefore not a confidence statement about anything.
+#' @keywords internal
+.ctBackendCollapsedScales <- function(fit, tolerance = 1e-6) {
+  # Each level's population covariance at the estimate, on either route
+  # (`.ctBackendPopulations()`).
+  populations <- tryCatch(.ctBackendPopulations(fit,
+    matrix(as.numeric(fit$estimate$raw), nrow = 1L)), error = function(e) NULL)
+  rows <- list()
+  for (l in seq_along(populations)) {
+    population <- populations[[l]]
+    sds <- as.numeric(population$rawsd[1L, ])
+    name <- if (!is.null(population$level)) as.character(population$level) else
+      as.character(l)
+    collapsed <- which(sds <= tolerance)
+    if (length(collapsed)) {
+      rows[[length(rows) + 1L]] <- data.frame(level = name,
+        effect = collapsed, sd = sds[collapsed], stringsAsFactors = FALSE)
+    }
+  }
+  if (!length(rows)) return(data.frame())
+  do.call(rbind, rows)
+}
+
+# The coordinates whose reported spread the projection removed, named.
+#
+# Said as its own sentence because it is the one thing the surrounding warning
+# does not imply: "the standard errors along those directions are arbitrary"
+# prepares a reader for a number that is too big, and what they will actually
+# see is a number that is too small and a z of 65. See
+# `.ctBackendIntervalCheck()` for how the share is measured and why.
+#' @keywords internal
+.ctBackendNoWidthAdvice <- function(intervals, brief = FALSE) {
+  if (is.null(intervals) || !isTRUE(intervals$nunidentified > 0L)) return("")
+  named <- utils::head(intervals$unidentified, 6)
+  more <- if (length(intervals$unidentified) > 6) ", ..." else ""
+  many <- length(intervals$unidentified) > 1L
+  if (brief) return(paste0(" No width at all for ",
+    paste(named, collapse = ", "), more, ", so summary() reports ",
+    if (many) "those sds, intervals and zs" else "that sd, interval and z",
+    " as NA."))
+  paste0(" The reported spread for ", paste(named, collapse = ", "), more,
+    " is absent rather than small: ",
+    if (many) "those coordinates lie" else "that coordinate lies",
+    " in a direction with no curvature, which is left out of the inversion, ",
+    "so the sd, interval and z printed for ", if (many) "them" else "it",
+    " are artefacts of that projection and say nothing about the data. ",
+    "summary() reports them as NA.")
+}
+
+# A julia fit's closing warnings, in order of what matters.
+#
+# A fit that did not reach a maximum used to close with up to five warnings
+# about one situation: the covariance repair, the unidentified directions, the
+# negative curvature, the intervals wider than the curvature supports, and the
+# verdict itself -- on a binary model that ended at a saddle, about two
+# thousand characters. The verdict is what a reader has to act on, and at a
+# point that is not a maximum the standard errors are a secondary concern, so
+# then it is one warning: the verdict, and a sentence on the standard errors.
+# The negative-curvature warning is the verdict's own finding and goes.
+#
+# At a maximum the identifiability and interval warnings stand as before. The
+# covariance repair is said only when they say nothing: a direction left out of
+# the inversion is the unidentified direction they name, in other words.
+#' @keywords internal
+.ctBackendFitWarnings <- function(fit, repairs = character(0)) {
+  identify <- fit$identifiability
+  intervals <- fit$uncertainty$intervalcheck
+  verdict <- .ctBackendCertifyVerdict(fit)
+  if (!is.null(verdict) && isTRUE(verdict$failed)) {
+    .ctBackendIdentifyWarn(identify, fit$collapsedScales, intervals,
+      standard_errors = FALSE)
+    warning(verdict$text, .ctBackendStandardErrorNote(identify, intervals,
+      repairs), call. = FALSE)
+    return(invisible(NULL))
+  }
+  .ctBackendIdentifyWarn(identify, fit$collapsedScales, intervals)
+  said <- isTRUE(identify$nweak > 0L) || isTRUE(intervals$nflagged > 0L) ||
+    isTRUE(intervals$nunidentified > 0L)
+  if (length(repairs) && !said) warning(repairs[1L], call. = FALSE)
+  if (!is.null(verdict)) warning(verdict$text, call. = FALSE)
+  invisible(NULL)
+}
+
+# The standard errors in a sentence, for a fit whose verdict leads.
+#' @keywords internal
+.ctBackendStandardErrorNote <- function(identify, intervals, repairs) {
+  name3 <- function(x) paste0(paste(utils::head(x, 3), collapse = ", "),
+    if (length(x) > 3) ", ..." else "")
+  parts <- character(0)
+  if (isTRUE(identify$nweak > 0L)) parts <- c(parts, paste0(identify$nweak,
+    " direction", if (identify$nweak > 1L) "s are" else " is",
+    " not identified (", name3(identify$parameters), ")"))
+  wide <- setdiff(intervals$parameters, c(identify$parameters,
+    intervals$unidentified))
+  if (length(wide)) parts <- c(parts, paste0(length(wide), " interval",
+    if (length(wide) > 1L) "s are" else " is",
+    " far wider than the curvature supports"))
+  if (!length(parts) && length(repairs)) parts <- paste0("the covariance ",
+    "needed numerical repair")
+  if (!length(parts)) return("")
+  paste0(" The standard errors there are unreliable too: ",
+    paste(parts, collapse = ", and "), "; see fit$identifiability and ",
+    "fit$uncertainty$intervalcheck.")
+}
+
+# Say it once, at the end of a fit, in the terms a reader needs.
+# `standard_errors = FALSE` keeps only the collapsed-scale message, for a fit
+# whose verdict carries the rest (`.ctBackendFitWarnings()`).
+#' @keywords internal
+.ctBackendIdentifyWarn <- function(identify, collapsed, intervals = NULL,
+  standard_errors = TRUE) {
+  if (!isTRUE(standard_errors)) {
+    identify <- NULL
+    intervals <- NULL
+  }
+  nowidth <- .ctBackendNoWidthAdvice(intervals, brief = TRUE)
+  if (!is.null(identify) && identify$nweak > 0L) {
+    # Which parameters are on a random-effect scale/correlation ridge and which
+    # the data says nothing about, in the same words `print.ctIdentify()` uses
+    # -- the advice differs between the two cases and a fit is where it is
+    # most expensive to get wrong.
+    #
+    # `brief`, and the shell around it kept to a phrase, because R truncates a
+    # warning at 1000 bytes and the full wording plus the interval note ran
+    # past it -- the reader lost exactly the part naming what to do. What is
+    # dropped is explanation, not content: every parameter and every piece of
+    # advice is still named, and `fit$identifiability` carries the rest.
+    partition <- .ctIdentifyPartition(identify$directions)
+    warning("The data do not identify ", identify$nweak, " direction",
+      if (identify$nweak > 1L) "s" else "", " of this model; the estimates ",
+      "stand but the standard error",
+      if (identify$nweak > 1L) "s along them do" else " along it does",
+      " not. ",
+      paste(.ctIdentifyAdvice(partition, brief = TRUE,
+        zero = .ctEffectRows(identify[["effects"]], "zero")), collapse = " "),
+      if (!length(partition$partial) && !length(partition$structural))
+        paste0("Parameters involved: ",
+          paste(utils::head(identify$parameters, 6), collapse = ", "),
+          if (length(identify$parameters) > 6) ", ..." else "", ".") else "",
+      nowidth,
+      " See fit$identifiability, or ctIdentify(data, model) before the next ",
+      "fit.", call. = FALSE)
+    # Carried by the warning above rather than repeated under it: the two are
+    # about one finding and a reader who has to be told twice stops reading.
+    nowidth <- ""
+  }
+  # A null direction at 1e-12 is a flat direction at 1e-8 too, so this normally
+  # travels with the warning above. It stands alone only when the two were
+  # computed from different Hessians -- `ctOptimUncertainty()` re-run with a
+  # different method is the case -- and then it is the more specific of the two
+  # and worth saying by itself.
+  if (nzchar(nowidth)) {
+    warning(trimws(nowidth), " See fit$uncertainty$intervalcheck.",
+      call. = FALSE)
+  }
+  if (!is.null(identify) && isTRUE(identify$negative > 0L)) {
+    warning(identify$negative, " direction",
+      if (identify$negative > 1L) "s have" else " has",
+      " negative curvature at the estimate, so it is not a maximum there. ",
+      "Treat the estimate as a stopping point rather than a solution.",
+      call. = FALSE)
+  }
+  if (is.data.frame(collapsed) && nrow(collapsed)) {
+    message(nrow(collapsed), " population standard deviation",
+      if (nrow(collapsed) > 1L) "s were" else " was",
+      " estimated at zero (level ",
+      paste(unique(collapsed$level), collapse = ", "),
+      "). That is a finding -- no detectable individual differences -- but the ",
+      "parameter sits at the edge of its transform, where the curvature is ",
+      "zero, so its reported interval is not a confidence statement. See ",
+      "fit$collapsedScales.")
+  }
+  # Said even when no direction is flat enough to count as unidentified, which
+  # is the case this exists for: a parameter can be separable in principle and
+  # still have almost all of its reported width come from its entanglement with
+  # the others, and then the interval moves by orders of magnitude between two
+  # runs that reached the same optimum.
+  # A parameter the identifiability warning above already named is not named
+  # again here: its wide interval is that finding, and on a binary fit both
+  # warnings listed the same TI-effect coefficient.
+  fresh <- if (is.null(intervals)) character(0) else
+    setdiff(intervals$parameters, c(if (isTRUE(identify$nweak > 0L))
+      identify$parameters, intervals$unidentified))
+  if (length(fresh)) {
+    involved <- paste(utils::head(fresh, 6), collapse = ", ")
+    if (length(fresh) > 6) involved <- paste0(involved, ", ...")
+    ratios <- intervals$table$ratio[intervals$table$param %in% fresh]
+    ratios <- ratios[is.finite(ratios)]
+    warning(length(fresh), " reported interval",
+      if (length(fresh) > 1L) "s are" else " is",
+      " far wider than the curvature at the estimate supports",
+      if (length(ratios)) paste0(" -- up to ", signif(max(ratios), 3),
+        " times the width that parameter's own curvature gives") else "",
+      ". That width comes from the parameter not being separable from ",
+      "the others rather than from the data, and it is not stable: it can ",
+      "move by orders of magnitude between two fits that reach the same ",
+      "optimum. Parameters involved: ", involved,
+      ". See fit$uncertainty$intervalcheck.", call. = FALSE)
+  }
+  invisible(NULL)
+}

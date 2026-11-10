@@ -1,0 +1,610 @@
+# backend='r' pinned rather than left at 'auto': this test characterises what the model recovers from one particular dataset, and the generator is not what is under test here.
+# Does `fit$optim$converged` mean what it says?
+#
+# The stan side has `test-stan-convergence.R`, which checks the same thing the
+# same way: the recorded gradient is the gradient at the reported estimate, it
+# is small on a fit that arrived, and it is large on one that stopped early.
+# This is the julia equivalent, and it exists because the flag was wrong in the
+# other direction. Over 64 optimisation replications of a benchmark whose log
+# likelihoods matched stan's to the digit, 45 reported `converged = FALSE`.
+#
+# All of them for the same reason. `converged` was keyed on `saturated` -- a
+# raw coordinate whose materialising transform has gone flat -- and saturation
+# covers two outcomes that share a zero gradient:
+#
+#   * the optimizer overstepped into the flat region and stopped somewhere
+#     that is not a maximum (a real failure, measured once at 16 log units
+#     below the profile peak), and
+#   * the data do not identify that coordinate, so it correctly ran to the
+#     edge while everything else converged. A population standard deviation
+#     with no individual differences behind it is the common case, and it is a
+#     finding rather than a fault.
+#
+# The engine now tells them apart by pulling coordinates back and asking
+# whether the objective improves -- at a maximum, nothing improves it. See
+# `_ctsem_overshot` in inst/julia/ContinuousTimeSEM/src/ctsem_backend.jl.
+#
+# ## The fixture this file used to use was not identified
+#
+# It generated data with the manifest means fixed at c(1, -0.5) for every
+# subject -- both population standard deviations exactly zero -- and fitted a
+# model estimating two of them and their correlation. Two of the tests here
+# asserted which optimum that fit reached and which flags came with it, and
+# both passed only because of where in the file they ran. Ten starts drawn the
+# way `inits = NULL` draws them, at sd 0.01:
+#
+#   -202.0846   8/10   popsd 0.382, 0.374   correlation ~1.000000
+#   -202.2331   2/10   popsd 0.000, 0.000   correlation ~0.999
+#
+# The reason is in the third column, and it is a property of the model rather
+# than of the optimiser or the data. Two *perfectly correlated* manifest-mean
+# random effects, on two manifests that both load 1 on a single latent, are a
+# latent-level random intercept -- which that model already has, through T0VAR
+# and DRIFT. So the between-person spread has two homes and the likelihood has
+# a maximum for each: the first solution puts it in the manifest means, the
+# second puts it in a slower drift (-0.396 against -0.341) and a larger T0VAR.
+# 0.15 nats apart, with 25 subjects and 8 timepoints.
+#
+# Nothing about convergence can be tested on that. A fit landing in either
+# basin is a correct answer to an under-identified question, and an assertion
+# about which one is an assertion about the starting draw. The fixture is gone
+# rather than pinned to a start that happens to pass: a fixture that only
+# behaves from a start we chose is a fixture that is hiding something, and the
+# hidden thing here was the model.
+#
+# What went with it is the only place in the suite where the `saturated`
+# certification status (`unidentified` until 2026-09-25) came from a real fit.
+# That status is still covered, deterministically and without a fit, by
+# `test-backend-optimgap.R`; and the coordinates reported with no width,
+# `.ctBackendIntervalCheck()`'s `$unidentified`, by `test-ctidentify.R` and
+# `test-ctOptimUncertainty.R` from information matrices directly, which is
+# where that behaviour actually lives.
+#
+# The fixture below is the same model over data that has the individual
+# differences it asks for, drawn independently for the two manifests so the
+# correlation is estimable and away from its boundary. One maximum: ten starts,
+# ten times -251.8548, spread 5.7e-14 nats, correlation -0.011, population sds
+# 0.30 and 0.29. Nothing here pins a starting value.
+
+skip_on_cran()
+skip_on_32bit()
+
+# Each subject gets its own manifest means, drawn around c(1, -0.5) and
+# independently of each other, so the fitted model's two population SDs and
+# their correlation are all things the data can speak to. Generated a subject
+# at a time because the individual differences are the point.
+.jconv_data <- function() {
+  set.seed(3)
+  rows <- lapply(seq_len(25), function(i) {
+    mm <- c(1, -0.5) + stats::rnorm(2, 0, 0.5)
+    gm <- suppressMessages(ctModel(type = "ct", n.latent = 1, n.manifest = 2,
+      LAMBDA = matrix(c(1, 1), 2, 1), DRIFT = matrix(-.4), DIFFUSION = matrix(.6),
+      MANIFESTVAR = diag(.2, 2), T0VAR = matrix(1), T0MEANS = matrix(0),
+      CINT = matrix(0), MANIFESTMEANS = matrix(mm, 2, 1), Tpoints = 8))
+    d <- suppressMessages(data.frame(ctGenerate(gm, n = 1, Tpoints = 8,
+      burnin = 0, backend = 'r')))
+    d$id <- i
+    d
+  })
+  do.call(rbind, rows)
+}
+
+.jconv_model <- function() suppressMessages(ctModel(type = "ct", n.latent = 1,
+  n.manifest = 2, LAMBDA = matrix(c(1, 1), 2, 1), CINT = matrix(0),
+  T0MEANS = matrix(0)))
+
+# The fit, computed once. Two tests ask different questions of it and nothing
+# here mutates it, so fitting it twice was a minute spent reproducing a number
+# we already had.
+.jconv_cache <- new.env(parent = emptyenv())
+.jconv_fit <- function() {
+  if (is.null(.jconv_cache$fit)) {
+    .jconv_cache$fit <- suppressWarnings(suppressMessages(
+      ctFit(.jconv_data(), .jconv_model(), backend = "julia", cores = 1,
+        verbose = 0)))
+  }
+  .jconv_cache$fit
+}
+
+test_that("the sgd phase (stochastic = TRUE) runs first and the fit still reaches the maximum", {
+  # The same certified optimum the default fit reaches below, through
+  # `_ctsem_sgd` then L-BFGS: the phase changes the path, not the answer, and
+  # is recorded on the fit.
+  expect_identical(.jconv_fit()$optim$sgd_iterations, 0L)
+  fit <- suppressWarnings(suppressMessages(ctFit(.jconv_data(), .jconv_model(),
+    backend = "julia", cores = 1, verbose = 0,
+    optimcontrol = list(stochastic = TRUE))))
+  expect_gt(fit$optim$sgd_iterations, 0L)
+  expect_lt(fit$optim$sgd_iterations, fit$optim$iterations)
+  expect_equal(fit$estimate$loglik, -251.8548, tolerance = 1e-4)
+  expect_equal(fit$uncertainty$certification$status, "certified")
+})
+
+test_that("the optimiser reaches the maximum and says so", {
+  fit <- .jconv_fit()
+  # `e` is what was estimated, `o` the run that found it.
+  e <- fit$estimate
+  o <- fit$optim
+
+  # The optimum, in nats, from whatever start the RNG supplies. Ten starts
+  # reached this to within 6e-14, which is what makes it assertable without
+  # pinning anything -- and what the old fixture could not offer.
+  expect_equal(e$loglik, -251.8548, tolerance = 1e-4)
+  expect_true(o$converged)
+  expect_equal(fit$uncertainty$certification$status, "certified")
+  expect_true(fit$uncertainty$certification$certified)
+
+  # Nothing is sitting on a boundary here -- the population SDs are 0.30 and
+  # 0.29 and the correlation is -0.011 -- so nothing is flat and there is
+  # nothing to overstep. That is the property the old fixture lacked.
+  expect_false(o$saturated)
+  expect_false(o$overshot)
+  expect_equal(o$overshoot_gain, 0)
+
+  # The recorded number is the thing it claims to be, so the assertions around
+  # it are not just the optimizer agreeing with itself.
+  expect_equal(max(abs(o$gradient)), o$gradient_norm, tolerance = 1e-10)
+
+  # With no flat direction left, the optimiser's own estimate of what remains
+  # is accurate rather than meaningless -- `1/2 g'Bg` against an exact gap of
+  # 1e-13 here, where on a saturated fit it has read 1.002 against 2e-15. That
+  # is the case `_ctsem_optimise_verdict`'s second condition exists for, and
+  # `test-backend-optimgap.R` keeps it under unit test.
+  expect_true(is.finite(o$predicted_gain))
+  expect_lt(o$predicted_gain, o$convergence_tolerance)
+
+  # Rounding-scale negative eigenvalues are not saddles. A symmetric
+  # eigendecomposition returns them for a direction whose true curvature is
+  # zero, and counting them fired "this is not a maximum" on fits sitting at
+  # one.
+  expect_equal(fit$identifiability$negative, 0L)
+})
+
+# Both of the optimiser's own stopping rules were switched off for every fit in
+# the package by a single line, and no test saw it. `.ctJuliaOptimise()` fills
+# in a default objective and then asked `is.null(objective)` to decide whether
+# the caller had brought one -- which is FALSE from that line onwards, so both
+# rules took the state-explicit branch on every route. `gap_tol` was 0, meaning
+# nothing stopped a fit whose next step was predicted to gain 1e-8, and
+# `stall_window` was 0, which is the whole stall check.
+#
+# Nothing failed. A rule that is switched off is indistinguishable, from the
+# outside, from a rule that never had cause to fire -- which is exactly how the
+# post-merge check on the stall work read "never fires on any test fit" as good
+# news. So the settings are now reported on the fit and asserted here: this is
+# the fit-free half, and it costs one read of a fit two other tests already
+# made.
+test_that("the stopping rules a marginal fit runs are the ones it asked for", {
+  skip_without_julia()
+  o <- .jconv_fit()$optim
+  # The marginal route certifies, so both rules are live at their defaults.
+  expect_equal(o$stall_window, .ctBackendStallWindow(list()))
+  expect_gt(o$stall_window, 0L)
+  expect_equal(o$gap_tol, .ctBackendInnerGapTol(list(), intoverstates = TRUE))
+  expect_gt(o$gap_tol, 0)
+  # And a caller who turns one off gets it off, which is the other half of
+  # showing the argument reaches the engine rather than a default doing so.
+  off <- suppressWarnings(suppressMessages(ctFit(.jconv_data(), .jconv_model(),
+    backend = "julia", cores = 1, verbose = 0,
+    optimcontrol = list(stallwindow = 0L, innergaptol = 0, maxiter = 5L))))
+  expect_equal(off$optim$stall_window, 0L)
+  expect_equal(off$optim$gap_tol, 0)
+  # And a fit that arrives under its own power is not escaped from. The escape
+  # runs only on a stage that stalled or that its own probe says is not a
+  # maximum, so a healthy fit pays nothing for it -- the other half of the
+  # claim the flat-transform test below makes.
+  expect_equal(o$stall_escapes, 0L)
+})
+
+test_that("a fit that reaches a rising plateau climbs it to the maximum", {
+  skip_without_julia()
+  # Random walks fitted with an OU model, from a start in a saddle region: the
+  # likelihood falls toward a plateau where drift runs to minus infinity
+  # (white noise, -39.8787) and rises from it, monotonically in the drift
+  # coordinate, to its maximum at the drift boundary (a random walk,
+  # -25.1894). The fixture of test-julia-particle.R. The finish once converged
+  # on the plateau on a Hessian from two steps back and was certified there on
+  # 6.4e-7 of predicted gain, 14.7 below the maximum; before that, a floored
+  # step along the plateau's negative curvature happened to jump off it. The
+  # claim is the maximum, whatever the path to it.
+  model <- suppressWarnings(ctModel(
+    type = "ct", LAMBDA = diag(1), DRIFT = matrix("drift", 1, 1),
+    DIFFUSION = matrix("diffusion", 1, 1), MANIFESTVAR = matrix(.3, 1, 1),
+    MANIFESTMEANS = matrix(0, 1, 1), T0VAR = matrix(1, 1, 1), T0MEANS = matrix(0, 1, 1)))
+  set.seed(4)
+  dat <- data.frame(id = rep(1:6, each = 5), time = rep(0:4, 6),
+    Y1 = as.vector(replicate(6, cumsum(rnorm(5, 0, .5)))))
+  fit_from <- function(start) suppressWarnings(suppressMessages(ctFit(dat, model,
+    backend = "julia", cores = 1, inits = start, verbose = 0)))
+  # The plateau's supremum, to show which side of it a fit ended on: the
+  # objective at drift raw -9, where the plateau is flat to six decimals.
+  spec <- suppressMessages(ctFit(dat, model, backend = "julia", fit = FALSE))
+  plateau <- max(vapply(seq(-1, 1, by = 0.01), function(s)
+    as.numeric(ctJuliaEvaluate(spec, c(-9, s), gradient = FALSE)$value),
+    numeric(1)))
+  expect_lt(plateau, -39.8)
+  # From the test's start, and from the point on the plateau the fit used to
+  # stop at: the maximum, and a verdict that says it is one. With the diagonal
+  # L-BFGS scaling the first start reaches the plateau further out, at raw
+  # drift -5.6, where the ridge is flat to 1e-5 over five raw units and the
+  # Hessian negative definite; the finish leaves it along the ridge
+  # (`_ctsem_flat_ladder`), which a straight probe could not.
+  for (start in list(c(0.1, -0.2), c(-4.204915, -0.161058))) {
+    fit <- fit_from(start)
+    expect_equal(fit$estimate$loglik, -25.1894, tolerance = 1e-4,
+      info = paste(start, collapse = " "))
+    expect_true(isTRUE(fit$optim$converged), info = paste(start, collapse = " "))
+  }
+})
+
+test_that("a julia fit stopped early does not converge, and says what is left", {
+  # The contrast that makes the assertions above mean something: the flag is
+  # not simply TRUE everywhere.
+  #
+  # One iteration, and no retry. `maxiter` caps a *stage*, and a fit the
+  # curvature says is short is resumed from where it stopped -- which, since
+  # the optimiser stopped capping every step at 0.1, reaches the optimum from
+  # a single iteration. `stallretries = 0` is what keeps a stopped-early fit
+  # stopped early.
+  capped <- suppressWarnings(suppressMessages(ctFit(.jconv_data(),
+    .jconv_model(), backend = "julia", cores = 1, verbose = 0,
+    optimcontrol = list(maxiter = 1, carefulfit = FALSE, stallretries = 0L))))
+  expect_false(capped$optim$converged)
+  # Stated as objective still available rather than as a large gradient. With
+  # the metric even one iteration brings the gradient down a long way, so
+  # "short" and "large gradient" have stopped being the same thing -- which is
+  # the reason the criterion moved to nats in the first place.
+  cert <- capped$uncertainty$certification
+  expect_true(cert$status %in% c("notmaximum", "suboptimal"))
+  expect_gt(cert$gap, cert$tolerance)
+  expect_equal(max(abs(capped$optim$gradient)),
+    capped$optim$gradient_norm, tolerance = 1e-10)
+})
+
+# Does any of this recover anything, or does it only report?
+#
+# Everything above asks what the optimiser says about where it stopped. This
+# asks whether it stops somewhere better, and it needs an extreme starting
+# value to ask it: from an ordinary start this model fits without incident, so
+# a guard that only ever runs on healthy fits can be switched off for a year
+# without anything going red. That is not hypothetical. Both of the
+# optimiser's stopping rules were off for every fit in the package, for months,
+# and the suite was green the whole time -- which is what the test above this
+# one exists to stop happening again, and what this one exists to make
+# meaningful.
+#
+# The start puts `drift` at raw 8, inside its own transform's flat region:
+# `-log1p_exp(-param)` has a derivative of 3.4e-4 there against 0.5 at zero, so
+# the gradient the optimiser sees in that coordinate is three orders down on
+# what the rest of the model gives it. The fit climbs, stops, and reports that
+# it converged -- at a point its own pullback probe can beat by 215 nats.
+#
+# Whether the corner strands the fit is a property of the sample, and this says
+# so rather than hiding it. Same generating process, `drift` started at raw 8
+# every time, four samples (local machine, 25 subjects x 25 timepoints):
+#
+#   seed 1   -806.0045  ->  -806.0045   no escape taken
+#   seed 2   -792.9143  ->  -792.9143   no escape taken
+#   seed 3   -785.2203  ->  -759.2346   +25.99, one escape
+#   seed 4   -790.4214  ->  -790.4214   escape taken, same optimum
+#
+# Two things follow. A single-sample assertion of a *gain* is an assertion
+# about the sample: this fixture drew seed 13 through `ctGenerate()` and
+# recorded a 211-nat rescue right up until a change to count sampling moved the
+# data underneath it, on a linear Gaussian generating model. And the escape
+# never loses on any sample, which is by construction -- the loop keeps a
+# resumed stage only on a measured improvement.
+#
+# What the escape is worth when a sample does strand the fit is larger than the
+# seed 3 row suggests, and it is not only about the answer. Seed 5, same start:
+#
+#   escape available     164 s   229 iterations  0.72 s/it   -770.1258
+#   escape unavailable  3153 s   437 iterations  7.21 s/it   -974.9147
+#
+# Both report `converged = TRUE`. The second is 204.8 log units short and took
+# nineteen times as long to get there, with 1516 function calls against 437
+# gradients -- a line search thrashing against a curvature model that predicted
+# gains of 1e5 where the step delivered tens.
+#
+# The ten-fold difference in cost per iteration is the part worth keeping in
+# mind, because it is not incidental. A drift raw of 8 is almost no mean
+# reversion, so each subject's trajectory runs away and its conditional mode
+# sits far from the origin -- and the inner Newton solve starts at the origin
+# every time, by design, so that distance is paid on every evaluation. Being
+# stuck in the flat corner makes the fit expensive as well as wrong, and
+# leaving it makes both better at once. Seed 5 is not used as the fixture
+# because its control arm takes fifty minutes.
+#
+# So the invariant is asserted and the demonstration is recorded. Seed 3 is
+# used *because* it is a sample where the corner strands the fit. If the
+# demonstration goes red, re-run the sweep before touching the number: "no
+# sample strands it any more" is a finding about the optimiser, not a stale
+# constant, and it is the second time it has happened here.
+#
+# Twenty-five and twenty-five, and the size is not incidental: the failure this
+# test reproduces lives in this realisation and was not found in any smaller
+# one. Searched, with the prior floor on and off each time -- 10x10, 12x12 and
+# 15x15 over six seeds, and 25x8, 25x10, 25x12, 20x10, 30x8 -- and no unit's
+# curvature is ever floored in any of them. Where a smaller fixture does show
+# the escape firing it fires identically with the floor off, so it is an
+# ordinary local optimum the escape already handled and not this at all.
+# Shrinking the fixture makes the test cheap by deleting what it tests.
+.jconv_flat_data <- function(seed = 3L, nsubjects = 25L, ntimes = 25L) {
+  set.seed(seed)
+  baseline <- stats::rnorm(nsubjects, 2, 2)
+  start <- stats::rnorm(nsubjects, baseline / 2, 1)
+  drift <- -log1p(exp(-stats::rnorm(nsubjects, baseline / 2, 0.5)))
+  diffusion <- 0.5
+  noise <- 0.5
+  rows <- lapply(seq_len(nsubjects), function(i) {
+    a <- drift[i]
+    decay <- exp(a)
+    intercept <- (baseline[i] / a) * (decay - 1)
+    innovation <- sqrt(diffusion^2 * (exp(2 * a) - 1) / (2 * a))
+    latent <- numeric(ntimes)
+    latent[1] <- start[i]
+    for (t in seq_len(ntimes - 1L)) {
+      latent[t + 1L] <- decay * latent[t] + intercept +
+        stats::rnorm(1, 0, innovation)
+    }
+    data.frame(id = i, time = seq_len(ntimes) - 1L,
+      Y1 = latent + stats::rnorm(ntimes, 0, noise),
+      stringsAsFactors = FALSE)
+  })
+  do.call(rbind, rows)
+}
+
+# Individually varying, nonlinear drift: the transform is the point, and
+# `intoverpop = 'laplace'` is the route whose population scales and
+# correlations the relative-flatness detector cannot see on its own.
+.jconv_flat_model <- function() suppressMessages(ctModel(silent = TRUE,
+  type = "ct", CINT = "cint", MANIFESTMEANS = 0, LAMBDA = matrix(1),
+  DRIFT = "drift|-log1p_exp(-param)|TRUE"))
+
+test_that("a fit started inside a flat transform gets back out of it", {
+  skip_without_julia()
+  # 210 s, against about 2 for everything else in this file, and it is in the
+  # slow tier because no cheaper reproduction exists rather than because nobody
+  # looked. What was searched, with the prior floor on and off each time:
+  # 10x10, 12x12 and 15x15 over six seeds; 25x8, 25x10, 25x12, 20x10 and 30x8;
+  # and both engine fixtures over eight population-scale settings. Not one
+  # floors a unit's curvature. Where a smaller fixture does show the escape
+  # firing it fires with the floor off too -- an ordinary local optimum the
+  # escape already handled, not this. `maxiter` is already bounded below at 250
+  # for the same reason; uncapped this is 1180 s.
+  #
+  # Worth revisiting: a fixture that reaches a near-singular unit curvature
+  # deliberately rather than by luck would make this cheap and would make the
+  # floor testable on demand. See
+  # `CT-SEM/review/LAPLACE-singular-unit-curvature-2026-09-22.md`.
+  skip_unless_slow("the flat-transform escape")
+  data <- .jconv_flat_data()
+  model <- .jconv_flat_model()
+  # Which raw coordinate `drift` is, without paying for a fit to find out.
+  spec <- suppressWarnings(suppressMessages(ctFit(data, model,
+    backend = "julia", intoverpop = "laplace", fit = FALSE)))
+  npar <- .ctBackendNpar(spec)
+  names <- .ctBackendRawParameterNames(list(model_spec = spec), npar)
+  drift <- which(names == "drift")
+  expect_length(drift, 1L)
+
+  inits <- rep(0, npar)
+  inits[drift] <- 8
+  # The transform is genuinely flat there, which is the premise of the whole
+  # test rather than an incidental detail.
+  expect_lt((1 / (1 + exp(8))) / 0.5, 1e-3)
+
+  # `maxiter` bounded, and 250 is a measured value rather than a round one.
+  # Under it the fit never reaches the bad point at all: at 60 and at 120 both
+  # configurations escape to -755 and the test passes whether or not the prior
+  # floor is there, which is a test that cannot fail. At 250 the floor-less fit
+  # converges onto the spurious maximum at its own 232nd iteration and stalls
+  # there, which is the thing being tested. Above it nothing changes except the
+  # cost: uncapped, the control fit exhausts 1000 iterations to reach the same
+  # verdict and the test takes 1180 s instead of 170.
+  fit_from <- function(...) suppressWarnings(suppressMessages(
+    ctFit(datalong = data, model = model, backend = "julia", cores = 1,
+      verbose = 0, intoverpop = "laplace", inits = inits,
+      optimcontrol = list(estonly = TRUE, maxiter = 250L, ...))))
+  # With no escape available this one does not converge, it runs out of
+  # iterations: the prior floor removed the spurious maximum it used to stop
+  # dead on, so nothing stops it early and nothing gets it out either. That is
+  # the control condition working, not a fault, and it is why `maxiter` is
+  # bounded above.
+  stuck <- fit_from(overshoot = "off", stallwindow = 0L)
+  free <- fit_from()
+
+  expect_true(is.finite(stuck$estimate$loglik))
+  expect_true(is.finite(free$estimate$loglik))
+  # The whole claim, in one line: the same model, the same data and the same
+  # starting values land somewhere materially better. 215 nats when measured;
+  # a hundred is the bar, so a change that costs most of the effect fails here
+  # rather than silently halving it.
+  # The invariant, true on every sample: the escape cannot lose. The loop keeps
+  # a resumed stage only when it measured an improvement, so this holds whether
+  # or not this particular sample needed rescuing -- and it is what would catch
+  # an escape that started accepting worse points.
+  expect_gte(free$estimate$loglik, stuck$estimate$loglik - 1e-6)
+  # And the demonstration, on the sample chosen for it. 29.48 measured; ten is
+  # the bar, so losing most of the effect fails here rather than passing
+  # quietly. Without the prior floor this is 0.000 and the fit converges,
+  # wrongly, 26.7 nats short -- which is what the floor is for.
+  expect_gt(free$estimate$loglik - stuck$estimate$loglik, 10)
+  # And by the route this is supposed to take, not by luck.
+  expect_gte(free$optim$stall_escapes, 1L)
+  expect_true(isTRUE(free$optim$converged))
+  # The control really did have nothing to escape with, so the difference is
+  # the escape rather than a second optimisation from anywhere at all.
+  expect_equal(stuck$optim$stall_escapes, 0L)
+})
+
+test_that("a later ctOptimUncertainty() certifies at the gaptol the fit asked for", {
+  skip_without_julia()
+  # The tolerance was read from the top of `fit$args`, where only the backend's
+  # own copy of the controls is -- the one a fit carries while it is being
+  # built. `ctFit()` then stores them as `$args$input` and `$args$resolved`, so
+  # certification inside the fit used `gaptol` and every later call used the
+  # default of 1e-6.
+  fit <- suppressWarnings(suppressMessages(ctFit(.jconv_data(), .jconv_model(),
+    backend = "julia", cores = 1, verbose = 0,
+    optimcontrol = list(gaptol = 1e-3, estonly = TRUE))))
+  fit <- suppressWarnings(suppressMessages(ctOptimUncertainty(fit,
+    uncertainty = "hessian", finishsamples = 50, verbose = 0)))
+  expect_equal(fit$uncertainty$certification$tolerance, 1e-3)
+})
+
+test_that("what the fit reports is what the curvature measured", {
+  # The complaint: a fit could pass certification -- the optimum bounded within
+  # `gaptol` of the estimate, no warning raised, the summary saying so -- and
+  # still report `converged = FALSE`, because that field was the optimiser's
+  # own gradient verdict and nothing ever revisited it. Two verdicts on one
+  # fit, and the weaker one was the one a user reads.
+  fit <- .jconv_fit()
+  certification <- fit$uncertainty$certification
+
+  # The precondition: something was measured. Without this the assertion below
+  # would hold vacuously on a fit that certified nothing.
+  expect_true(is.list(certification) && length(certification$status) == 1L)
+  expect_true(is.finite(certification$gap))
+
+  # The one rule, on a real fit: converged iff the curvature says this is a
+  # maximum. `saturated` is a maximum with a coordinate the data does not
+  # determine; the rest of the not-certified statuses are not maxima.
+  expect_equal(isTRUE(fit$optim$converged),
+    certification$status %in% c("certified", "saturated"))
+
+  # The held complaint is gone rather than left behind to be warned about by a
+  # later call on the same fit.
+  expect_null(fit$optim$convergence_pending)
+})
+
+test_that("a marginal model's exact Hessian reports its progress through the shared sink", {
+  skip_without_julia()
+  # The marginal route's Hessian is a forward sweep per dual width of
+  # parameters, about a gradient per parameter, and it reported nothing: a
+  # quarter of an hour, twice, on a 715-parameter model, with the progress
+  # line frozen on the iteration before. The sweeps are counted in the engine
+  # (test_hessian.jl); this is the plumbing, from `ctsem_hessian_progress` --
+  # `.ctBackendHessian()`'s entry point -- to R's sink. The model is the one
+  # the package image has compiled (helper-julia.R), so the subject is the
+  # reporting rather than a compile.
+  spec <- suppressMessages(ctFit(image_data(nsub = 6L, nobs = 5L, seed = 2L),
+    image_model(), backend = "julia", fit = FALSE, intoverpop = "augmented"))
+  npar <- ctsem:::.ctBackendNpar(spec)
+  module <- ctsem:::.ctJuliaModule(spec$project)
+  objective <- ctsem:::.ctJuliaObjective(spec)
+  raw <- rep(0.1, npar)
+  seen <- character()
+  capture <- function(text, kind = "update") seen <<- c(seen, text)
+  result <- ctsem:::.ctBackendJuliaValue(module$ctsem_hessian_progress(objective,
+    ctsem:::.ctJuliaNumericVector(raw), progress = TRUE, progress_sink = capture,
+    progress_overwrite = TRUE, progress_label = "hessian", progress_every = 1e-9))
+  hessian <- matrix(as.numeric(result), npar, npar)
+  expect_true(all(is.finite(hessian)))
+  expect_true(any(grepl(paste0("hessian ", npar, " of ", npar, " parameters"),
+    seen, fixed = TRUE)))
+  # A side channel, not a second computation.
+  bare <- matrix(as.numeric(ctsem:::.ctBackendJuliaValue(
+    module$ctsem_hessian_progress(objective, ctsem:::.ctJuliaNumericVector(raw)))),
+    npar, npar)
+  expect_equal(hessian, bare, tolerance = 1e-10)
+})
+
+# A deterministic age state and steep steps in it, as a questionnaire's form
+# changes are written, with the step given by `means`.
+.age_step_data <- function() {
+  set.seed(5)
+  do.call(rbind, lapply(seq_len(30), function(i) {
+    t <- sort(c(4.5, stats::runif(5, 4.6, 15.5)))
+    eta <- cumsum(stats::rnorm(length(t), 0, 0.5))
+    data.frame(id = i, time = t, y1 = eta + stats::rnorm(length(t), 0, 0.5) +
+      ifelse(t < 4.7, 1, 0) - ifelse(t > 13.4, 1, 0))
+  }))
+}
+.age_step_model <- function(means) {
+  model <- suppressMessages(ctModel(type = "ct", n.latent = 2, n.manifest = 1,
+    manifestNames = "y1", latentNames = c("eta", "AGE"),
+    LAMBDA = matrix(c(1, 0), 1, 2), DRIFT = matrix(c("drift", 0, 0, 0), 2, 2),
+    DIFFUSION = matrix(c("diff", 0, 0, 0), 2, 2),
+    T0VAR = matrix(c("t0v", 0, 0, 0), 2, 2), T0MEANS = matrix(c("t0m", 4.5), 2, 1),
+    CINT = matrix(c(0, 1), 2, 1), MANIFESTMEANS = matrix(means),
+    MANIFESTVAR = matrix("mvar"), PARS = matrix(c("f54", "f15"), ncol = 1)))
+  model$pars$indvarying <- FALSE
+  model
+}
+
+test_that("a logistic is differentiated in a form that does not overflow", {
+  # Deriv's quotient rule makes `x / (1 + exp(a))`, and `inv_logit(a)` through
+  # its body, into `exp(a) / (1 + exp(a))^2`, whose square is Inf past
+  # a = 354: right in value, Inf / Inf under any derivative.
+  stable <- ctsem:::.ctStableLogistic
+  expect_identical(stable("exp(a)/(exp(a)+1)"), "inv_logit(a)")
+  expect_identical(stable("1/(1+exp(a))"), "inv_logit(-(a))")
+  expect_identical(stable("f*1/(1+exp((s-4.7)*40))"), "(f*1)*inv_logit(-((s-4.7)*40))")
+  # Nothing to rewrite comes back as written, digits and all.
+  expect_identical(stable("x/(2+exp(a))+0.123456789012345678*s"),
+    "x/(2+exp(a))+0.123456789012345678*s")
+  derivative <- ctsem:::.ctWithStableDerivRules(Deriv::Deriv(
+    stable("f*1/(1+exp((s-4.7)*40))"), "s", cache.exp = FALSE))
+  expect_false(grepl("^", derivative, fixed = TRUE))
+  expect_equal(eval(str2lang(derivative), list(f = 2, s = 4.8,
+    inv_logit = ctsem::inv_logit)), -80 * stats::dlogis(4))
+  # The rules are Deriv's to keep: added for the call, then put back.
+  expect_false(exists("inv_logit", envir = Deriv::drule, inherits = FALSE))
+
+  skip_without_julia()
+  # Past age 13.6 the old Jy cell's square overflowed, and a derivative of
+  # 1e-17 on the age state made every dual pass NaN: no exact Hessian. Both
+  # spellings of the step now give it, against central differences of the
+  # adjoint gradient, elementwise.
+  data <- .age_step_data()
+  for (means in c(
+    "f54 * 1/(1+exp((AGE - 4.7)*40)) + f15 * 1/(1+exp(-(AGE - 13.4)*20))",
+    "f54 * inv_logit(-(AGE - 4.7)*40) + f15 * inv_logit((AGE - 13.4)*20)")) {
+    spec <- suppressWarnings(suppressMessages(ctFit(data, .age_step_model(means),
+      backend = "julia", fit = FALSE, cores = 1L)))
+    jy <- spec$parameter_table$updatetransform[spec$parameter_table$matrix %in% "Jy"]
+    expect_false(any(grepl("^", jy, fixed = TRUE)))
+    npar <- ctsem:::.ctBackendNpar(spec)
+    at <- rep(0.1, npar)
+    hessian <- ctsem:::.ctBackendHessianAt(spec, at)
+    gradient <- function(x) as.numeric(ctJuliaEvaluate(spec, x, gradient = TRUE)$gradient)
+    eps <- 1e-5
+    differenced <- vapply(seq_len(npar), function(j) {
+      (gradient(replace(at, j, at[j] + eps)) - gradient(replace(at, j, at[j] - eps))) /
+        (2 * eps)
+    }, numeric(npar))
+    expect_equal(hessian, differenced, tolerance = 1e-5)
+  }
+})
+
+test_that("an exact Hessian the dual pass cannot form is refused, and the fit goes on without it", {
+  skip_without_julia()
+  # A cell that overflows under a derivative however it is differentiated:
+  # the step's own slope, `exp(a) / (1 + exp(a))^2`, written out. Its value
+  # is 0 past age 13.6, and a derivative of 1e-17 on the age state makes its
+  # partial Inf / Inf, so every dual pass is NaN. The adjoint's invalid-point
+  # gradient was `T(NaN)` -- NaN in the value, zero in the partials -- and a
+  # Jacobian reads only the partials: the exact Hessian came back an exact zero
+  # matrix, the Newton finish took no step and did not hand back to L-BFGS,
+  # and a 415-parameter fit stopped uncertified with |g| 177. It is NaN now, so
+  # the finish resumes L-BFGS and the certification differences the gradient.
+  data <- .age_step_data()
+  model <- .age_step_model(paste0("f54 * exp((AGE - 4.7)*40)/(1+exp((AGE - 4.7)*40))^2",
+    " + f15 * 1/(1+exp(-(AGE - 13.4)*20))"))
+  spec <- suppressWarnings(suppressMessages(ctFit(data, model, backend = "julia",
+    fit = FALSE, cores = 1L)))
+  hessian <- ctsem:::.ctBackendHessianAt(spec, rep(0.1, ctsem:::.ctBackendNpar(spec)))
+  expect_false(isTRUE(all(hessian == 0)))
+  expect_true(anyNA(hessian))
+
+  fit <- suppressWarnings(suppressMessages(ctFit(data, model, backend = "julia",
+    cores = 1L)))
+  expect_true(isTRUE(fit$optim$converged))
+  expect_identical(fit$uncertainty$certification$status, "certified")
+  expect_true(all(is.finite(fit$uncertainty$hessian)))
+  expect_false(all(fit$uncertainty$hessian == 0))
+  # The proxy the stopping rule used, not the Inf of a finish that had no
+  # Hessian.
+  expect_true(is.finite(fit$optim$predicted_gain))
+})

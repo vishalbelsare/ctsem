@@ -1,0 +1,1149 @@
+"""
+Adjoint-gradient integration boundary.
+
+The hand-derived reverse-mode mathematics lives one level down, in
+`adjoint_primitives.jl` (generic matrix kernels), `adjoint_parameters.jl` (the
+transform layer) and `adjoint_ekf.jl` (the reverse filter). This file holds the
+public entry points: the workspace that caches everything discovered once per
+model, `ctsem_adjoint_gradient`, and the validation oracle that cross-checks
+the adjoint against ForwardDiff and finite differences.
+"""
+
+using LinearAlgebra
+using ForwardDiff
+
+export ctsem_validate_forward_gradient, ctsem_adjoint_gradient
+
+"""
+    CTSEMDeferredGroup{T}
+
+What a chunk holds back for one parameter layer, one group of its subjects
+(`_ctsem_subject_group!`): the JAx cotangent of their Frechet derivatives, and
+their covariance batches -- DIFFUSION, MANIFESTVAR, T0VAR and the population
+block, each a raw matrix, the cotangent summed against it and whether one is
+pending -- with the TI predictor row that keys the group and a member's
+parameter values, for its pass through the layer (`_release_groups!`).
+"""
+mutable struct CTSEMDeferredGroup{T}
+    jax::Matrix{T}
+    dvar_bar::Matrix{T}
+    dvar_mat::Matrix{T}
+    dvar_pending::Bool
+    mvar_bar::Matrix{T}
+    mvar_mat::Matrix{T}
+    mvar_pending::Bool
+    t0var_bar::Matrix{T}
+    t0var_mat::Matrix{T}
+    t0var_pending::Bool
+    pop_bar::Matrix{T}
+    pop_mat::Matrix{T}
+    pop_pending::Bool
+    key::Vector{Float64}
+    values::Vector{T}
+end
+
+CTSEMDeferredGroup(::Type{T}, n::Int, m::Int, k::Int) where {T} = CTSEMDeferredGroup{T}(
+    zeros(T, n, n), zeros(T, n, n), zeros(T, n, n), false, zeros(T, m, m), zeros(T, m, m),
+    false, zeros(T, n, n), zeros(T, n, n), false, zeros(T, k, k), zeros(T, k, k), false,
+    Float64[], T[])
+
+"""
+    CTSEMAdjointWorkspace
+
+Per-model state for the reverse pass, built once and reused across evaluations.
+
+Holds the things that are discovered by inspecting the model rather than by
+running it: which `values` index each regular transform reads, which parameter
+cells each state-dependent transform reads, and the dual-number scratch those
+lookups are evaluated through. `tipreds` is the one genuinely per-subject
+field, refreshed by `ctsem_adjoint_gradient` before each subject's reverse
+pass.
+"""
+mutable struct CTSEMAdjointWorkspace{T,SP,LB,FB,WS,DC}
+    sp::SP
+    n::Int
+    m::Int
+    # The leading block of genuine dynamics, over which the intercept solve and
+    # the affine offset run. Not the same set as `diffusion_state_indices`:
+    # see `affine_dim` in `EKFParameters`.
+    affine_dim::Int
+    diffusion_state_indices::Vector{Int}
+    predict_indices::Vector{Int}
+    update_indices::Vector{Int}
+    td_indices::Vector{Int}
+    predict_supports::Vector{Vector{Int}}
+    update_supports::Vector{Vector{Int}}
+    td_supports::Vector{Vector{Int}}
+    # The same for the TI predictors each of those transforms reads, which only
+    # a subject whose value of one is sampled needs (`_group_reverse_walk!`).
+    predict_tipred_supports::Vector{Vector{Int}}
+    update_tipred_supports::Vector{Vector{Int}}
+    td_tipred_supports::Vector{Vector{Int}}
+    # One entry per mutable position: the `subject_values` indices its regular
+    # transform reads. Almost always a single index -- a cell materialised from
+    # one raw parameter -- but a cell written as an expression over several
+    # PARS parameters reads all of them, so this is a support *set* rather than
+    # the `parnumber` it used to be.
+    regular_supports::Vector{Vector{Int}}
+    regular_dual_scratch::Vector{ForwardDiff.Dual{Nothing,T,1}}
+    # A type parameter for the reason `ekf_ws` is one (below): read from an
+    # `Any` field, every group reverse was a dynamic call that boxed its row
+    # context on the way in.
+    dual_context::DC
+    tipreds::Vector{T}
+    # The subject's TI predictor cotangent, and which of its predictors it
+    # samples; see `_ctsem_tipred_bar_reset!` and `_ctsem_tipred_scatter!`.
+    tipreds_bar::Vector{T}
+    tipred_sampled::Vector{Bool}
+    # Persistent working copy of `all_params` used to replay a transform group
+    # forward during the reverse pass; see `_ctsem_complex_group_pullback!`.
+    # Initialised to `NaN`: only cells in a group's relevant set are ever
+    # written, so anything a transform reads that was not recorded stays `NaN`
+    # and poisons the gradient visibly instead of quietly using a stale value.
+    group_scratch::Vector{T}
+    # Reused across every reverse prediction substep. Sized to the *dynamic*
+    # state block, which is what the Lyapunov solve actually operates on.
+    lyap_buffer::LB
+    # Reverse-pass accumulators, reused across subjects rather than allocated
+    # per subject. The reverse pass wraps `theta_bar` in a ComponentVector
+    # view locally rather than caching one here -- see the note in
+    # `_ctsem_reverse_tape!` for why that matters.
+    theta_bar::Vector{T}
+    x_bar::Vector{T}
+    P_bar::Matrix{T}
+    manifest_cov_bar::Matrix{T}
+    subject_values_bar::Vector{T}
+    # True when the parameter layer is identical for every subject, so it can
+    # be unwound once at the end instead of once per subject.
+    parameter_layer_shareable::Bool
+    # --- deferred matrix-exponential Frechet derivative (see `_flush_frechet!`)
+    # `A = exp(JAx * dt)` is the most expensive step in the reverse pass, and
+    # `L(A, E)` is linear in `E`, so directions belonging to the same
+    # `JAx * dt` are accumulated and pushed through one Fréchet evaluation
+    # instead of one each. The table holds up to `_CTSEM_FRECHET_TABLE`
+    # distinct keys at once, so a schedule with a handful of distinct intervals
+    # batches however its rows are ordered; entries `1:frechet_count` are live.
+    frechet_count::Int
+    frechet_dts::Vector{T}
+    frechet_As::Vector{Matrix{T}}
+    frechet_accums::Vector{Matrix{T}}
+    # The parameter layer each queued direction's JAx cotangent belongs to:
+    # 0, the subject walking now (`theta_bar`); g, the chunk's group g
+    # (`groups`). `frechet_group` is the walking subject's.
+    frechet_tags::Vector{Int}
+    frechet_group::Int
+    # --- pullbacks deferred across a chunk's subjects, by parameter layer
+    # Every subject paid its own Frechet derivatives and its own pullbacks of
+    # DIFFUSION, MANIFESTVAR, T0VAR and the population block -- about 60% of a
+    # 20-latent gradient -- for matrices its fellows share. Subjects whose
+    # parameter layers are the same share all of them, so a chunk holds them
+    # back per layer (`CTSEMDeferredGroup`) and pushes each group through its
+    # layer once (`_release_groups!`). Where no TI effect reaches a deferred
+    # cell every subject has one layer, and there is one group; otherwise
+    # (`group_keyed`) the subjects with the same TI predictor row share one
+    # (`_ctsem_subject_group!`), up to `_CTSEM_FRECHET_GROUPS` at once. A
+    # subject whose predictor value is sampled is its own layer, and walks in
+    # `own_group` with nothing deferred past its walk. The covariance fields
+    # below (`dvar_*`, `mvar_*`, `t0var_*`, `pop_*`) are the walking subject's
+    # group's (`_ctsem_enter_group!`).
+    groups::Vector{CTSEMDeferredGroup{T}}
+    own_group::CTSEMDeferredGroup{T}
+    group_count::Int
+    group_current::Int
+    group_keyed::Bool
+    # Whether the Frechet batch spans subjects at all: not where a transform
+    # group writes a JAx cell, whose reverse would consume a pending
+    # direction, nor in the walks that want each subject's own gradient
+    # (the Laplace unit loop).
+    defer_frechet::Bool
+    # Whether any state-dependent transform group writes a JAx cell. Such a
+    # group's reverse *zeroes* that cell's cotangent, so it is the one thing
+    # that can consume an outstanding Frechet contribution mid-tape.
+    groups_write_jax::Bool
+    # The same question for MANIFESTVAR, and for the same reason: a deferred
+    # covariance pullback has not reached `theta_bar` yet, so a group that
+    # consumes and zeroes those cells mid-tape must flush it first.
+    groups_write_manifestvar::Bool
+    # The deferred MANIFESTVAR pullback: the accumulated measurement-covariance
+    # cotangent, and the matrix it was accumulated against.
+    #
+    # `sdcovsqrt2cov`'s reverse is linear in the cotangent and costs O(m^3) plus
+    # a correlation square root, and the tape calls it once per observed row --
+    # 20% of a summed gradient on a five-indicator model, measured on dev1. The
+    # matrix is the same on every one of those rows unless something writes it,
+    # so the cotangents can be summed and pushed back once. Comparing the matrix
+    # to decide costs O(m^2), which is the same trade `_covcache` makes in the
+    # forward.
+    mvar_bar::Matrix{T}
+    mvar_mat::Matrix{T}
+    mvar_pending::Bool
+    # The same for DIFFUSION, which the prediction reverse pushes back once per
+    # substep rather than once per row -- so on a model with substeps there is
+    # even more of it to batch.
+    groups_write_diffusion::Bool
+    dvar_bar::Matrix{T}
+    dvar_mat::Matrix{T}
+    dvar_pending::Bool
+    # Whether the walking subject's covariance batches run on past its walk,
+    # in its group (`chunk_active`: set by the summed gradient's chunk alone,
+    # for a subject in a group; every other walk flushes them per subject),
+    # and which covariances may: those no transform group writes, whose
+    # reverse would consume a pending cotangent.
+    chunk_active::Bool
+    chunk_dvar::Bool
+    chunk_mvar::Bool
+    chunk_t0var::Bool
+    chunk_pop::Bool
+    t0var_bar_acc::Matrix{T}
+    t0var_mat::Matrix{T}
+    t0var_pending::Bool
+    pop_bar_acc::Matrix{T}
+    pop_mat::Matrix{T}
+    pop_pending::Bool
+    # Flat `all_params` positions belonging to the JAx component.
+    jax_positions::Vector{Int}
+    # Workspace and outputs for `my_exp_frechet!`, so a flush allocates
+    # nothing: `frechet_Y` receives `exp(A')`, `frechet_L` the derivative.
+    frechet_buffer::FB
+    frechet_Y::Matrix{T}
+    frechet_L::Matrix{T}
+    # The forward exponential table every subject in this chunk shares while
+    # the chunk runs; see `ExpTable`.
+    exp_table::ExpTable{T}
+    # The series route's powers and the cotangents waiting on them, released
+    # by `_flush_series!`; see `SeriesTable`.
+    series_reverse::CTSEMSeriesReverse{T}
+    # Scratch for `_sdcovsqrt2cov_pullback!`, sized to the larger of the state
+    # and manifest dimensions; one set serves DIFFUSION, T0VAR and MANIFESTVAR.
+    covsqrt_scratch::CTSEMCovSqrtScratch{T}
+    # Working storage for the reverse pass; see `CTSEMReverseScratch` for why
+    # the temporaries come from here rather than from the heap.
+    reverse_scratch::CTSEMReverseScratch{T}
+    # A moment-matched prediction's reverse (`_reverse_moment!`).
+    moment::CTSEMMomentScratch{T}
+    tape::CTSEMAdjointTape{T}
+    # The forward filter's own workspace, held here so that its *type* is known
+    # where the reverse pass calls the forward.
+    #
+    # `_init_continuous_ekf_workspace` takes the state and manifest dimensions
+    # from the model at run time, so its result type is not inferable from
+    # `(T, sp)` and any accessor returning it hands back an abstract
+    # `ContinuousEKFWorkspace{T}`. Calling the forward filter with that is a
+    # dynamic dispatch, and a dynamic dispatch puts its `struct` arguments on
+    # the heap to pass them: one boxed `EKFParameters` and two boxed scalars per
+    # subject evaluation, 288 of the 448 bytes that remained after the rest of
+    # this pass.
+    #
+    # Making it a *type parameter* of this workspace fixes it at construction,
+    # where the concrete type is in hand. This object is already built per task
+    # and per element type, which is exactly the granularity the filter
+    # workspace needs, and the constructor built one anyway to read the
+    # dimensions off.
+    ekf_ws::WS
+end
+
+function CTSEMAdjointWorkspace(::Type{T}, sp::EKFParameters, nvalues::Integer,
+    ntdpred::Integer) where {T}
+    ws = _init_continuous_ekf_workspace(T, sp)
+    n = ws.state_dim
+    m = ws.manifest_dim
+    # The subject vector the regular transforms read: the raw parameters, any
+    # stated population values (`EKFParameters.anchors`), then any TI
+    # predictor tail (`EKFParameters.ti_tail`).
+    nvalues = Int(nvalues) + _ctsem_anchor_append(sp, nvalues) + length(sp.ti_tail)
+    _ctsem_check_raw_length(sp, nvalues)
+
+    predict_indices = findall(sp.predict_transforms_indices)
+    update_indices = findall(sp.update_transforms_indices)
+    td_indices = findall(sp.td_transforms_indices)
+
+    # `regular_dual_scratch` (below) is filled with NaN, not zero, for the same
+    # reason `group_scratch` is: every entry a transform reads is written
+    # immediately before the read, so an entry that reaches a transform
+    # unwritten is a bug, and a NaN says so instead of contributing a
+    # plausible term. See `_ctsem_regular_pullback!`.
+    nan_dual = ForwardDiff.Dual{Nothing,T,1}(T(NaN), ForwardDiff.Partials((zero(T),)))
+    theta_bar = zeros(T, length(sp.mutables))
+    lyap_buffer = LyapBuffer(T, length(ws.diffusion_state_indices))
+
+    predict_supports, predict_tipred_supports = _ctsem_complex_transform_supports(
+        sp.predict_transforms, predict_indices, sp, n, Int(ntdpred))
+    update_supports, update_tipred_supports = _ctsem_complex_transform_supports(
+        sp.update_transforms, update_indices, sp, n, Int(ntdpred))
+    td_supports, td_tipred_supports = _ctsem_complex_transform_supports(
+        sp.td_transforms, td_indices, sp, n, Int(ntdpred))
+    group_relevant = [
+        _ctsem_group_relevant(predict_supports, predict_indices),
+        _ctsem_group_relevant(td_supports, td_indices),
+        _ctsem_group_relevant(update_supports, update_indices),
+    ]
+    group_scratch = fill(T(NaN), length(sp.mutables))
+
+    jax_positions = _ctsem_jax_positions(sp)
+    jax_set = Set(jax_positions)
+    groups_write_jax = any(i -> i in jax_set,
+        Iterators.flatten((predict_indices, td_indices, update_indices)))
+    mvar_set = Set(_ctsem_component_positions(sp, :MANIFESTVAR))
+    groups_write_manifestvar = any(i -> i in mvar_set,
+        Iterators.flatten((predict_indices, td_indices, update_indices)))
+    dvar_set = Set(_ctsem_component_positions(sp, :DIFFUSION))
+    groups_write_diffusion = any(i -> i in dvar_set,
+        Iterators.flatten((predict_indices, td_indices, update_indices)))
+    regular_supports = _ctsem_regular_transform_supports(sp, nvalues)
+    # What a chunk may hold back past a subject's walk: what no transform group
+    # writes, whose reverse would consume a pending cotangent. Grouped by TI
+    # predictor row where a TI effect reaches any of it.
+    defer_frechet = !groups_write_jax
+    chunk_dvar = !groups_write_diffusion
+    chunk_mvar = !groups_write_manifestvar
+    written = Set{Int}(Iterators.flatten((predict_indices, td_indices, update_indices)))
+    t0var_positions = _ctsem_component_positions(sp, :T0VAR)
+    chunk_t0var = !any(in(written), t0var_positions)
+    npop = length(sp.population_indices)
+    chunk_pop = npop > 0 && !any(in(written), sp.population_range)
+    deferred = Int[]
+    defer_frechet && append!(deferred, jax_positions)
+    chunk_dvar && append!(deferred, dvar_set)
+    chunk_mvar && append!(deferred, mvar_set)
+    chunk_t0var && append!(deferred, t0var_positions)
+    chunk_pop && append!(deferred, sp.population_range)
+    group_keyed = !_ctsem_layer_subject_invariant(sp, deferred, regular_supports)
+    own = CTSEMDeferredGroup(T, n, m, npop)
+
+    frechet_buffer = ExpFrechetBuffer{T}(n)
+    dual_context = CTSEMDualContext(T, sp, zeros(T, n))
+    return CTSEMAdjointWorkspace{T,typeof(sp),typeof(lyap_buffer),
+        typeof(frechet_buffer),typeof(ws),typeof(dual_context)}(
+        sp, n, m, ws.affine_buffer.dim,
+        collect(ws.diffusion_state_indices),
+        predict_indices, update_indices, td_indices,
+        predict_supports,
+        update_supports,
+        td_supports,
+        predict_tipred_supports,
+        update_tipred_supports,
+        td_tipred_supports,
+        regular_supports,
+        fill(nan_dual, Int(nvalues)),
+        dual_context,
+        T[],
+        T[],
+        Bool[],
+        group_scratch,
+        lyap_buffer,
+        theta_bar,
+        zeros(T, n),
+        zeros(T, n, n),
+        zeros(T, m, m),
+        Vector{T}(undef, Int(nvalues)),
+        _ctsem_parameter_layer_shareable(sp, predict_indices, update_indices, td_indices),
+        0, zeros(T, _CTSEM_FRECHET_TABLE),
+        [zeros(T, n, n) for _ in 1:_CTSEM_FRECHET_TABLE],
+        [zeros(T, n, n) for _ in 1:_CTSEM_FRECHET_TABLE],
+        zeros(Int, _CTSEM_FRECHET_TABLE), 0,
+        [CTSEMDeferredGroup(T, n, m, npop) for _ in 1:_CTSEM_FRECHET_GROUPS], own,
+        0, 0, group_keyed,
+        defer_frechet, groups_write_jax, groups_write_manifestvar,
+        own.mvar_bar, own.mvar_mat, false,
+        groups_write_diffusion, own.dvar_bar, own.dvar_mat, false,
+        false, chunk_dvar, chunk_mvar, chunk_t0var, chunk_pop,
+        own.t0var_bar, own.t0var_mat, false,
+        own.pop_bar, own.pop_mat, false,
+        jax_positions,
+        frechet_buffer, zeros(T, n, n), zeros(T, n, n), ExpTable(T, n),
+        CTSEMSeriesReverse(T, n, length(ws.diffusion_state_indices)),
+        CTSEMCovSqrtScratch(T, max(n, m)),
+        CTSEMReverseScratch(T, n, m, length(ws.diffusion_state_indices),
+            ws.affine_buffer.dim),
+        CTSEMMomentScratch(T, sp, ws, predict_supports, predict_tipred_supports),
+        CTSEMAdjointTape(T, group_relevant),
+        ws,
+    )
+end
+
+"""
+    _ctsem_layer_subject_invariant(sp, positions, supports)
+
+Whether the cells at `positions` (flat `all_params` positions) have the same
+parameter layer for every subject, so that a cotangent on them summed across
+subjects can be pushed through one subject's layer: the cells a chunk defers
+-- the exponential's derivative on the `JAx` cells, the covariance batches --
+in one group rather than one per TI predictor row (`group_keyed`). A cell's
+layer is every subject's unless a subject-specific shift reaches what its
+transform reads (`supports`, `_ctsem_regular_transform_supports`): a TI
+effect's parameter (`ti_parameter_indices`) or the predictor tail (`ti_tail`).
+A TI effect on an intercept, an initial mean or a measurement parameter leaves
+the `JAx` cells' layer the same for every subject, and the TI pullback of a
+cotangent that reaches no shifted parameter is zero, so the batch is exact
+there; before, any TI effect at all turned it off.
+"""
+function _ctsem_layer_subject_invariant(sp::EKFParameters, positions::AbstractVector{Int},
+    supports::AbstractVector{Vector{Int}})
+    shifted = Set{Int}(sp.ti_parameter_indices)
+    union!(shifted, sp.ti_tail)
+    isempty(shifted) && return true
+    # `supports` is indexed by the mutable positions in order.
+    slot = cumsum(sp.mutables)
+    for p in positions
+        sp.mutables[p] || continue
+        any(i -> i in shifted, supports[slot[p]]) && return false
+    end
+    return true
+end
+
+"""
+    _ctsem_jax_positions(sp)
+
+The flat `all_params` positions belonging to the `JAx` component.
+
+Discovered by marking the component through a `ComponentVector` view rather
+than by arithmetic on the axis, so it stays correct whatever order the R-side
+parameter table happens to list matrices in.
+"""
+function _ctsem_jax_positions(sp::EKFParameters)
+    return _ctsem_component_positions(sp, :JAx)
+end
+
+"""
+    _ctsem_component_positions(sp, name)
+
+The flat `all_params` positions belonging to one model matrix.
+
+Found by marking that component through a `ComponentVector` view rather than by
+arithmetic on the axis, so a change to the layout cannot leave this returning a
+stale range.
+"""
+function _ctsem_component_positions(sp::EKFParameters, name::Symbol)
+    marker = CTSEMPars(zeros(Int, length(sp.mutables)), sp.parameter_axis)
+    getproperty(marker, name) .= 1
+    return findall(!iszero, getdata(marker))
+end
+
+"""
+    _ctsem_group_relevant(supports, indices)
+
+The `all_params` indices one transform group can read or write: the union of
+its transforms' recorded read sets with the cells they write.
+
+This is exactly what a group record has to snapshot. Everything else in
+`all_params` is unreachable from that group's expressions, so recording it
+would be dead weight -- ~23 KB per group per row on a 20-latent model.
+"""
+function _ctsem_group_relevant(supports::AbstractVector{Vector{Int}},
+    indices::AbstractVector{Int})
+    isempty(indices) && return Int[]
+    relevant = Set{Int}(indices)
+    for support in supports
+        union!(relevant, support)
+    end
+    return sort!(collect(relevant))
+end
+
+"""
+    _ctsem_parameter_layer_shareable(sp, predict_indices, update_indices, td_indices)
+
+Whether every subject sees the same parameter layer, so the cotangent on
+`all_params` can be accumulated across subjects and unwound once.
+
+Two things break it:
+
+  * **TI predictor effects.** `_materialize_subject_values!` shifts a
+    parameter by `values[coef] * tipred[pred]`, so `subject_values` -- and
+    therefore each regular transform's derivative -- differs per subject.
+    So does a T0MEANS or T0VAR cell reading a predictor (`sp.ti_tail`): the
+    predictor is in `subject_values`, and unwinding once at the last
+    subject's values gave every subject that subject's predictor.
+  * **State-dependent transforms.** Their reverse *overwrites* (zeroes) the
+    cotangent on the cells they write, because the forward pass overwrote the
+    values. Running subject 2's reverse over a buffer still holding subject
+    1's accumulated cotangent would destroy it. This is a genuine correctness
+    constraint, not a conservatism.
+
+When neither applies -- an ordinary linear multi-subject model, which is the
+common ctsem shape -- the parameter layer is `O(number of parameter cells)`
+work that would otherwise be repeated once per subject for no reason. On a
+20-latent, 20-subject model that is the difference between doing it 20 times
+and once.
+"""
+function _ctsem_parameter_layer_shareable(sp::EKFParameters, predict_indices,
+    update_indices, td_indices)
+    isempty(sp.ti_parameter_indices) || return false
+    isempty(sp.ti_tail) || return false
+    return isempty(predict_indices) && isempty(update_indices) && isempty(td_indices)
+end
+
+"""
+    ctsem_adjoint_gradient(objective, values)
+
+Return `(value = ..., gradient = ...)` for a prepared `CTSEMObjective`, using
+the reverse-mode adjoint rather than ForwardDiff.
+
+Each subject is filtered forward once with tracing on, then its tape is
+replayed backwards and its contribution accumulated into the shared gradient.
+The cost is therefore independent of the number of free parameters, which is
+the whole point: `ForwardDiff` needs one dual pass per chunk of parameters, so
+its cost grows with the parameter count that large `indvarying` models
+inflate.
+
+An invalid trial point -- one where the primal returns a non-finite
+log-likelihood, e.g. because a Cholesky factorization failed -- propagates as a
+non-finite value *and* a non-finite gradient, matching what the ForwardDiff
+path does and what `ctsem_optimize`'s `fg!` guards expect. There is deliberately
+no silent fallback to ForwardDiff.
+"""
+function ctsem_adjoint_gradient(objective::CTSEMObjective, values::AbstractVector{T};
+    hybrid_mode::Int=_HYBRID_PROFILE) where {T}
+    # This is the one choke point every adjoint entry runs through --
+    # `ctsem_evaluate`'s `:adjoint` branch, and `ctsem_hessian` (which nests
+    # ForwardDiff over exactly this function, bypassing `ctsem_evaluate`
+    # entirely). A subject with a sampled (missing) TI predictor cell carries
+    # its raw row as a `TIMissingRecipe` rather than a plain vector; the
+    # per-subject chunk functions below convert that to the concrete numeric
+    # row the forward pass and the group replay need
+    # (`_ctsem_tipred_vector`), and `_ctsem_parameter_layer!` dispatches
+    # `_ctsem_ti_pullback!` on the recipe to add the product-rule term for the
+    # TI effect(s) that read it (adjoint_parameters.jl). The imputation
+    # log-density's own contribution is part of the prior, added below.
+    subjects = objective.subject_objectives
+    nsubjects = length(subjects)
+    nchunks = _ctsem_nchunks(nsubjects)
+    workspaces = _get_or_init_adjoint_workspaces!(objective, T, length(values), nchunks)
+    nblocks = _ctsem_nblocks(nsubjects, nchunks)
+    ranges = _ctsem_chunk_ranges(nsubjects, nblocks)
+
+    # Per-block accumulators, summed at the end in block order. Each block is
+    # independently a valid sub-objective: the parameter layer and the deferred
+    # Frechet contribution are both unwound within the block that produced
+    # them, so summing block gradients is exactly summing subject gradients,
+    # only in a different order. A block runs on whichever worker pulls it
+    # (`_ctsem_pull_blocks`), with that worker's workspace.
+    gradients = [zeros(T, length(values)) for _ in 1:nblocks]
+    totals = zeros(T, nblocks)
+    valid = fill(true, nblocks)
+    badvalue = fill(_ctsem_nan(T), nblocks)
+
+    _ctsem_pull_blocks(nblocks, nchunks) do b, w
+        _ctsem_adjoint_chunk!(gradients[b], totals, valid, badvalue, b,
+            ranges, subjects, objective, workspaces[w], values, hybrid_mode)
+    end
+
+    @inbounds for c in 1:nblocks
+        if !valid[c]
+            # One invalid subject invalidates the whole evaluation, exactly as
+            # in the serial path: a non-finite value *and* a non-finite
+            # gradient, so an optimizer's finiteness guards reject the trial
+            # point rather than accepting a partial gradient.
+            return (value=badvalue[c], gradient=fill(_ctsem_nan(T), length(values)))
+        end
+    end
+
+    total = zero(T)
+    gradient = gradients[1]
+    @inbounds for c in 1:nblocks
+        total += totals[c]
+        if c > 1
+            gradient .+= gradients[c]
+        end
+    end
+    # The prior is a closed-form function of the raw parameters alone, so it is
+    # added once here rather than inside a chunk; it includes the imputation
+    # density of a sampled TI predictor value.
+    total += _ctsem_log_prior(objective, values)
+    _ctsem_log_prior_gradient!(gradient, objective, values)
+    return (value=total, gradient=gradient)
+end
+
+export ctsem_subject_gradients
+"""
+    ctsem_subject_gradients(objective, values)
+
+Return `(value = ..., scores = ...)` where `scores[i, :]` is subject `i`'s own
+gradient contribution.
+
+This is the score matrix the R side's `scorecalc()` produces for the Stan
+backend, and it is what the OPG, sandwich and score-bootstrap uncertainty
+methods consume. It costs about one ordinary gradient evaluation rather than
+the per-subject model re-initialisation the Stan path needs.
+
+The rows are the objective's view as a sum over its subjects
+(`_ctsem_unit_sum`) evaluated with each unit's scores, as the Laplace route's
+are (`ctsem_subject_gradients(laplace, ...)`): a unit a subject, each its own
+piece of the summed adjoint chunk, so the two shortcuts that make the summed
+gradient fast -- the shared parameter layer and the cross-subject Frechet
+batch -- span one subject each, which is what makes a row that subject's own.
+The marginal route kept a loop of its own for this before the view existed.
+`sum(scores, dims=1)` equals `ctsem_adjoint_gradient`'s gradient, and
+`test_subject_gradients.jl` asserts that.
+
+A sampled (missing) TI predictor value is its subject's: the TI-effect term
+of its cotangent lands on that row, and its imputation density's term is added
+to the same row (`_ctsem_prior_scores!`).
+
+`prior = false` leaves the prior out of the rows -- each is then subject `i`'s
+log likelihood gradient alone, which is what removing subject `i` removes
+(`ctLOO(casewiseApproximation = TRUE)`); a refit keeps the whole prior. The
+value is the objective either way. `sink`, a vector, gets each subject's own
+log likelihood, unweighted, NaN where its weight is zero.
+"""
+ctsem_subject_gradients(objective::CTSEMObjective, values::AbstractVector;
+    prior::Bool=true, sink::Union{Nothing,AbstractVector}=nothing) =
+    ctsem_subject_gradients(_ctsem_units_of(objective), values; prior=prior, sink=sink)
+
+"""
+    _ctsem_adjoint_chunk!(gradient, totals, valid, badvalue, c, ranges, subjects,
+                          objective, aws, values, mode=_HYBRID_PROFILE,
+                          weights=nothing, sink=nothing, want_gradient=true)
+
+Accumulate one chunk of subjects, `ranges[c]` (any collection of their
+indices), into its own gradient and workspace.
+
+The trailing arguments are for a caller that sums units rather than the
+objective's own subjects -- a Laplace objective with no coordinate left
+(`_laplace_filter_evaluate`): `mode`, what each subject's filter returns for
+the deviations it integrates (`CTSEMHybridBuffers`; the full integral there);
+`weights`, each subject's weight in place of the objective's sampling weights
+(a coreset's replace them); `sink`, a vector each subject's log likelihood is
+written into; `want_gradient = false`, the values alone, with no tape and no
+reverse pass.
+
+This is the serial adjoint loop, scoped to that range. Everything it touches --
+`aws` and its tape, `gradient`, and slot `c` of the shared result vectors -- is
+private to this chunk, so no synchronisation is needed beyond the enclosing
+`@sync`.
+
+The range vector and the objective rather than the range and `objective.params`:
+the call reaches here through a dynamic dispatch (`aws` comes out of a
+`Vector{Any}`), which boxes every immutable argument -- the parameters struct
+and the range, once per block.
+"""
+function _ctsem_adjoint_chunk!(gradient::Vector{T}, totals::Vector{T},
+    valid::Vector{Bool}, badvalue::Vector{T}, c::Int, ranges::AbstractVector,
+    subjects, objective, aws, values::AbstractVector{T}, mode::Int=_HYBRID_PROFILE,
+    weights=nothing, sink=nothing, want_gradient::Bool=true) where {T}
+    # The deviations the filter integrates, as the caller asks, and back to
+    # the profile however the chunk ends, so a later pass on this workspace
+    # never inherits it (as `_laplace_subject_value_gradient!` does).
+    aws.ekf_ws.hyb.mode = mode
+    try
+        _ctsem_adjoint_chunk_body!(gradient, totals, valid, badvalue, c, ranges,
+            subjects, objective, aws, values, mode, weights, sink, want_gradient)
+    finally
+        aws.ekf_ws.hyb.mode = _HYBRID_PROFILE
+        # Every other walk on this workspace flushes per subject, in its own
+        # buffers.
+        aws.chunk_active = false
+        aws.frechet_group = 0
+        _ctsem_enter_group!(aws, 0)
+    end
+    return nothing
+end
+
+function _ctsem_adjoint_chunk_body!(gradient::Vector{T}, totals::Vector{T},
+    valid::Vector{Bool}, badvalue::Vector{T}, c::Int, ranges::AbstractVector,
+    subjects, objective, aws, values::AbstractVector{T}, mode::Int,
+    weights, sink, want_gradient::Bool) where {T}
+    range = ranges[c]
+    params = objective.params
+
+    shared = aws.parameter_layer_shareable
+    shared && fill!(aws.theta_bar, zero(T))
+    # A previous call that bailed out on an invalid trial point can leave a
+    # queued Frechet direction behind; it belongs to that call's cotangent.
+    # So can a group's deferred pullbacks.
+    aws.frechet_count = 0
+    _ctsem_reset_groups!(aws)
+    last_subject_values = nothing
+    last_tipreds = nothing
+    total = zero(T)
+
+    sampling = objective.subject_weights
+    @inbounds for i in range
+        subject_objective = subjects[i]
+        w = weights === nothing ? (isempty(sampling) ? 1.0 : sampling[i]) : weights[i]
+        w == 0 && continue
+        # The task's filter workspace, which this chunk's adjoint workspace
+        # carries at its own element type (the Laplace route filters through
+        # it too): a workspace depends on the shared parameters, never on the
+        # subject. A subject's own cached one, as here before, left a copy per
+        # subject, and under `ctsem_hessian` a dual copy per subject 13 times
+        # the size, kept for the session -- 15 GB on a 1046-subject model.
+        ws = aws.ekf_ws
+        # One exponential table for the chunk: a linear model's `exp(JAx * dt)`
+        # is the same for every subject at the same interval.
+        ws.discretization_cache.exp_table = aws.exp_table
+        # The concrete numeric row this evaluation reads: identity for a plain
+        # `Vector{Float64}` (see `_ctsem_tipred_vector`), or the sampled
+        # predictor's raw parameter value substituted in for a
+        # `TIMissingRecipe` subject. The forward pass and the group replay
+        # inside the reverse pass (`aws.tipreds`, read via `ctx.tipreds`) must
+        # see the same row `values` produced, not the recipe itself.
+        tipred_vec = _ctsem_tipred_fill!(aws.tipreds, subject_objective.tipreds, values)
+        if !want_gradient
+            loglik = _ekf_run(ws, subject_objective, values, tipred_vec, nothing)
+            if !_finite_deep(loglik)
+                valid[c] = false
+                badvalue[c] = loglik
+                return nothing
+            end
+            sink === nothing || (sink[i] = loglik)
+            total += w * loglik
+            continue
+        end
+        tape = _tape_reset!(aws.tape)
+
+        loglik = _ekf_run(ws, subject_objective, values, tipred_vec, tape)
+        # _finite_deep, not isfinite: under ctsem_hessian this runs at Dual and
+        # isfinite tests the value alone, so a NaN partial would pass.
+        if !_finite_deep(loglik)
+            valid[c] = false
+            badvalue[c] = loglik
+            return nothing
+        end
+        sink === nothing || (sink[i] = loglik)
+        total += w * loglik
+
+        # Forward mode for a subject whose reverse pass would not be stable;
+        # see `_CTSEM_ADJOINT_GROWTH`. Its gradient goes straight into the
+        # chunk's, so nothing of it enters the shared parameter layer.
+        if _growth_unstable(ws)
+            gf = similar(gradient)
+            _ctsem_forward_subject_gradient!(gf, subject_objective, values, mode)
+            w == 1 ? (gradient .+= gf) : (gradient .+= w .* gf)
+            continue
+        end
+
+        # The group whose parameter layer this subject's deferred pullbacks
+        # belong to (`_ctsem_subject_group!`), whose buffers it walks in; before
+        # the weight's scaling, since a full group table is released here into
+        # the gradient.
+        g = _ctsem_subject_group!(gradient, aws, subject_objective.tipreds, tipred_vec,
+            tape.subject_values, params, values)
+        _ctsem_enter_group!(aws, g)
+        aws.chunk_active = g > 0
+        aws.frechet_group = aws.defer_frechet ? g : 0
+
+        # A sampling weight. The reverse pass below adds this subject's
+        # cotangents into the chunk's accumulators -- the gradient, the shared
+        # parameter layer's, the deferred Frechet one -- linearly and nowhere
+        # else, so dividing them by the weight first and multiplying after
+        # leaves what was there and adds the weight times this subject's part,
+        # without a weight in any kernel.
+        w == 1 || _ctsem_scale_accumulators!(gradient, aws, shared, inv(w))
+        shared || fill!(aws.theta_bar, zero(T))
+        _ctsem_tipred_bar_reset!(aws, subject_objective.tipreds, length(tipred_vec))
+        _ctsem_reverse_tape!(tape, subject_objective.params, aws, aws.n, aws.m)
+        # Per subject and straight onto raw positions, so before or after a
+        # shared parameter layer alike (`CTSEMHybrid`, a sampled TI predictor
+        # a cell reads).
+        _ekf_gaussian_call(aws.ekf_ws, _hybrid_scatter!, _ctsem_noop, gradient, tape.hyb,
+            subject_objective.params.hybrid)
+        _ctsem_tipred_scatter!(gradient, aws, subject_objective.tipreds)
+        # Kept for the shared parameter layer below, and for the deferred
+        # Frechet pass; with either of those enabled every subject sees the
+        # same parameter layer, so any subject's values do. The original
+        # `tipreds` (recipe or plain vector), not `tipred_vec` -- see
+        # `_ctsem_parameter_layer!`.
+        last_subject_values = tape.subject_values
+        last_tipreds = subject_objective.tipreds
+        # A subject that is its own layer (a sampled TI predictor value): its
+        # Frechet directions go into its own cotangent now; its covariance
+        # batches were flushed with its walk.
+        aws.defer_frechet && g == 0 && _flush_frechet!(aws)
+        if !shared
+            _ctsem_parameter_layer!(gradient, aws.theta_bar, tape.subject_values,
+                subject_objective.params, aws, subject_objective.tipreds, values)
+        end
+        w == 1 || _ctsem_scale_accumulators!(gradient, aws, shared, w)
+        _ctsem_leave_group!(aws)
+    end
+
+    if shared && last_subject_values !== nothing
+        # Every subject in this chunk shares one parameter layer, and so one
+        # group; unwind once, with that group's covariance batches.
+        aws.group_count > 0 && _ctsem_flush_group_covariances!(aws, 1, aws.theta_bar,
+            CTSEMPars(aws.theta_bar, params.parameter_axis))
+        _ctsem_parameter_layer!(gradient, aws.theta_bar, last_subject_values,
+            params, aws, last_tipreds, values)
+    end
+
+    # Each group's deferred pullbacks, one pass through its parameter layer.
+    last_subject_values !== nothing && aws.group_count > 0 &&
+        _release_groups!(gradient, aws, params, values, last_subject_values, last_tipreds)
+
+    totals[c] = total
+    return nothing
+end
+
+"""
+    _ctsem_subject_group!(gradient, aws, tipreds, tipred_vec, subject_values, params, values)
+
+The group whose parameter layer a subject's deferred pullbacks are pushed
+through: 1 where every subject shares the deferred cells' layer; otherwise the
+group of subjects with this TI predictor row, which joins the table if it is
+new; 0, the subject's own (`own_group`, nothing deferred past its walk), where
+a predictor value is sampled (a `TIMissingRecipe`). A full table is released
+into `gradient` first.
+"""
+function _ctsem_subject_group!(gradient, aws, tipreds, tipred_vec, subject_values, params,
+    values)
+    if !aws.group_keyed
+        aws.group_count = 1
+        return 1
+    end
+    tipreds isa TIMissingRecipe && return 0
+    @inbounds for g in 1:aws.group_count
+        _ctsem_same_row(aws.groups[g].key, tipred_vec) && return g
+    end
+    aws.group_count == length(aws.groups) &&
+        _release_groups!(gradient, aws, params, values, subject_values, tipreds)
+    g = aws.group_count + 1
+    G = aws.groups[g]
+    resize!(G.key, length(tipred_vec))
+    copyto!(G.key, tipred_vec)
+    resize!(G.values, length(subject_values))
+    copyto!(G.values, subject_values)
+    aws.group_count = g
+    return g
+end
+
+"""
+    _ctsem_enter_group!(aws, g)
+
+Point the workspace's covariance batch fields (`dvar_*`, `mvar_*`, `t0var_*`,
+`pop_*`) at group `g`'s (`own_group` for 0), which the tape's deferral and
+flush functions then accumulate in. References, not copies; the pending flags
+are copied in and `_ctsem_leave_group!` copies them back.
+"""
+function _ctsem_enter_group!(aws, g::Int)
+    G = g == 0 ? aws.own_group : aws.groups[g]
+    aws.dvar_bar = G.dvar_bar
+    aws.dvar_mat = G.dvar_mat
+    aws.dvar_pending = G.dvar_pending
+    aws.mvar_bar = G.mvar_bar
+    aws.mvar_mat = G.mvar_mat
+    aws.mvar_pending = G.mvar_pending
+    aws.t0var_bar_acc = G.t0var_bar
+    aws.t0var_mat = G.t0var_mat
+    aws.t0var_pending = G.t0var_pending
+    aws.pop_bar_acc = G.pop_bar
+    aws.pop_mat = G.pop_mat
+    aws.pop_pending = G.pop_pending
+    aws.group_current = g
+    return nothing
+end
+
+"""Copy the walking group's pending flags back into it (`_ctsem_enter_group!`)."""
+function _ctsem_leave_group!(aws)
+    g = aws.group_current
+    G = g == 0 ? aws.own_group : aws.groups[g]
+    G.dvar_pending = aws.dvar_pending
+    G.mvar_pending = aws.mvar_pending
+    G.t0var_pending = aws.t0var_pending
+    G.pop_pending = aws.pop_pending
+    return nothing
+end
+
+"""Empty every group, and walk in the workspace's own buffers."""
+function _ctsem_reset_groups!(aws)
+    T = eltype(aws.theta_bar)
+    for G in aws.groups
+        fill!(G.jax, zero(T))
+        G.dvar_pending = G.mvar_pending = G.t0var_pending = G.pop_pending = false
+    end
+    own = aws.own_group
+    own.dvar_pending = own.mvar_pending = own.t0var_pending = own.pop_pending = false
+    aws.group_count = 0
+    _ctsem_enter_group!(aws, 0)
+    return nothing
+end
+
+"""Release group `g`'s covariance batches into `θ̄` (`θ̄ca` its component view)."""
+function _ctsem_flush_group_covariances!(aws, g::Int, θ̄, θ̄ca)
+    _ctsem_enter_group!(aws, g)
+    _flush_diffusion!(aws, θ̄ca, aws.n)
+    _flush_manifestvar!(aws, θ̄ca, aws.m)
+    _flush_t0var!(aws, θ̄ca, aws.n)
+    _flush_population!(aws, θ̄, length(aws.sp.population_indices))
+    _ctsem_leave_group!(aws)
+    return nothing
+end
+
+"""Exact elementwise equality of two predictor rows."""
+@inline function _ctsem_same_row(a::AbstractVector, b::AbstractVector)
+    length(a) == length(b) || return false
+    @inbounds for i in eachindex(a)
+        a[i] == b[i] || return false
+    end
+    return true
+end
+
+"""
+    _release_groups!(gradient, aws, params, values, last_values, last_tipreds)
+
+Push every group's deferred pullbacks -- its JAx cotangent from the Frechet
+derivatives and its covariance batches -- through its parameter layer, one
+pass per group: a keyed group through its own member's values and predictor
+row, the single unkeyed one through `last_values` and `last_tipreds`, any
+subject's. Empties the table. `jax_positions` lists the JAx component's flat
+positions in the column-major order the matrices are stored in.
+"""
+function _release_groups!(gradient::AbstractVector{T}, aws, params, values,
+    last_values, last_tipreds) where {T}
+    aws.defer_frechet && _flush_frechet!(aws)
+    θ̄ = aws.theta_bar
+    θ̄ca = CTSEMPars(θ̄, params.parameter_axis)
+    @inbounds for g in 1:aws.group_count
+        G = aws.groups[g]
+        fill!(θ̄, zero(T))
+        J = G.jax
+        for k in eachindex(aws.jax_positions)
+            θ̄[aws.jax_positions[k]] = J[k]
+        end
+        fill!(J, zero(T))
+        _ctsem_flush_group_covariances!(aws, g, θ̄, θ̄ca)
+        if aws.group_keyed
+            _ctsem_parameter_layer!(gradient, θ̄, G.values, params, aws, G.key, values)
+        else
+            _ctsem_parameter_layer!(gradient, θ̄, last_values, params, aws, last_tipreds,
+                values)
+        end
+    end
+    aws.group_count = 0
+    _ctsem_enter_group!(aws, 0)
+    return nothing
+end
+
+"""
+    _ctsem_scale_accumulators!(gradient, aws, shared, s)
+
+Scale everything a chunk accumulates across its subjects' reverse passes by
+`s`: the gradient, the shared parameter layer's cotangent where one is shared,
+where the Frechet derivatives are deferred both what has been flushed of them
+and the queue still waiting (`_frechet_enqueue!`), whose entries add up
+directions across subjects until the chunk ends or the table fills, and the
+covariance batches that span the chunk's subjects (`chunk_active`). See the
+sampling weight in `_ctsem_adjoint_chunk!`.
+"""
+@inline function _ctsem_scale_accumulators!(gradient, aws, shared::Bool, s)
+    gradient .*= s
+    shared && (aws.theta_bar .*= s)
+    if aws.defer_frechet
+        # Every group's, not only this subject's: a queue that fills during
+        # this subject's walk releases the other groups' directions into
+        # their matrices at this scale too.
+        @inbounds for h in 1:aws.group_count
+            aws.groups[h].jax .*= s
+        end
+        @inbounds for e in 1:aws.frechet_count
+            aws.frechet_accums[e] .*= s
+        end
+    end
+    # The walking subject's group's covariance batches: its walk touches no
+    # other group's.
+    if aws.chunk_active
+        aws.chunk_dvar && aws.dvar_pending && (aws.dvar_bar .*= s)
+        aws.chunk_mvar && aws.mvar_pending && (aws.mvar_bar .*= s)
+        aws.t0var_pending && (aws.t0var_bar_acc .*= s)
+        aws.pop_pending && (aws.pop_bar_acc .*= s)
+    end
+    return nothing
+end
+
+"""Return a cached adjoint workspace for `objective`, building it on first use."""
+function _get_or_init_adjoint_workspaces!(objective::CTSEMObjective, ::Type{T},
+    nvalues::Integer, nchunks::Integer) where {T}
+    cached = objective.adjoint_ws
+    if cached isa Vector{Any} && length(cached) >= nchunks &&
+        all(w -> w isa CTSEMAdjointWorkspace{T} &&
+            length(w.regular_dual_scratch) == nvalues +
+                _ctsem_anchor_append(objective.params, nvalues) +
+                length(objective.params.ti_tail),
+            view(cached, 1:nchunks))
+        return cached
+    end
+    ntdpred = isempty(objective.subject_objectives) ? 0 :
+        size(first(objective.subject_objectives).tdpreds, 1)
+    # One workspace per chunk, owned by that chunk's task. Not indexed by
+    # `threadid()`: a task can migrate between threads at any yield point, so
+    # thread-indexed mutable scratch is a race rather than an optimisation.
+    built = Any[CTSEMAdjointWorkspace(T, objective.params, nvalues, ntdpred)
+                for _ in 1:nchunks]
+    objective.adjoint_ws = built
+    return built
+end
+
+"""
+    ctsem_validate_forward_gradient(objective, values; step=1e-6, adjoint=true)
+
+Three-way gradient comparison: ForwardDiff, central finite differences, and
+(when `adjoint` is true) the reverse-mode adjoint.
+
+This is the oracle the adjoint's acceptance tests compare against. Finite
+differences are the independent referee: ForwardDiff and the adjoint are both
+"clever" and could in principle share a misunderstanding of the primal, whereas
+a central difference only knows the primal's outputs.
+"""
+function ctsem_validate_forward_gradient(objective, values::AbstractVector;
+    step::Real=1e-6, adjoint::Bool=true)
+    forward = _ctsem_gradient(objective, values)
+    finite = similar(forward)
+    for i in eachindex(values)
+        plus = copy(values); minus = copy(values)
+        plus[i] += step; minus[i] -= step
+        finite[i] = (objective(plus) - objective(minus)) / (2step)
+    end
+    denom = max(norm(forward), eps(eltype(values)))
+    adjoint_gradient = (adjoint && objective isa CTSEMObjective) ?
+        ctsem_adjoint_gradient(objective, collect(values)).gradient : nothing
+    return (
+        forward=forward,
+        finite=finite,
+        adjoint=adjoint_gradient,
+        relative_error=norm(forward - finite) / denom,
+        adjoint_relative_error=adjoint_gradient === nothing ? nothing :
+            norm(adjoint_gradient - forward) / denom,
+    )
+end
+
+export ctsem_hessian
+
+"""
+    ctsem_hessian(objective, values; progress=nothing, hybrid_mode=_HYBRID_PROFILE)
+
+The Hessian of the log posterior, by forward-mode differentiation *of the
+reverse-mode gradient*. `progress`, when given, hears after each sweep how many
+parameters' columns are done (`_ctsem_hessian_progress`).
+
+The alternative the R side used before this existed is a central finite
+difference of the same gradient, which costs `2 * npar` reverse sweeps and is
+accurate to roughly the square root of machine precision -- and only if the
+step happens to suit the parameter's scale, which one global step cannot do for
+a vector mixing log standard deviations with unconstrained correlations. Nesting
+forward over reverse costs `ceil(npar / chunksize)` sweeps instead of `2 * npar`,
+and is exact to machine precision: no step to choose, and nothing to tune.
+
+Forward-over-reverse rather than forward-over-forward because the reverse pass
+is where this engine's work already is. `ForwardDiff.hessian` would need
+`O(npar^2 / chunksize)` primal passes; differentiating the adjoint needs
+`O(npar / chunksize)`, each one a single traced forward sweep plus its reverse.
+
+By the hand-coded second order (`tangent_hessian.jl`): the subjects' sweeps
+carry the directions as Float64 tangents, and only the parameter layer runs at
+a dual, so the filter is never compiled at one. The forward mode over the
+adjoint gradient it replaced is the tests' oracle (test/dual_oracles.jl).
+Where subjects take their gradient by forward mode (`_CTSEM_ADJOINT_GROWTH`,
+R's `explosive_forward` optimcontrol) because their reverse pass is unstable,
+the Hessian is central differences of that gradient instead
+(`_ctsem_difference_columns!`).
+
+The result is symmetrised. The exact Hessian is symmetric, and each entry is
+computed once, so the two triangles differ only by floating-point association
+order; averaging them is free and keeps the matrix usable by a Cholesky.
+"""
+function ctsem_hessian(objective::CTSEMObjective, values::AbstractVector;
+    progress=nothing, hybrid_mode::Integer=_HYBRID_PROFILE)
+    # `progress(done, total, unit)`, when given, is called after each chunk of
+    # columns with `done` the parameters whose columns are finished. A chunk
+    # costs a few gradients, so the Hessian costs about `npar` -- a quarter of
+    # an hour on a 715-parameter model, which the finish's progress line used
+    # to sit through frozen.
+    x = collect(Float64, values)
+    n = length(x)
+    n == 0 && return zeros(Float64, 0, 0)
+    H = zeros(Float64, n, n)
+    if isfinite(_CTSEM_ADJOINT_GROWTH[])
+        _ctsem_difference_columns!(H, objective, x, collect(1:n), Int(hybrid_mode),
+            progress)
+    else
+        _tan_hessian_columns!(H, objective, x, collect(1:n), progress, hybrid_mode)
+    end
+    return _ctsem_symmetrised(H)
+end
+_ctsem_symmetrised(H::AbstractMatrix) = (H .+ transpose(H)) ./ 2
+
+"""
+The Hessian's columns `cols` into `H` by central differences of the gradient
+(`ctsem_adjoint_gradient`, at `hybrid_mode`), each at a step of `cbrt(eps)`
+of the parameter's size: where subjects take their gradient by forward mode,
+whose stability the hand-coded sweeps' reverse would not share.
+"""
+function _ctsem_difference_columns!(H::Matrix{Float64}, objective::CTSEMObjective,
+    x::Vector{Float64}, cols::Vector{Int}, hybrid_mode::Int, progress)
+    y = copy(x)
+    for (k, c) in enumerate(cols)
+        h = cbrt(eps(Float64)) * max(1.0, abs(x[c]))
+        y[c] = x[c] + h
+        up = ctsem_adjoint_gradient(objective, y; hybrid_mode=hybrid_mode).gradient
+        y[c] = x[c] - h
+        down = ctsem_adjoint_gradient(objective, y; hybrid_mode=hybrid_mode).gradient
+        y[c] = x[c]
+        @inbounds for i in eachindex(x)
+            H[i, k] = (up[i] - down[i]) / (2h)
+        end
+        progress === nothing || progress(k, length(cols), "parameters")
+    end
+    return H
+end
+
+"""
+The adjoint gradient as a function of the parameters alone, the hybrid's
+deviations handled by `mode` (`ctsem_adjoint_gradient`'s `hybrid_mode`). A type
+rather than a closure: it names the Hessian's dual tag (`_ctsem_hessian_dual`),
+which the hand-coded second order's parameter layer runs at, and which the
+tests' oracle differentiates this at (test/dual_oracles.jl), so that the two
+share one dual type.
+"""
+struct _CTSEMAdjointGradientOf{O}
+    objective::O
+    mode::Int
+end
+(g::_CTSEMAdjointGradientOf)(y) =
+    ctsem_adjoint_gradient(g.objective, y; hybrid_mode=g.mode).gradient
+
+export ctsem_hessian_columns
+"""
+    ctsem_hessian_columns(objective, values, columns; progress=nothing,
+        hybrid_mode=_HYBRID_PROFILE)
+
+The Hessian's columns `columns` at `values`, unsymmetrised, as an `n` by
+`length(columns)` matrix: for a caller holding the rest of a Hessian that has
+added coordinates since -- a sampled TI predictor cell's, whose likelihood
+curvature and coupling a prior's diagonal would leave out (R's
+`.ctJuliaTIMissingSampleFit`). Its derivatives along those coordinates alone,
+as `ctsem_hessian` takes them along all; on the Laplace route, its differences
+of the gradient (`_laplace_hessian_columns`), or these where no unit holds a
+coordinate (`_laplace_filter_hessian`).
+"""
+function ctsem_hessian_columns(objective::CTSEMObjective, values::AbstractVector,
+    columns; progress=nothing, hybrid_mode::Integer=_HYBRID_PROFILE)
+    x = collect(Float64, values)
+    cols = collect(Int, columns)
+    isempty(cols) && return zeros(Float64, length(x), 0)
+    H = zeros(Float64, length(x), length(cols))
+    isfinite(_CTSEM_ADJOINT_GROWTH[]) && return _ctsem_difference_columns!(H, objective,
+        x, cols, Int(hybrid_mode), progress)
+    _tan_hessian_columns!(H, objective, x, cols, progress, hybrid_mode)
+    return H
+end
+
+export ctsem_hessian_forward
+"""
+    ctsem_hessian_forward(objective, values; chunk=0)
+
+`ctsem_hessian` by nested ForwardDiff over the plain callable `objective(x)`
+rather than over `ctsem_adjoint_gradient`: what `gradient = 'forward'` asks
+for. Correct for every model, a sampled TI predictor value included, and the
+slower route in general, which is why `ctsem_hessian` is the default.
+"""
+function ctsem_hessian_forward(objective::CTSEMObjective, values::AbstractVector;
+    chunk::Integer=0, progress=nothing)
+    # `progress` unused -- see `ctsem_hessian` above; accepted only so R's
+    # uniform call (either name, by `.ctBackendHessianFunction()`) does not
+    # need to know which method it reached.
+    x = collect(Float64, values)
+    n = length(x)
+    n == 0 && return zeros(Float64, 0, 0)
+    chunksize = chunk > 0 ? min(Int(chunk), n) : ForwardDiff.pickchunksize(n)
+    hessian = _ctsem_dual_hessian(objective, x, ForwardDiff.Chunk{chunksize}())
+    return (hessian .+ transpose(hessian)) ./ 2
+end

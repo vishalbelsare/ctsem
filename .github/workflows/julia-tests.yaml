@@ -1,0 +1,229 @@
+# Tier 2 of four: the R-side julia suite, with Julia actually present.
+#
+# These ~280 test blocks skip in every other workflow. `R CMD check` has no
+# Julia and no NOT_CRAN, so they skip there by design; julia-engine.yaml runs
+# the engine's own assertions inside Julia and never crosses the R bridge --
+# which is exactly how an empty vector that deadlocked every R fit was merged
+# with 1400 green engine assertions behind it. This tier is the one that runs
+# ctsem's julia backend the way a user does.
+#
+# NOT_CRAN=true also unlocks the expensive stan test files, so this is where
+# the slow stan suite runs too. That is deliberately not left to the tier 3
+# matrix, where it would be paid for five times.
+#
+# Four shards, because one job does not fit. As a single job this tier had
+# never once been green: seven consecutive runs spent 105 minutes in the suite
+# and were killed by the cap below without reaching the end. The same files
+# measure about 70 minutes on the development laptop and a runner core is
+# roughly half its speed, so that is slowness rather than a hang, and the cap
+# stays where it is -- it is there to catch a hang, and a shard that needs an
+# hour is one that has hung. dev/test-shard.R does the split by measured cost;
+# see the comment there for what happens as that measurement goes stale, which
+# it does.
+on:
+  push:
+    branches: [juliaFit, master, main]
+  pull_request:
+    branches: [juliaFit, master, main]
+  # The slow tier, below, runs on these two events only.
+  schedule:
+    - cron: '0 3 * * 2'
+  workflow_dispatch:
+
+name: julia-tests
+
+concurrency:
+  group: julia-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  julia-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    name: shard ${{ matrix.shard }} of 4
+    strategy:
+      # One shard's failure is not a reason to throw away the other three's
+      # results; the whole point of the split is to see all of them at once.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
+      R_KEEP_PKG_SOURCE: yes
+      # Every julia test is skip_on_cran. Without this the suite reports zero
+      # assertions and a zero-assertion run looks exactly like a clean one.
+      NOT_CRAN: 'true'
+      # Consent to the managed Julia install from a script. Julia is installed
+      # by the step below, so this only covers the engine's own dependencies.
+      CTSEM_JULIA_AGREE: 'yes'
+      CTSEM_SHARD: ${{ matrix.shard }}
+      CTSEM_SHARDS: '4'
+      # Tests that cannot be reproduced cheaply, gated by `skip_unless_slow()`.
+      # Weekly and on demand, not per push: one of them is 210 s on its own,
+      # against about 2 s for the rest of its file. A push run skips them and
+      # says so, which is not the same as not having them -- the skip message
+      # names the variable.
+      CTSEM_SLOW_TESTS: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'true' || 'false' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: julia-actions/setup-julia@v2
+        with:
+          # In step with the pin in R/ctJuliaInstall.R and julia-engine.yaml.
+          version: '1.13.3'
+
+      - uses: julia-actions/cache@v2
+
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: release
+          use-public-rspm: true
+
+      - uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          extra-packages: any::testthat, any::JuliaConnectoR
+          needs: check
+
+      - name: Compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-ubuntu-release-${{ hashFiles('inst/stan/**', 'inst/include/**', 'configure') }}
+          restore-keys: |
+            ccache-ubuntu-release-
+
+      - name: Point R at ccache
+        run: |
+          command -v ccache >/dev/null || sudo apt-get install -y ccache
+          mkdir -p ~/.R ~/.ccache
+          {
+            echo 'CC = ccache gcc'
+            echo 'CXX = ccache g++'
+            echo 'CXX11 = ccache g++'
+            echo 'CXX14 = ccache g++'
+            echo 'CXX17 = ccache g++'
+            echo 'CXX20 = ccache g++'
+          } >> ~/.R/Makevars
+          printf 'max_size = 5.0G\nsloppiness = include_file_ctime,include_file_mtime,time_macros\n' > ~/.ccache/ccache.conf
+
+      - name: Install ctsem
+        run: |
+          chmod +x configure
+          R CMD INSTALL --no-multiarch --no-docs --no-byte-compile .
+
+      # Fail here rather than 40 minutes later with a green run full of skips.
+      - name: Julia is reachable from R
+        run: |
+          Rscript -e '
+            library(ctsem)
+            s <- ctJuliaStatus()
+            cat("julia bin :", format(s$julia), "\n")
+            cat("available :", isTRUE(s$available), "\n")
+            if (!isTRUE(s$available)) stop("Julia is not reachable; this tier would skip everything.")'
+
+      # One fit through the R bridge, before the suite, because the suite is
+      # long and this is the failure that matters most.
+      - name: Smoke test
+        run: Rscript dev/smoke.R
+
+      - name: Suite
+        run: |
+          Rscript -e '
+            library(testthat)
+            source("dev/test-shard.R")
+            n <- as.integer(Sys.getenv("CTSEM_SHARD"))
+            of <- as.integer(Sys.getenv("CTSEM_SHARDS"))
+            # ctTestShard checks that its filter selects exactly these files
+            # and stops if it does not, because a shard that runs a subset of
+            # what it was given is indistinguishable from a shard that passed.
+            s <- ctTestShard(n, of)
+            cat(sprintf("TIER2 shard %d/%d: %d files, %.0f s by the last measurement\n",
+                n, of, length(s$files), s$secs))
+            cat(paste0("  ", s$files, collapse = "\n"), "\n", sep = "")
+            pdf(NULL)
+            r <- test_dir("tests/testthat", package = "ctsem", load_package = "installed",
+                          filter = s$filter, reporter = "summary", stop_on_failure = FALSE)
+            d <- as.data.frame(r)
+            # The time of every test: the slowest in the job summary, all of
+            # them kept as an artifact (below), as the engine suite does. No
+            # apostrophe anywhere in this R: it is inside a single-quoted
+            # shell string, and one ends the string.
+            times <- d[, c("file", "test", "real")]
+            utils::write.csv(times, sprintf("r-test-timings-shard%d.csv", n),
+                row.names = FALSE)
+            summ <- Sys.getenv("GITHUB_STEP_SUMMARY")
+            if (nzchar(summ)) {
+              slow <- head(times[order(-times$real), ], 15)
+              cat(sprintf("### Shard %d: %.1f min of tests, the slowest\n\n", n,
+                  sum(times$real) / 60), "| file | test | seconds |\n|---|---|---:|\n",
+                  sprintf("| %s | %s | %.1f |\n", slow$file,
+                      gsub("|", "/", slow$test, fixed = TRUE), slow$real),
+                  sep = "", file = summ, append = TRUE)
+            }
+            cat(sprintf("\nTIER2 shard %d pass=%d fail=%d error=%d skip=%d\n",
+                n, sum(d$passed), sum(d$failed), sum(d$error), sum(d$skipped)))
+            jl <- d[grepl("^test-(julia|backend|stan-julia)", d$file), , drop = FALSE]
+            cat(sprintf("TIER2 shard %d julia files=%d pass=%d skip=%d\n",
+                n, length(unique(jl$file)), sum(jl$passed), sum(jl$skipped)))
+            # Say which file and which assertion, in annotations. GitHub
+            # serves a failed run log only to someone who can write to the
+            # repository, so `stop("test failures")` on its own told a reader
+            # nothing at all -- one shard of this tier went red and the only
+            # published word about it was that string, which cost a full local
+            # reproduction of 23 files to turn into a file name. Tier 1 has
+            # reported this way since it was written; this is the same thing.
+            bad <- which(d$failed > 0 | d$error > 0)
+            if (length(bad)) {
+              # Ten is all GitHub serves, and the summary below has to be one
+              # of them, so the detail stops short of that.
+              shown <- 0
+              for (i in bad) {
+                for (e in r[[i]]$results) {
+                  if (!inherits(e, c("expectation_failure", "expectation_error"))) next
+                  if (shown >= 8) next
+                  shown <- shown + 1
+                  cat(sprintf("::error title=%s::%s :: %s\n", d$file[i], d$test[i],
+                      substr(gsub("[\r\n]+", " ", conditionMessage(e)), 1, 700)))
+                }
+              }
+              cat(sprintf("::error title=Tier 2 shard %d::%d failed and %d errored in: %s\n",
+                  n, sum(d$failed), sum(d$error),
+                  paste(unique(d$file[bad]), collapse = " ")))
+              stop("test failures")
+            }
+            # The failure mode this tier exists to catch is not a red suite, it
+            # is a green one that ran nothing. Every shard so far has drawn
+            # julia files, but the split is by cost and nothing guarantees it,
+            # so ask whether this one has any before demanding assertions.
+            if (any(grepl("^test-(julia|backend|stan-julia)", s$files)) &&
+                sum(jl$passed) == 0) stop("the julia files asserted nothing")
+            # A skip for some other reason is legitimate; a skip because Julia
+            # could not be found is this tier failing quietly.
+            why <- unlist(lapply(r, function(f)
+              vapply(f$results, function(x)
+                if (inherits(x, "expectation_skip")) conditionMessage(x) else NA_character_,
+                character(1))))
+            why <- why[!is.na(why)]
+            if (length(why)) { cat("\nskip reasons:\n"); print(table(why)) }
+            if (any(grepl("Julia is not available|JuliaConnectoR", why))) {
+              stop("julia tests skipped in the tier that installs Julia")
+            }'
+
+      - name: Keep the timings
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: r-test-timings-shard${{ matrix.shard }}
+          path: r-test-timings-shard${{ matrix.shard }}.csv
+          if-no-files-found: ignore
+
+  # One check to require, rather than four that a shard count change renames.
+  julia-tests-complete:
+    needs: julia-tests
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every shard passed
+        run: |
+          echo "shards: ${{ needs.julia-tests.result }}"
+          test "${{ needs.julia-tests.result }}" = success

@@ -1,89 +1,173 @@
-ctModelBuildPopCov <- function(ctm,linearise){ #for latex
-  ctm <- T0VARredundancies(ctm)
-  pars <- unique(ctm$pars$param[ctm$pars$indvarying])
+# One level's population covariance, as labels: `column` is `indvarying` for
+# the subject level or `indvarying_<idname>` for a grouping level above it,
+# and `label` names the matrix the entries belong to.
+ctModelBuildPopCov <- function(ctm,linearise,column='indvarying',label='PCov'){ #for latex
+  ctm <- suppressMessages(T0VARredundancies(ctm))
+  ctm$pars <- .ctModelCleanctspec(ctm$pars)
+  freepars <- .ctSpecHoldsParameter(ctm$pars, ctm$latentNames, ctm$TDpredNames)
+  pars <- unique(ctm$pars$param[ctm$pars[[column]] %in% TRUE & freepars])
   d=length(pars)
-  m <- matrix(paste0(ifelse(linearise,'','raw'),'PCov_',rep(1:d,d),'_',rep(1:d,each=d)),d,d,dimnames = list(pars,pars))
+  m <- matrix(paste0(ifelse(linearise,'','raw'),label,'_',rep(1:d,d),'_',rep(1:d,each=d)),d,d,dimnames = list(pars,pars))
   m[upper.tri(m)]=t(m)[upper.tri(m)]
   return(m)
 }
 
-getPopEffectsFromFit <- function(x,linearise=TRUE,digits=3){
-  # browser()
-  ms=ctMatsetupFreePars(x$setup$matsetup)
-  e=x$stanfit$transformedparsfull#ctExtract(x)
-  if(x$standata$ntipred > 0){
-    if(linearise) timat <- e$linearTIPREDEFFECT
-    if(!linearise) timat <- e$TIPREDEFFECT
-    dimnames(timat) <- list(iter=1:(dim(timat)[1]),param= ms$parname,
-      TIpred= x$ctstanmodel$TIpredNames)
-    timat <- timat[,apply(x$standata$TIPREDEFFECTsetup,1,function(x) any(x!=0)),,drop=FALSE]
-  } else timat <- diag(0,0)
-  
-  if(!is.null(e$rawpopc) && !is.null(e$popcov)){ 
-    if(!linearise) popcov <- matrix(e$rawpopc[1,4,,],dim(e$rawpopc)[3])
-    if(linearise) {
-      popcov <- matrix(e$popcov[1,,],dim(e$popcov)[3])
-      if(x$standata$intoverpop==1){
-        t0index <- ms$indvarying[ms$param > 0 & ms$row <= x$standata$nlatent & ms$matrix %in% 1 & ms$indvarying > 0]
-        popcov[t0index,t0index] <- e$pop_T0VAR[1,
-          t0index,t0index] #is this correct...?
-      }
-    }
-    dimnames(popcov) <- list(#iter=1:(dim(popcov)[1]),
-      ms$parname[as.logical(ms$indvarying)],
-      ms$parname[as.logical(ms$indvarying)] )
-    
-  }
-  return(list(popcov=popcov,tieffects=timat))
-}
+# getPopEffectsFromFit <- function(x,linearise=TRUE,digits=3){
+#   # browser()
+#   ms=ctMatsetupFreePars(x$setup$matsetup)
+#   e=x$stanfit$transformedparsfull#ctExtract(x)
+#   if(x$standata$ntipred > 0){
+#     if(linearise) timat <- e$linearTIPREDEFFECT
+#     if(!linearise) timat <- e$TIPREDEFFECT
+#     dimnames(timat) <- list(iter=1:(dim(timat)[1]),param= ms$parname,
+#       TIpred= x$ctstanmodel$TIpredNames)
+#     timat <- timat[,apply(x$standata$TIPREDEFFECTsetup,1,function(x) any(x!=0)),,drop=FALSE]
+#   } else timat <- diag(0,0)
+#   
+#   if(!is.null(e$rawpopc) && !is.null(e$popcov)){ 
+#     if(!linearise) popcov <- matrix(e$rawpopc[1,4,,],dim(e$rawpopc)[3])
+#     if(linearise) {
+#       popcov <- matrix(e$popcov[1,,],dim(e$popcov)[3])
+#       if(x$standata$intoverpop==1){
+#         t0index <- ms$indvarying[ms$param > 0 & ms$row <= x$standata$nlatent & ms$matrix %in% 1 & ms$indvarying > 0]
+#         popcov[t0index,t0index] <- e$pop_T0VAR[1,
+#           t0index,t0index] #is this correct...?
+#       }
+#     }
+#     dimnames(popcov) <- list(#iter=1:(dim(popcov)[1]),
+#       ms$parname[as.logical(ms$indvarying)],
+#       ms$parname[as.logical(ms$indvarying)] )
+#     
+#   }
+#   return(list(popcov=popcov,tieffects=timat))
+# }
 
 ctModelBuildTIeffects <- function(ctm){ #for latex
-  ctm$pars <- ctStanModelCleanctspec(ctm$pars)
+  ctm$pars <- .ctModelCleanctspec(ctm$pars)
   tieffects <- unique(colnames(ctm$pars)[grep('_effect',colnames(ctm$pars),fixed=TRUE)])
-  pars <- unique(ctm$pars$param[apply(ctm$pars[,tieffects,drop=FALSE],1,any)])
+  # Only a cell that holds a parameter carries its effects, as in a fit, and
+  # its effects are read there: a cell referring to a PARS label carries none,
+  # and read first it showed the parameter without them.
+  held <- ctm$pars[.ctSpecHoldsParameter(ctm$pars, ctm$latentNames,
+    ctm$TDpredNames),,drop=FALSE]
+  pars <- unique(held$param[apply(held[,tieffects,drop=FALSE],1,
+      function(r) any(.ctTipredEffectActive(r)))])
   timat <- matrix(0,length(pars),length(tieffects),dimnames = list(pars,gsub('_effect','',tieffects)))
   if(length(tieffects)){
-    for(p in 1:length(pars)){
-      timat[p,] <- unlist(ctm$pars[match(x = pars[p],ctm$pars$param),tieffects,drop=FALSE])
+    for(p in seq_along(pars)){
+      # Active as 1, absent as 0: the loop below turns anything non-zero into
+      # a label. A fixed effect shows its value instead of a generated name.
+      row <- held[match(x = pars[p],held$param),tieffects,drop=FALSE]
+      value <- .ctTipredEffectValue(row)
+      timat[p,] <- ifelse(.ctTipredEffectActive(row),
+        ifelse(is.na(value), 1, value), 0)
     }
   }
-  for(i in 1:nrow(timat)){
-    for(j in 1:ncol(timat)){
+  for(i in seq_len(nrow(timat))){
+    for(j in seq_len(ncol(timat))){
       if(timat[i,j] !=0) timat[i,j] = paste0(pars[i],'_',gsub('_effect','',tieffects[j],fixed=TRUE))
     }}
   return(timat)
 }
 
-ctMatsetupFreePars <- function(m,intoverpop){
-  m=m[m$when %in% c(0,-1) & m$param > 0,,drop=FALSE]
-  m=m[match(unique(m$param),m$param),,drop=FALSE]
-  m = m[order(m$param),,drop=FALSE]
+ctModelLatexT0Labels <- function(ctm){
+  nlatent <- ctm$n.latent
+  labels <- paste0('T0MEANS_', ctm$latentNames[seq_len(nlatent)])
+  t0pars <- ctm$pars[ctm$pars$matrix %in% 'T0MEANS' &
+      ctm$pars$row <= nlatent & ctm$pars$col == 1,,drop=FALSE]
+  t0pars <- t0pars[match(seq_len(nlatent), t0pars$row),,drop=FALSE]
+  named <- !is.na(t0pars$param) & nzchar(as.character(t0pars$param))
+  labels[named] <- as.character(t0pars$param[named])
+  labels
 }
 
-ctMatvalueFreePars <- function(ms,mv){
-  mv=mv[ms$when %in% c(0,-1) & ms$param > 0,,drop=FALSE]
-  ms=ms[ms$when %in% c(0,-1) & ms$param > 0,,drop=FALSE]
-  mv=mv[match(unique(ms$param),ms$param),,drop=FALSE]
-  mv = mv[order(ms$param),,drop=FALSE]
+ctModelLatexT0DisplayCov <- function(t0var, digits=3){
+  t0var <- as.matrix(t0var)
+  d <- nrow(t0var)
+  if(d < 1) return(matrix(numeric(0), 0, 0))
+  num <- suppressWarnings(matrix(as.numeric(t0var), nrow=d, ncol=d))
+  if(!any(is.na(num))) return(round(sdpcor2cov(num), digits))
+  
+  out <- matrix(0, d, d)
+  dimnames(out) <- dimnames(t0var)
+  for(ri in seq_len(d)){
+    for(ci in seq_len(d)){
+      if(ri == ci){
+        out[ri,ci] <- if(!is.na(num[ri,ri]) && num[ri,ri] == 0) 0 else
+          paste0('T0cov_', ri, '_', ci)
+      } else {
+        lr <- max(ri, ci)
+        lc <- min(ri, ci)
+        out[ri,ci] <- if(!is.na(num[lr,lc]) && num[lr,lc] == 0) 0 else
+          paste0('T0cov_', ri, '_', ci)
+      }
+    }
+  }
+  out[upper.tri(out)] <- t(out)[upper.tri(out)]
+  out
 }
 
-# ctCovTransform <- function(rawpopcov, rawpopmeans, ms, mv){
-#   mv <- ctMatvalueFreePars(ms,mv)
-#   ms <- ctMatsetupFreePars(ms)
-#   rawpopmeans=rawpopmeans[ms$param[ms$indvarying>0]]
-#   
-#   d=nrow(rawpopcov)
-#   n=10000
-#   mc <- t(chol(rawpopcov))
-#   
-#   x <- matrix(rnorm(n*d),n,d)
-#   x <- t(apply(x,1,function(y)  mc %*% (y) + rawpopmeans ))
-#   tx <- x
-#   for(i in 1:nrow(mc)){
-#       tx[,i] <- ctsem:::tform(x[,i],ms$transform[i],mv$multiplier[i], mv$meanscale[i], mv$offset[i],mv$inneroffset[i])
-#   }
-#   return(cov(tx))
-# }
+ctModelLatexAugmentT0 <- function(popmeans, popcov, timat, ctm, digits=3,
+  t0means=NULL, t0cov=NULL, latentPopNames=NULL, t0covIsTotal=FALSE){
+  
+  nlatent <- ctm$n.latent
+  if(nlatent < 1) return(list(popmeans=popmeans, popcov=popcov, timat=timat))
+  labels <- ctModelLatexT0Labels(ctm)
+  if(is.null(t0means)) t0means <- as.matrix(ctm$T0MEANS)[seq_len(nlatent),1]
+  if(is.null(t0cov)) t0cov <- ctModelLatexT0DisplayCov(
+    as.matrix(ctm$T0VAR)[seq_len(nlatent), seq_len(nlatent), drop=FALSE],
+    digits=digits)
+  t0cov <- as.matrix(t0cov)
+  
+  labelsInPopcov <- labels %in% rownames(popcov)
+  
+  pars <- unique(c(rownames(popcov), labels))
+  newpopcov <- matrix(0, length(pars), length(pars), dimnames=list(pars, pars))
+  if(nrow(popcov) > 0) {
+    ii <- match(rownames(popcov), rownames(newpopcov))
+    newpopcov[ii, ii] <- popcov
+  }
+  if(t0covIsTotal) {
+    newpopcov[labels, labels] <- t0cov[seq_len(nlatent), seq_len(nlatent), drop=FALSE]
+  } else if(any(!labelsInPopcov)){
+    missingLabels <- labels[!labelsInPopcov]
+    missingIndex <- which(!labelsInPopcov)
+    newpopcov[missingLabels, missingLabels] <- t0cov[missingIndex, missingIndex, drop=FALSE]
+  }
+  
+  if(!is.null(latentPopNames) && length(latentPopNames) > 0 &&
+      nrow(t0cov) >= nlatent + length(latentPopNames)){
+    for(pi in seq_along(latentPopNames)){
+      pname <- latentPopNames[pi]
+      if(pname %in% rownames(newpopcov)){
+        newpopcov[labels, pname] <- t0cov[seq_len(nlatent), nlatent + pi]
+        newpopcov[pname, labels] <- t0cov[nlatent + pi, seq_len(nlatent)]
+      }
+    }
+  }
+  popcov <- newpopcov
+  
+  if(length(popmeans) > 0){
+    newpopmeans <- rep(NA, nrow(popcov))
+    names(newpopmeans) <- rownames(popcov)
+    oldnames <- names(popmeans)
+    if(is.null(oldnames)) oldnames <- rownames(popcov)[seq_along(popmeans)]
+    oldmatch <- match(oldnames, names(newpopmeans))
+    newpopmeans[oldmatch[!is.na(oldmatch)]] <- popmeans[!is.na(oldmatch)]
+    newpopmeans[labels] <- t0means
+    popmeans <- newpopmeans
+  }
+  
+  if(nrow(timat) > 0){
+    newtimat <- matrix(0, nrow(popcov), ncol(timat),
+      dimnames=list(rownames(popcov), colnames(timat)))
+    newtimat[rownames(timat),] <- timat
+    timat <- newtimat
+  }
+  
+  list(popmeans=popmeans, popcov=popcov, timat=timat)
+}
+
 
 texPrep <- function(x){ #replaces certain characters with tex safe versions
   for(i in 1:length(x)){
@@ -91,6 +175,277 @@ texPrep <- function(x){ #replaces certain characters with tex safe versions
     x[i]=gsub('^', '\\textasciicircum',x[i],fixed=TRUE)
   }
   return(x)
+}
+
+# Rendering a fitted model's context-dependent cells ---------------------------
+#
+# For an ordinary cell, substituting the fitted number is exactly right. For a
+# cell written as an expression referencing a latent process or a time dependent
+# predictor it is not: collapsing `-log1p(exp(dr11)) * eta2` to a single number
+# produces the equation of a *linear* model, and a reader documenting a
+# nonlinear fit from this output would publish the wrong model.
+#
+# So such a cell keeps its structure and loses only its labels: each free
+# parameter is replaced by its estimated value, latent references become
+# subscripted etas and TD predictor references keep their names. The result
+# reads as the model that was fitted -- numbers where the estimates are,
+# structure where the structure is.
+
+# The estimated raw value of every free parameter, by name. Raw, not
+# transformed: inside a cell expression a parameter appears before its
+# transform has been applied, so the transformed value would be wrong there.
+.ctLatexRawEstimates <- function(fit, e = NULL) {
+  if (inherits(fit, 'ctJuliaFit')) {
+    cells <- .ctBackendFreeParameterCells(fit)
+    # A stated population mean (R/ctFixedPopMeans.R) is a value the cell
+    # reads, past the free parameters.
+    values <- .ctBackendRawFull(fit, as.numeric(fit$estimate$raw))[cells$parnumber]
+    names(values) <- .ctBackendParameterNames(cells)
+    return(values[!is.na(names(values))])
+  }
+  if (is.null(e)) e <- ctExtract(fit)
+  values <- as.numeric(ctCollapse(e$rawpopmeans, 1, mean))
+  names(values) <- getparnames(fit)
+  values[!is.na(names(values))]
+}
+
+# Every model matrix with the fit's estimates in it: a number in each cell,
+# except the cells written as expressions over the state or the TD predictors,
+# which keep their structure and lose only their labels (see
+# .ctLatexRenderExpression above).
+#
+# Shared by the two backend branches of ctModelLatex(). They differ only in
+# where the four inputs come from -- the matrices, the pop_* arrays, the
+# parameter table and the context cells -- so only that differs, and the
+# substitution itself is written once.
+.ctLatexFillEstimates <- function(ctmodelmats, e, pars, contextcells, estimates,
+  latentNames, TDpredNames, digits) {
+
+  isContextCell <- function(mi,i,j) !is.null(contextcells) &&
+    any(contextcells$matrix %in% mi & contextcells$row %in% i & contextcells$col %in% j)
+
+  for(mi in names(ctmodelmats)){
+    # A matrix the backend does not report leaves its expressions in place,
+    # rather than taking the whole document down on a NULL.
+    if(is.null(e[[paste0('pop_',mi)]])) next
+    mimean <- ctCollapse(e[[paste0('pop_',mi)]],1,mean)
+    for(i in 1:nrow(ctmodelmats[[mi]])){
+      for(j in 1:ncol(ctmodelmats[[mi]])){
+        if(isContextCell(mi,i,j)){
+          ctmodelmats[[mi]][i,j] <- .ctLatexRenderExpression(
+            .ctLatexCellExpression(pars,mi,i,j), estimates,
+            latentNames, TDpredNames, digits)
+        } else ctmodelmats[[mi]][i,j] <- round(mimean[i,j],digits)
+      }
+    }
+  }
+  ctmodelmats
+}
+
+# The expression a cell was actually written as.
+#
+# Two spec syntaxes reach the same place. A bare expression lives in `param`
+# and `listOfMatrices` already returns it. A `name | transform` cell keeps only
+# the name there, with the expression in `transform` and the name written as
+# `param` inside it -- so the expression has to be reassembled before it can be
+# rendered, or the cell collapses to a single estimate again.
+.ctLatexCellExpression <- function(pars, mi, i, j) {
+  row <- which(pars$matrix %in% mi & pars$row %in% i & pars$col %in% j)
+  if (!length(row)) return(NA_character_)
+  row <- row[1L]
+  transform <- pars$transform[row]
+  written <- !is.na(transform) && nzchar(as.character(transform)) &&
+    is.na(suppressWarnings(as.numeric(transform)))
+  if (written) return(.ctLatexResolvePARS(gsub('\\bparam\\b',
+    as.character(pars$param[row]), as.character(transform), perl = TRUE), pars))
+  .ctLatexResolvePARS(as.character(pars$param[row]), pars)
+}
+
+# `PARS[i,j]` referred to by its own name.
+#
+# A cell may hold a parameter in the PARS matrix and reference it from the
+# dynamics, and ctModelStatesAndPARS rewrites the name into that coordinate
+# before either backend sees the model -- so a julia fit's parameter table
+# spells `dr11 * (1 + 0.2 * eta2)` as `PARS[1,1] * (1 + 0.2 * state[2])`, while
+# the stan branch reads the base model and still sees `dr11`. Left alone the
+# coordinate renders as the literal text `PARS[1,1]` in a document whose point
+# is the estimates; resolved to the label, it substitutes like any other
+# parameter and the two backends write the same cell.
+#
+# The label, not the PARS cell's own transform: what this expression multiplies
+# is the parameter, and the transform is reported where that cell is -- the
+# same thing the stan branch does by reading the name the user wrote.
+.ctLatexResolvePARS <- function(expression, pars) {
+  if (length(expression) != 1 || is.na(expression) ||
+      !grepl('PARS[', expression, fixed = TRUE)) return(expression)
+  for (row in which(pars$matrix %in% 'PARS')) {
+    label <- if (is.na(pars$value[row])) as.character(pars$param[row]) else
+      as.character(pars$value[row])
+    if (is.na(label)) next
+    expression <- gsub(paste0('\\bPARS\\s*\\[\\s*', pars$row[row], '\\s*,\\s*',
+      pars$col[row], '\\s*\\]'), gsub('\\\\', '\\\\\\\\', label), expression, perl = TRUE)
+  }
+  expression
+}
+
+# One cell's expression, with estimates for labels and math for references.
+.ctLatexRenderExpression <- function(expression, estimates, latentNames,
+  TDpredNames, digits = 3) {
+
+  if (length(expression) != 1 || is.na(expression) || !nzchar(expression)) return(expression)
+  quoted <- function(x) paste0('\\b\\Q', x, '\\E\\b')
+
+  # Longest names first, so that a parameter called `a1` cannot eat part of
+  # `a12` before `a12` has had its turn.
+  named <- names(estimates)[order(nchar(names(estimates)), decreasing = TRUE)]
+  for (nm in named) {
+    expression <- gsub(quoted(nm), format(round(estimates[[nm]], digits), trim = TRUE),
+      expression, perl = TRUE)
+  }
+
+  for (k in seq_along(latentNames)) {
+    expression <- gsub(quoted(latentNames[k]), paste0('\\\\eta_{', k, '}'),
+      expression, perl = TRUE)
+  }
+  expression <- gsub('\\bstate\\s*\\[\\s*([0-9]+)\\s*\\]', '\\\\eta_{\\1}',
+    expression, perl = TRUE)
+
+  for (k in seq_along(TDpredNames)) {
+    expression <- gsub(quoted(TDpredNames[k]),
+      paste0('\\\\text{', texPrep(TDpredNames[k]), '}'), expression, perl = TRUE)
+  }
+  expression <- gsub('tdpreds\\s*\\[\\s*rowi\\s*,\\s*([0-9]+)\\s*\\]',
+    '\\\\text{TD}_{\\1}', expression, perl = TRUE)
+
+  expression <- gsub('*', ' \\cdot ', expression, fixed = TRUE)
+
+  # Function names set upright, so `log1p(...)` does not render as a product of
+  # the letters l, o, g and the number 1p. Done name by name rather than with
+  # one replacement pattern because the name needs tex-escaping on the way in,
+  # and an underscore must be escaped there while the one in `\eta_{2}` must
+  # not. `\text` and `\mathrm` are never caught: they are followed by a brace,
+  # not a parenthesis.
+  # The lookbehind keeps the `\cdot` just inserted above from being read as a
+  # function name when the next token happens to be a parenthesis.
+  notmacro <- '(?<![\\\\A-Za-z0-9_.])'
+  functions <- unique(regmatches(expression,
+    gregexpr(paste0(notmacro, '[A-Za-z][A-Za-z0-9_.]*(?=\\s*\\()'),
+      expression, perl = TRUE))[[1L]])
+  for (fn in functions) {
+    replacement <- gsub('\\', '\\\\', paste0('\\mathrm{', texPrep(fn), '}'), fixed = TRUE)
+    expression <- gsub(paste0(notmacro, '\\Q', fn, '\\E\\b(\\s*\\()'),
+      paste0(replacement, '\\1'), expression, perl = TRUE)
+  }
+  trimws(gsub(' {2,}', ' ', expression))
+}
+
+ctModelLatexMathElement <- function(x){
+  for(i in seq_along(x)){
+    if(is.na(suppressWarnings(as.numeric(x[i]))) &&
+        grepl('\\',x[i],fixed=TRUE) == FALSE) {
+      x[i] <- paste0('\\text{',texPrep(x[i]),'}')
+    }
+  }
+  x
+}
+
+# A named covariance placed into a wider set of parameters, zero elsewhere.
+#
+# Every source of a covariance here covers some of the parameters and not
+# others -- one random-effect level, the covariate effects, the initial state --
+# and they are shown as one distribution over the union of them.
+.ctLatexExpandCov <- function(cov, pars) {
+  out <- matrix(0, length(pars), length(pars), dimnames=list(pars,pars))
+  index <- match(rownames(cov), pars)
+  keep <- !is.na(index)
+  out[index[keep], index[keep]] <- cov[keep, keep, drop=FALSE]
+  out
+}
+
+# A level's symbolic covariance labelled by where its entries sit in the
+# displayed matrix, so `Cov_3_2` is row 3 and column 2 of what the reader sees.
+# Only the level's own labels: an initial state's T0VAR entry merged into the
+# subject level keeps its own text.
+.ctLatexRelabelCov <- function(cov, label) {
+  islabel <- matrix(startsWith(as.character(cov), paste0(label, '_')), nrow(cov))
+  i <- pmax(row(cov), col(cov)); j <- pmin(row(cov), col(cov))
+  cov[islabel] <- paste0(label, '_', i[islabel], '_', j[islabel])
+  cov
+}
+
+# The parameters a covariance spans: rows with anything other than zero.
+.ctLatexNonzeroRows <- function(cov) {
+  if(!length(cov)) return(character())
+  zero <- matrix(suppressWarnings(as.numeric(cov)) %in% 0, nrow(cov))
+  rownames(cov)[rowSums(!zero) > 0]
+}
+
+# The parameter distribution: the first line of the equations.
+#
+# One level is a normal over the parameters, as it always was. With grouping
+# levels above the subject each level is a term of its own -- a deviation
+# vector over the parameters, zero where a parameter does not vary at that
+# level -- and a line below gives that level's covariance over the parameters
+# it does vary. One covariance per level padded out to every parameter showed
+# the levels too, as matrices mostly of zeros in which they were hard to find.
+# Subscripts follow the nesting: a parameter is phi_ij for subject i in group
+# j, and the group's deviation is u_j. `members` names what each level spans,
+# subject first, read before the covariances were widened: an estimated
+# variance can round to zero. `relabel` numbers a model's symbolic entries by
+# their place in the matrix shown.
+.ctLatexPopulationBlock <- function(popcov, extracov, popmeans, timat, members,
+  ctmodel, linearise, relabel) {
+  rel <- ifelse(linearise, "\\approx", "\\sim")
+  open <- ifelse(linearise, "", "\\textrm{tform}\\left\\{")
+  close <- ifelse(linearise, "", "\\right\\}")
+  beta <- function(z) if(nrow(timat)) paste0(" + \\underbrace{",bmatrix(timat),
+    "}_{\\vect{",ifelse(linearise,"\\hat",""),"\\beta}}","
+  \\underbrace{
+    ",bmatrix(matrix(colnames(timat))),"}_{\\vect{z}",z,"}") else ""
+  head <- "\\parbox{10em}{\\centering{Initial\\linebreak and subject\\linebreak parameter\\linebreak distribution:}}
+             &"
+  if(!length(extracov)) return(paste0(head, "\\underbrace{",
+    bmatrix(matrix(paste0('\\text{', texPrep(colnames(popcov)),'}_i')),nottext=TRUE),"
+            }_{\\vect{\\phi}(i)} ", rel, open, " \\mathrm{N} \\left(
+              ",bmatrix(popmeans),", ", bmatrix(popcov)," \\right) ", beta(""),
+    close, " \\\\"))
+
+  levels <- c(if(is.null(ctmodel$subjectIDname)) 'subject' else
+    as.character(ctmodel$subjectIDname), names(extracov))
+  index <- c('i','j','k','l','m','n','o','p')[seq_along(levels)]
+  sub <- vapply(seq_along(levels), function(l)
+    paste(index[l:length(levels)], collapse = ''), character(1))
+  pars <- colnames(popcov)
+  covs <- c(list(popcov), extracov)
+  prefix <- paste0(ifelse(linearise, '', 'raw'),
+    c('PCov', paste0('Cov', names(extracov))))
+  u <- function(p) paste0('u_{\\text{', texPrep(p), '}}')
+  terms <- character()
+  lines <- character()
+  for(l in seq_along(levels)){
+    spans <- pars[pars %in% union(members[[l]], .ctLatexNonzeroRows(covs[[l]]))]
+    if(!length(spans)) next
+    name <- paste0("\\vect{u}^{\\textrm{", texPrep(levels[l]), "}}_{", sub[l], "}")
+    terms <- c(terms, paste0(" + \\underbrace{",
+      bmatrix(matrix(ifelse(pars %in% spans, u(pars), "0")), nottext=TRUE),
+      "}_{", name, "}"))
+    level <- covs[[l]][spans, spans, drop=FALSE]
+    if(relabel) level <- .ctLatexRelabelCov(level, prefix[l])
+    lines <- c(lines, paste0("\\underbrace{", bmatrix(matrix(u(spans)), nottext=TRUE),
+      "}_{", name, "} \\sim \\mathrm{N} \\left( \\mathbf{0}, ", bmatrix(level),
+      " \\right) \\\\"))
+  }
+  nesting <- paste0(index, "\\textrm{: ", texPrep(levels), "}",
+    collapse = "\\textrm{, within }")
+  paste0(head, "\\underbrace{",
+    bmatrix(matrix(paste0('\\text{', texPrep(pars), '}_{', sub[1], '}')), nottext=TRUE),
+    "}_{\\vect{\\phi}_{", sub[1], "}} ", rel, open, " \\underbrace{",
+    bmatrix(popmeans), "}_{\\vect{\\mu}}", paste(terms, collapse = ""),
+    beta(paste0("_{", sub[1], "}")), close, " \\\\
+  \\parbox{10em}{\\centering{Random effects\\linebreak by level:}}
+  &", paste(lines, collapse = "
+  &"), "
+  &", nesting, " \\\\")
 }
 
 bmatrix = function(x, digits=NULL,nottext=FALSE, ...) {
@@ -123,14 +478,196 @@ bmatrix = function(x, digits=NULL,nottext=FALSE, ...) {
   return(out)
 }
 
+ctModelLatexDynamicsBlock <- function(ctmodel, showd, continuoustime, matrixnames=TRUE,
+  splitDynamics=TRUE){
+  drift <- paste0("\\underbrace{
+        ",bmatrix(ctmodel$DRIFT),"
+      ",ifelse(!matrixnames,"}_{{", "}_{\\underbrace{"),"\\vect{A}}",ifelse(!matrixnames,"}","_\\textrm{DRIFT}}")," \\underbrace{
+        ",bmatrix(matrix(paste0(ctmodel$latentNames)))," 
+        \\big(t\\big)
+      }_{\\vect{\\eta} (t",ifelse(continuoustime,"","-1"),")}	+ \\underbrace{
+        ",bmatrix(ctmodel$CINT),"
+      ",ifelse(!matrixnames,"}_{{", "}_{\\underbrace{"),"\\vect{b}}",ifelse(!matrixnames,"}","_\\textrm{CINT}}"),
+    if(ctmodel$n.TDpred > 0) paste0( "+ \\underbrace{
+        ",bmatrix(ctmodel$TDPREDEFFECT),"
+      ",ifelse(!matrixnames,"}_{{", "}_{\\underbrace{"),"\\vect{M}}",ifelse(!matrixnames,"}","_\\textrm{TDPREDEFFECT}}"),"
+      \\underbrace{
+        ",bmatrix(matrix(ctmodel$TDpredNames))," 
+      }_{\\vect{\\chi} (t)}"))
+  diffusion <- paste0("\\underbrace{UcorSDtoChol\\left\\{
+      ",bmatrix(ctmodel$DIFFUSION),"\\right\\}
+    ",ifelse(!matrixnames,"}_{{", "}_{\\underbrace{"),"\\vect{G}}",ifelse(!matrixnames,"}","_\\textrm{DIFFUSION}}"),"
+    \\underbrace{",showd,"
+      ",bmatrix(matrix(paste0('W_{',1:ctmodel$n.latent,'}')),nottext=TRUE)," 
+      (t)}_{",showd," \\vect{W}(t)}")
+  
+  if(splitDynamics) return(paste0("\\parbox{10em}{\\centering{Deterministic\\linebreak change:}}
+  &\\underbrace{",showd,"
+    ",bmatrix(matrix(paste0(ctmodel$latentNames)))," 
+    \\big(t\\big)}_{",showd," \\vect{\\eta} (t)}	=  \\left(
+      ",drift,"
+      \\right) ",ifelse(continuoustime,"\\mathrm{d}t","")," \\quad + \\nonumber \\\\ \\\\
+    \\parbox{10em}{\\centering{Random\\linebreak change:}}
+    & \\qquad \\qquad \\quad ",diffusion," \\\\ \\\\"))
+  
+  paste0("\\parbox{10em}{\\centering{Dynamics:}}
+  &\\underbrace{",showd,"
+    ",bmatrix(matrix(paste0(ctmodel$latentNames)))," 
+    \\big(t\\big)}_{",showd," \\vect{\\eta} (t)}	=  \\left(
+      ",drift,"
+      \\right) ",ifelse(continuoustime,"\\mathrm{d}t","")," \\quad + ",diffusion," \\\\ \\\\")
+}
+
+ctModelLatexMeasurementBlock <- function(ctmodel, matrixnames=TRUE,
+  splitMeasurement=TRUE){
+  manifesttype <- rep(0, ctmodel$n.manifest)
+  if(!is.null(ctmodel$manifesttype)) manifesttype <- as.integer(ctmodel$manifesttype)
+  binary <- manifesttype == 1
+  ordinal <- manifesttype == 2
+  count <- manifesttype == 3
+  censored <- manifesttype == 4
+  manifestNames <- ctmodel$manifestNames
+  manifestIndex <- seq_along(manifestNames)
+  binaryIndex <- which(binary)
+  ordinalIndex <- which(ordinal)
+  countIndex <- which(count)
+  censoredIndex <- which(censored)
+  
+  if(!any(manifesttype != 0)){
+    observation <- paste0("\\underbrace{
+          ",bmatrix(ctmodel$LAMBDA)," 
+        ",ifelse(!matrixnames,"}_{{", "}_{\\underbrace{"),"\\vect{\\Lambda}}",ifelse(!matrixnames,"}","_\\textrm{LAMBDA}}")," \\underbrace{
+          ",bmatrix(matrix(ctmodel$latentNames))," 
+          (t)}_{\\vect{\\eta}(t)} +
+        \\underbrace{
+          ",bmatrix(ctmodel$MANIFESTMEANS)," 
+        ",ifelse(!matrixnames,"}_{{", "}_{\\underbrace{"),"\\vect{\\tau}}",ifelse(!matrixnames,"}","_\\textrm{MANIFESTMEANS}}"))
+    noise <- paste0("\\underbrace{UcorSDtoChol \\left\\{
+                ",bmatrix(ctmodel$MANIFESTVAR),"\\right\\}  
+              ",ifelse(!matrixnames,"}_{{", "}_{\\underbrace{"),"\\vect{\\Theta}}",ifelse(!matrixnames,"}","_\\textrm{MANIFESTVAR}}"),"
+              \\underbrace{
+          ",bmatrix(matrix(paste0('\\epsilon_{',1:ctmodel$n.manifest,'}')))," 
+          (t)}_{\\vect{\\epsilon}(t)}")
+    
+    if(splitMeasurement) return(paste0("\\parbox{10em}{\\centering{Observations:}}
+&\\underbrace{
+      ",bmatrix(matrix(ctmodel$manifestNames),nottext=FALSE),"  
+      (t)}_{\\vect{Y}(t)} = 
+        ",observation," + \\nonumber \\\\ \\\\
+    \\parbox{10em}{\\centering{Observation\\linebreak noise:}}
+    & \\qquad \\qquad \\quad  ",noise," \\\\ \\\\"))
+    
+    return(paste0("\\parbox{10em}{\\centering{Measurement:}}
+&\\underbrace{
+      ",bmatrix(matrix(ctmodel$manifestNames),nottext=FALSE),"  
+      (t)}_{\\vect{Y}(t)} = 
+        ",observation," + ",noise," \\\\ \\\\"))
+  }
+  
+  linearPredictor <- paste0("\\underbrace{
+          ",bmatrix(ctmodel$LAMBDA)," 
+        ",ifelse(!matrixnames,"}_{{", "}_{\\underbrace{"),"\\vect{\\Lambda}}",ifelse(!matrixnames,"}","_\\textrm{LAMBDA}}")," \\underbrace{
+          ",bmatrix(matrix(ctmodel$latentNames))," 
+          (t)}_{\\vect{\\eta}(t)} +
+        \\underbrace{
+          ",bmatrix(ctmodel$MANIFESTMEANS)," 
+        ",ifelse(!matrixnames,"}_{{", "}_{\\underbrace{"),"\\vect{\\tau}}",ifelse(!matrixnames,"}","_\\textrm{MANIFESTMEANS}}"))
+  predictorLine <- paste0("\\parbox{10em}{\\centering{Linear\\linebreak predictor:}}
+&\\underbrace{",bmatrix(matrix(paste0('\\nu_{',manifestIndex,'}(t)')),nottext=TRUE),"
+      }_{\\vect{\\nu}(t)} =
+        ",linearPredictor," \\\\ \\\\")
+  yhat <- matrix(paste0('\\nu_{',manifestIndex,'}(t)'))
+  yhat[binary] <- paste0('\\operatorname{logit}^{-1}\\left(\\nu_{',binaryIndex,'}(t)\\right)')
+  # An ordinal row's predicted quantity is a set of cumulative probabilities
+  # rather than a single number, so the cell carries the cumulative form and
+  # the reader differences adjacent entries to get a category probability.
+  yhat[ordinal] <- paste0('\\Pr\\left(Y_{',ordinalIndex,
+    '}(t)\\leq k\\right)=\\operatorname{logit}^{-1}\\left(\\tau_{',
+    ordinalIndex,',k}-\\nu_{',ordinalIndex,'}(t)\\right)')
+  # A count's predicted quantity is its rate, and the link is the exponential:
+  # the linear predictor is the log rate.
+  yhat[count] <- paste0('\\exp\\left(\\nu_{',countIndex,'}(t)\\right)')
+  # A censored variable's predicted quantity is its uncensored mean; what the
+  # censoring changes is which values can be recorded, which the note explains
+  # rather than the cell.
+  yhat[censored] <- paste0('\\nu_{',censoredIndex,'}(t)')
+  predictedLine <- paste0("\\parbox{10em}{\\centering{Predicted\\linebreak observations:}}
+&\\underbrace{",bmatrix(matrix(paste0('\\hat{Y}_{',manifestIndex,'}(t)')),nottext=TRUE),"
+      }_{\\widehat{\\vect{Y}}(t)} =
+        ",bmatrix(yhat,nottext=TRUE)," \\\\ \\\\")
+  observationLine <- paste0("\\parbox{10em}{\\centering{Observations:}}
+&\\underbrace{
+      ",bmatrix(matrix(manifestNames),nottext=FALSE),"  
+      (t)}_{\\vect{Y}(t)} = 
+        \\widehat{\\vect{Y}}(t) + \\vect{\\epsilon}(t) \\\\ \\\\")
+  
+  errorCov <- as.matrix(ctmodel$MANIFESTVAR)
+  errorCovNumeric <- suppressWarnings(matrix(as.numeric(errorCov),
+    nrow=nrow(errorCov), ncol=ncol(errorCov)))
+  diagonalErrorCov <- !any(is.na(errorCovNumeric[row(errorCovNumeric) != col(errorCovNumeric)])) &&
+    all(errorCovNumeric[row(errorCovNumeric) != col(errorCovNumeric)] == 0)
+  errorCov <- ctModelLatexMathElement(errorCov)
+  # Censored keeps the Gaussian form: it is the one non-Gaussian type with a
+  # measurement error of its own, and that error is what MANIFESTVAR holds.
+  gaussianerror <- !binary & !ordinal & !count
+  diag(errorCov)[gaussianerror] <-
+    paste0('\\left[',diag(errorCov)[gaussianerror],'\\right]^2')
+  diag(errorCov)[binary] <- paste0('\\hat{Y}_{',binaryIndex,'}(t)\\left(1-\\hat{Y}_{',
+    binaryIndex,'}(t)\\right)')
+  # An ordinal observation has no Gaussian error term at all: the julia filter
+  # integrates the categorical likelihood over the latent rather than matching
+  # it to a normal, so there is nothing to put in this cell.
+  diag(errorCov)[ordinal] <- '\\textrm{--}'
+  # A Poisson's variance is its mean, and a count's MANIFESTVAR diagonal is a
+  # log-scale dispersion rather than an additive error, so the cell is the
+  # marginal variance of the observation: the Poisson's own plus the log rate's.
+  # It collapses to the rate itself when the dispersion is zero.
+  diag(errorCov)[count] <- paste0('\\hat{Y}_{',countIndex,'}(t)+\\hat{Y}_{',
+    countIndex,'}(t)^{2}\\left(e^{\\Theta_{',countIndex,countIndex,
+    '}}-1\\right)')
+  errorCovNote <- paste0(
+    if(!diagonalErrorCov) paste0(" \\\\ 
+&\\textrm{Note: off-diagonal entries in }\\vect{\\Theta}\\textrm{ are shown as specified; binary diagonal entries are conditional approximations.}") else "",
+    if(any(ordinal)) paste0(" \\\\ 
+&\\textrm{Note: ordinal observations carry no measurement error term -- the likelihood is integrated over }\\vect{\\eta}\\textrm{ directly.}") else "",
+    if(any(count)) paste0(" \\\\ 
+&\\textrm{Note: count observations are Poisson with a log link, the rate being the exponential of the linear predictor in }\\vect{\\eta}\\textrm{. The }\\vect{\\Theta}\\textrm{ diagonal is a dispersion on that log scale rather than an additive error, so the observation is Poisson-lognormal and the variance shown is its marginal variance; at a dispersion of zero it is the rate itself.}") else "",
+    if(any(censored)) paste0(" \\\\ 
+&\\textrm{Note: a censored observation is recorded as the value above clamped to its limits, so the equation gives the uncensored mean and observations pile up at censormin and censormax rather than passing them; the error term shown is real for this kind, unlike the others, and applies to }\\vect{\\eta}\\textrm{ .}") else "")
+  errorLine <- paste0("\\parbox{10em}{\\centering{Observation\\linebreak error:}}
+& \\qquad \\qquad \\quad \\vect{\\epsilon}(t) \\sim \\mathrm{N}\\left(\\mathbf{0},
+      \\underbrace{",bmatrix(errorCov,nottext=TRUE),"
+              ",ifelse(!matrixnames,"}_{{", "}_{\\underbrace{"),"\\vect{\\Theta}}",ifelse(!matrixnames,"}","_\\textrm{effective measurement covariance}}"),"\\right)",errorCovNote," \\\\ \\\\")
+  
+  if(splitMeasurement) return(paste0(
+    predictorLine,predictedLine,observationLine,errorLine))
+  
+  paste0("\\parbox{10em}{\\centering{Measurement:}}
+& \\underbrace{",bmatrix(matrix(paste0('\\nu_{',manifestIndex,'}(t)')),nottext=TRUE),"
+      }_{\\vect{\\nu}(t)} = ",linearPredictor," \\\\ \\\\
+& \\underbrace{",bmatrix(matrix(manifestNames),nottext=FALSE),"
+      (t)}_{\\vect{Y}(t)} =
+      \\widehat{\\vect{Y}}(t) + \\vect{\\epsilon}(t),\\quad
+      \\widehat{\\vect{Y}}(t) = ",bmatrix(yhat,nottext=TRUE),
+    " \\\\ \\\\
+& \\vect{\\epsilon}(t) \\sim \\mathrm{N}\\left(\\mathbf{0},
+      \\underbrace{",bmatrix(errorCov,nottext=TRUE),"
+              ",ifelse(!matrixnames,"}_{{", "}_{\\underbrace{"),"\\vect{\\Theta}}",ifelse(!matrixnames,"}","_\\textrm{effective measurement covariance}}"),"\\right)",errorCovNote," \\\\ \\\\")
+}
+
 
 #' Generate and optionally compile latex equation of subject level ctsem model.
 #'
-#' @param x ctsem model object or ctStanFit object.
+#' @param x A model from \code{\link{ctModel}}, or a fit from
+#' \code{\link{ctFit}} on either backend (\code{ctStanFit} or
+#' \code{ctJuliaFit}). Given a fit, the estimates are substituted for the
+#' parameter labels.
 #' @param matrixnames Logical. If TRUE, includes ctsem matrix names such as DRIFT and DIFFUSION under the matrices.
 #' @param digits Precision of decimals for numeric values.
 #' @param linearise Logical. Show the linearised normal approximation for subject parameters and 
-#' covariate effects, or the raw parameters?
+#' covariate effects, or the raw parameters? Only relevant where a subject
+#' parameter distribution is shown, and not available for a \code{ctJuliaFit},
+#' which holds that distribution on the raw scale.
 #' @param textsize Standard latex text sizes -- 
 #' tiny scriptsize footnotesize small normalsize large Large LARGE huge Huge. 
 #' Useful if output overflows page. 
@@ -139,18 +676,23 @@ bmatrix = function(x, digits=NULL,nottext=FALSE, ...) {
 #' @param tex Save .tex file? Otherwise latex is simply returned within R as a string.
 #' @param equationonly Logical. If TRUE, output is only the latex relevant to the equation, not a compileable document.
 #' @param minimal if TRUE, outputs reduced form version displaying matrix dimensions and equation structure only.
+#' @param splitDynamics Logical. If TRUE, split latent process dynamics across deterministic and random change lines.
+#' If FALSE, show the full dynamics equation on one line.
+#' @param splitMeasurement Logical. If TRUE, split measurement equations across observation and observation noise lines.
+#' If FALSE, show the full measurement equation on one line.
 #' @param compile Compile to .pdf? (Depends on \code{tex = TRUE}) 
 #' @param open Open after compiling? (Depends on \code{compile = TRUE})
 #' @param includeNote Include text describing matrix transformations and subject notation?
 #' triangular matrices (which results in a covariance or Cholesky matrix) is shown -- 
 #' the latter is a more direct representation of the model, while the former is often simpler to convey.
+#' @param savepng Logical. If TRUE, renders the equation as a png file instead of a pdf, viewing the png in RStudio viewer when available.
 #'
 #' @return character string of latex code. Side effects include saving a .tex, .pdf, and displaying the pdf. 
 #' @export
 #' @importFrom tools texi2pdf
 #'
 #' @examples
-#' ctmodel <- ctModel(type='stanct', 
+#' ctmodel <- ctModel(type='ct', 
 #' n.latent=2, n.manifest=1, 
 #' manifestNames='sunspots', 
 #' latentNames=c('ss_level', 'ss_velocity'),
@@ -164,11 +706,36 @@ bmatrix = function(x, digits=NULL,nottext=FALSE, ...) {
 #'   
 #' l=ctModelLatex(ctmodel,compile=FALSE, open=FALSE)
 #' cat(l)
-ctModelLatex<- function(x,matrixnames=TRUE,digits=3,linearise=class(x) %in% 'ctStanFit',textsize='normalsize',folder=tempdir(),
+ctModelLatex<- function(x,matrixnames=TRUE,digits=3,linearise=inherits(x,'ctStanFit'),textsize='normalsize',folder=tempdir(),
   filename=paste0('ctsemTex',as.numeric(Sys.time())),tex=TRUE, equationonly=FALSE, compile=TRUE, open=TRUE, includeNote=TRUE,
-  minimal=FALSE){
+  minimal=FALSE, splitDynamics=TRUE, splitMeasurement=TRUE, savepng=FALSE){
   #library(ctsem)
   dopopcov <- FALSE
+  t0cov <- NULL
+  t0means <- NULL
+  latentPopNames <- NULL
+  # Only a fit can have these; an unfitted model shows its expressions anyway.
+  contextcells <- NULL
+  # Random-effect levels above the subject. Only the julia backend has them.
+  extracov <- list()
+
+  # `linearise` shows the subject distribution of the *transformed* parameters.
+  # Reaching it needs a covariance on that scale, and the julia backend does not
+  # have one: it reports the sd of each transformed parameter by quadrature
+  # (summary()$popsd) and the correlations on the raw scale, which is not a
+  # transformed covariance and cannot be assembled into one. Refused by name
+  # rather than quietly ignored.
+  if(inherits(x,'ctJuliaFit') && isTRUE(linearise)) stop(call.=FALSE,
+    "linearise = TRUE is not available for a backend='julia' fit: it holds the ",
+    "subject distribution on the raw scale, and the transformed spread it does ",
+    "report (summary()$popsd) is not a covariance to show here. Use ",
+    "linearise = FALSE for the raw distribution the model was fitted with.")
+  
+  # When savepng is TRUE, force compilation settings
+  if(savepng) {
+    equationonly <- FALSE
+    compile <- TRUE
+  }
   
   if('ctStanFit' %in% class(x)){
     ms=ctMatsetupFreePars(x$setup$matsetup)
@@ -183,11 +750,21 @@ ctModelLatex<- function(x,matrixnames=TRUE,digits=3,linearise=class(x) %in% 'ctS
     
     if(!is.null(e$rawpopcov)){ 
       
-      if(!linearise) popcov <- round(ctCollapse(e$rawpopcov,1,mean),digits)
+      # Named, because everything downstream matches these by name: the union
+      # with the covariate effects below, and ctModelLatexAugmentT0(). Without
+      # the names the union dropped this covariance entirely and the equation
+      # showed a subject distribution of zeros.
+      if(!linearise) {
+        popcov <- round(ctCollapse(e$rawpopcov,1,mean),digits)
+        rownames(popcov) <- colnames(popcov) <- ms$parname[as.logical(ms$indvarying)]
+      }
       if(linearise) {
         popcov <- stan_constrainsamples(x$stanmodel,x$standata,matrix(x$stanfit$rawest,nrow=1),
           cores=1,pcovn =1000,dokalman=FALSE,savesubjectmatrices = FALSE)$popcov
         popcov <- round(ctCollapse(e$popcov,1,mean),digits=digits)
+        if(!is.null(e$pop_T0cov)) t0cov <- round(ctCollapse(e$pop_T0cov,1,mean),digits=digits)
+        if(!is.null(e$pop_T0MEANS)) t0means <- round(ctCollapse(e$pop_T0MEANS,1,mean),digits=digits)
+        if(!is.null(x$ctstanmodel$latentPopNames)) latentPopNames <- x$ctstanmodel$latentPopNames
         if(x$standata$intoverpop==1){
           t0index <- ms$indvarying[ms$param > 0 & ms$row <= x$standata$nlatent & ms$matrix %in% 1 & ms$indvarying > 0]
           popcov[t0index,t0index] <- round(ctCollapse(e$pop_T0cov,1,mean),digits=digits)[
@@ -198,6 +775,11 @@ ctModelLatex<- function(x,matrixnames=TRUE,digits=3,linearise=class(x) %in% 'ctS
       }
     } else popcov <- diag(0,0)
     
+    # Named for the same reason, and it is the half that was missing: the union
+    # orders the parameters by where they first appear, which is not parameter
+    # order once a covariance goes in front of the covariate effects, so an
+    # unnamed vector was rendered against whichever labels happened to line up.
+    popnames <- ms$parname[as.logical(ms$indvarying + ms$tipred)]
     if(!linearise) popmeans <- round(ctCollapse(e$rawpopmeans,1,mean),digits)[
       as.logical(ms$indvarying + ms$tipred),drop=FALSE]
     if(linearise) {
@@ -208,56 +790,176 @@ ctModelLatex<- function(x,matrixnames=TRUE,digits=3,linearise=class(x) %in% 'ctS
           t0index,1]
       }
     }
+    names(popmeans) <- popnames
     
     # parmats <- summary(x,residualcov=FALSE,priorcheck=FALSE,digits=digits)
     # parmats <- data.frame(parmats$parmatrices,matrix=rownames(parmats$parmatrices))
     ctmodelmats <- listOfMatrices((x$ctstanmodelbase$pars))
     ctmodel <- x$ctstanmodelbase
     ####################################################################
-    for(mi in names(ctmodelmats)){
-      mimean <- ctCollapse(e[[paste0('pop_',mi)]],1,mean)
-      for(i in 1:nrow(ctmodelmats[[mi]])){
-        for(j in 1:ncol(ctmodelmats[[mi]])){
-          ctmodelmats[[mi]][i,j] <- round(mimean[i,j],digits)
-          # if(ctmodel$pars$matrix[i] %in% parmats$matrix){
-          #   try(ctmodel$pars$value[i] <- parmats[parmats$matrix %in% ctmodel$pars$matrix[i] & 
-          #       ctmodel$pars$row[i] == parmats$Row & ctmodel$pars$col[i]==parmats$Col,'Mean'],silent=TRUE)
-        }
+    # Cells written as expressions over the state or the TD predictors keep
+    # their structure; see .ctLatexRenderExpression above. Detected from the
+    # *base* model, so the coordinates match ctmodelmats and so that an
+    # intoverpop carrier state -- which is a parameter, not a reference to the
+    # dynamics -- is not caught up in it.
+    contextcells <- try(.ctFitContextDependentCells(x$ctstanmodelbase), silent = TRUE)
+    if(inherits(contextcells,'try-error')) contextcells <- NULL
+    estimates <- if(!is.null(contextcells) && nrow(contextcells)){
+      try(.ctLatexRawEstimates(x, e), silent = TRUE)
+    } else NULL
+    if(inherits(estimates,'try-error')) estimates <- numeric()
+    ctmodelmats <- .ctLatexFillEstimates(ctmodelmats, e, x$ctstanmodelbase$pars,
+      contextcells, estimates, ctmodel$latentNames, ctmodel$TDpredNames, digits)
+    ctmodel <- c(ctmodel,ctmodelmats)
+    class(ctmodel) <- 'ctStanModel'
+  } else if(inherits(x,'ctJuliaFit')){
+    ####################################################################
+    # The same substitution for the julia backend. Everything it needs is
+    # already backend agnostic -- `ctExtract()` has a ctJuliaFit method
+    # returning the same pop_* arrays, `.ctFitModelObject()` returns the model
+    # they belong to -- so what follows is only the two places the layouts
+    # genuinely differ from stan's.
+    e <- ctExtract(x)
+    ctmodel <- .ctFitModelObject(x)
+    ctmodelmats <- listOfMatrices(ctmodel$pars)
+
+    # First difference: a julia fit carries the model ctFit handed the engine,
+    # which for an intoverpop model is written over the *augmented* state. The
+    # stan branch above sidesteps that by taking its structure from the base
+    # model, and the engine reports pop_* over the real processes either way
+    # (.ctBackendTrimAugmented), so the augmented rows and columns come off
+    # here and the two backends write the same system out. T0MEANS and T0VAR
+    # are trimmed too, which pop_* leaves augmented because a carrier state's
+    # T0 moments *are* a parameter's population moments -- reported elsewhere,
+    # not part of the equations. The Jacobians are ctStanCalcsList's working
+    # matrices rather than anything a reader asked for.
+    ctmodelmats <- ctmodelmats[!names(ctmodelmats) %in% .ctBackendJacobianMatrices]
+    augmented <- .ctBackendSpec(x)$nlatent_augmented
+    if(!is.null(augmented) && !identical(augmented, ctmodel$n.latent)){
+      latent <- seq_len(ctmodel$n.latent)
+      for(mi in names(ctmodelmats)){
+        mat <- ctmodelmats[[mi]]
+        rows <- if(mi %in% c(.ctBackendLatentRows,'T0MEANS','T0VAR') &&
+            nrow(mat) == augmented) latent else seq_len(nrow(mat))
+        cols <- if(mi %in% c(.ctBackendLatentCols,'T0VAR') &&
+            ncol(mat) == augmented) latent else seq_len(ncol(mat))
+        ctmodelmats[[mi]] <- mat[rows,cols,drop=FALSE]
       }
     }
+
+    # Second difference: which cells keep their structure. `carrier` cells --
+    # a CINT written `10*state[3]` because a parameter varies over subjects --
+    # are how this backend spells an individual difference, not a dependence
+    # on the dynamics, and the stan branch never sees them because the base
+    # model spells the same thing `cint1`. .ctFitConditionalCells() is the
+    # existing name for the subset that excludes them.
+    contextcells <- try(.ctFitConditionalCells(x), silent = TRUE)
+    if(inherits(contextcells,'try-error')) contextcells <- NULL
+    estimates <- if(!is.null(contextcells) && nrow(contextcells)){
+      try(.ctLatexRawEstimates(x), silent = TRUE)
+    } else NULL
+    if(inherits(estimates,'try-error')) estimates <- numeric()
+
+    ctmodelmats <- .ctLatexFillEstimates(ctmodelmats, e, ctmodel$pars,
+      contextcells, estimates, ctmodel$latentNames, ctmodel$TDpredNames, digits)
+
+    # The subject parameter distribution and the covariate effects, on the raw
+    # scale -- which is the scale `linearise = FALSE` writes, and the scale this
+    # distribution is a normal on. All three pieces are the estimates
+    # themselves: .ctBackendRawPopCov() recombines the same level populations
+    # the summary's popsd comes from, and a covariate coefficient is a free
+    # parameter with its own place in the raw vector.
+    levelcovs <- .ctBackendRawPopCov(x)
+    popcov <- if(length(levelcovs)) round(levelcovs[[1]]$cov,digits) else diag(0,0)
+    # Levels above the subject are their own populations -- a study sd is the
+    # spread between studies -- so they are shown as their own zero-mean term
+    # rather than pooled into one covariance that would describe neither.
+    extracov <- list()
+    if(length(levelcovs) > 1){
+      extracov <- lapply(levelcovs[-1], function(l) round(l$cov,digits))
+      names(extracov) <- vapply(levelcovs[-1],
+        function(l) as.character(l$level)[1], character(1))
+    }
+    timat <- .ctBackendRawTipredEffects(x)
+    timat <- if(is.null(timat)) diag(0,0) else round(timat,digits)
+    popmeans <- round(.ctLatexRawEstimates(x)[unique(c(rownames(popcov),
+      unlist(lapply(extracov,rownames)), rownames(timat)))], digits)
     ctmodel <- c(ctmodel,ctmodelmats)
     class(ctmodel) <- 'ctStanModel'
   } else ctmodel <- x
   
   if('ctStanModel' %in% class(ctmodel)) {
     
-    if(!'ctStanFit' %in% class(x)){ #construct pop effects
-      popcov <- ctModelBuildPopCov(ctmodel,linearise=linearise)
-      if(ctmodel$n.TIpred > 0) timat <- ctModelBuildTIeffects(ctmodel) else timat <- diag(0,0)
-      if(!linearise) timat[,] <- paste0('raw_',timat)
-      popmeans<-paste0(ifelse(linearise,'','raw_'),unique(c(rownames(popcov),rownames(timat))))
+    if(!inherits(x,c('ctStanFit','ctJuliaFit'))){ #construct pop effects
+      # The T0VAR cells a random T0MEANS makes redundant are fixed first, as
+      # ctFit fixes them: read after, they showed as parameters with covariate
+      # effects of their own.
       ctmodel<-T0VARredundancies(ctmodel)
-      ctmodel <- c(ctmodel,listOfMatrices(ctmodel$pars)) 
-    }
+      popcov <- ctModelBuildPopCov(ctmodel,linearise=linearise)
+# Each grouping level above the subject is its own population, as it is
+      # for a fit below: a zero-mean term of its own, labelled by its id.
+      extracov <- list()
+      for(g in ctmodel$groupIDnames){
+        levelcov <- ctModelBuildPopCov(ctmodel, linearise=linearise,
+          column=paste0('indvarying_',g), label=paste0('Cov',g))
+        if(nrow(levelcov)) extracov[[g]] <- levelcov
+      }
+      if(ctmodel$n.TIpred > 0) timat <- ctModelBuildTIeffects(ctmodel) else timat <- diag(0,0)
+      # Labels only: an absent effect is a zero and a fixed one its value, not a
+      # parameter called raw_0 or raw_0.3.
+      if(!linearise){
+        islabel <- is.na(suppressWarnings(as.numeric(timat)))
+        timat[islabel] <- paste0('raw_',timat[islabel])
+      }
+      popmeans<-paste0(ifelse(linearise,'','raw_'),unique(c(rownames(popcov),
+        unlist(lapply(extracov,rownames)),rownames(timat))))
+      ctmodel <- c(ctmodel,listOfMatrices(ctmodel$pars))
+}
     
     dopopcov <- as.logical(nrow(popcov))
     doti <- as.logical(nrow(timat))
+    levelmembers <- c(list(rownames(popcov)), lapply(extracov, rownames))
+
+    if(doti || length(extracov)){
+pars <- unique(c(rownames(popcov),unlist(lapply(extracov,rownames)),
+        rownames(timat)))
+      popcov <- .ctLatexExpandCov(popcov, pars)
+      extracov <- lapply(extracov, .ctLatexExpandCov, pars=pars)
+      if(doti){
+        newtimat <- matrix(0,length(pars),ncol(timat),dimnames=list(pars,colnames(timat)))
+        newtimat[na.omit(match(rownames(timat),rownames(newtimat))),] <- timat
+        timat <- newtimat
+      }
+      # The union may have given popcov rows it did not have -- a level above
+      # the subject can be the only thing that varies -- and the block below
+      # tests this before it is recomputed there.
+      dopopcov <- as.logical(nrow(popcov))
+    }
     
-    if(doti){
-      # both <- rownames(timat) %in% rownames(popcov)
-      pars <- unique(c(rownames(popcov),rownames(timat)))
-      newpopcov <- matrix(0,length(pars),length(pars),dimnames=list(pars,pars))
-      newtimat <- matrix(0,length(pars),ncol(timat),dimnames=list(pars,colnames(timat)))
-      newtimat[na.omit(match(rownames(timat),rownames(newtimat))),] <- timat
-      newpopcov[na.omit(match(rownames(popcov),rownames(newpopcov))), 
-        na.omit(match(rownames(popcov),rownames(newpopcov)))] <- popcov
-      popcov <- newpopcov
-      timat <- newtimat
+    if(dopopcov || doti){
+      t0covIsTotal <- !is.null(t0cov)
+      if(exists('t0cov') && is.null(t0cov) && exists('ctmodel')) {
+        t0cov <- ctModelLatexT0DisplayCov(
+          as.matrix(ctmodel$T0VAR)[seq_len(ctmodel$n.latent), seq_len(ctmodel$n.latent), drop=FALSE],
+          digits=digits)
+      }
+      if(exists('t0means') && !is.null(t0means)) {
+        t0means <- as.matrix(t0means)[seq_len(ctmodel$n.latent),1]
+      }
+      t0aug <- ctModelLatexAugmentT0(popmeans=popmeans, popcov=popcov,
+        timat=timat, ctm=ctmodel, digits=digits, t0means=t0means,
+        t0cov=t0cov, latentPopNames=latentPopNames, t0covIsTotal=t0covIsTotal)
+      popmeans <- t0aug$popmeans
+      popcov <- t0aug$popcov
+      extracov <- lapply(extracov, .ctLatexExpandCov, pars=rownames(t0aug$popcov))
+      timat <- t0aug$timat
+      dopopcov <- as.logical(nrow(popcov))
+      doti <- as.logical(nrow(timat))
     }
     
     dopop <- doti||dopopcov
-    
-    ### this section replaced t0var fixed values with params, seemed broken...
+
+### this section replaced t0var fixed values with params, seemed broken...
     # if(!'ctStanFit' %in% class(x)){ #if a model
     #   
     #   t0index <- unique(ctmodel$pars$row[ctmodel$pars$matrix %in% 'T0MEANS' & 
@@ -281,7 +983,7 @@ ctModelLatex<- function(x,matrixnames=TRUE,digits=3,linearise=class(x) %in% 'ctS
   
   if(equationonly) compile <- FALSE
   
-
+  
   
   
   
@@ -374,23 +1076,74 @@ ctModelLatex<- function(x,matrixnames=TRUE,digits=3,linearise=class(x) %in% 'ctS
       equationcont = paste0(equationcont,'\\mathbf{G} d\\mathbf{W}(t)')
     }
     
-    tabledim = tabledim = paste0(tabledim,'|c|c')
-    tablecont1 = paste0(tablecont1,'& $\\mathbf{y}$ & $\\Lambda $')
-    tablecont2 = paste0(tablecont2,'& $',c,'$','& $',nu,'\\times', c,'$')
-    equationcont = paste0(equationcont,'\\\\','\n', '\\mathbf{y}(t) &= \\Lambda \\eta(t)')
+    manifesttype <- rep(0, ctmodel$n.manifest)
+    if(!is.null(ctmodel$manifesttype)) manifesttype <- as.integer(ctmodel$manifesttype)
+    nbinary <- sum(manifesttype == 1)
+    ncount <- sum(manifesttype == 3)
     
-    if (dict[['tau']]){
-      tabledim = paste0(tabledim,'|c')
-      tablecont1 = paste0(tablecont1,'& $\\tau$')
-      tablecont2 = paste0(tablecont2,'& $',c,'$')
-      equationcont = paste0(equationcont,'+ \\tau')
+    if(!any(manifesttype != 0)){
+      tabledim = tabledim = paste0(tabledim,'|c|c')
+      tablecont1 = paste0(tablecont1,'& $\\mathbf{y}$ & $\\Lambda $')
+      tablecont2 = paste0(tablecont2,'& $',c,'$','& $',nu,'\\times', c,'$')
+      equationcont = paste0(equationcont,'\\\\','\n', '\\mathbf{y}(t) &= \\Lambda \\eta(t)')
+      
+      if (dict[['tau']]){
+        tabledim = paste0(tabledim,'|c')
+        tablecont1 = paste0(tablecont1,'& $\\tau$')
+        tablecont2 = paste0(tablecont2,'& $',c,'$')
+        equationcont = paste0(equationcont,'+ \\tau')
+      }
+      
+      tabledim = tabledim = paste0(tabledim,'|c|c}')
+      tablecont1 = paste0(tablecont1,'& $\\epsilon(t)$ & $\\Theta$ \\\\','\n', '\\hline')
+      tablecont2 = paste0(tablecont2,'& $',c,'$','& $',c,'\\times', c,'$')
+      noisestring = paste0(noisestring,'\\epsilon(t) &\\sim N(\\mathbf{0},\\Theta) \\\\','\n' )
+      equationcont = paste0(equationcont,'+ \\epsilon(t)')
+    } else {
+      tabledim = tabledim = paste0(tabledim,'|c|c|c')
+      tablecont1 = paste0(tablecont1,'& $\\nu(t)$ & $\\hat{Y}(t)$ & $\\Lambda $')
+      tablecont2 = paste0(tablecont2,'& $',c,'$','& $',c,'$','& $',nu,'\\times', c,'$')
+      equationcont = paste0(equationcont,'\\\\','\n',
+        '\\nu(t) &= \\Lambda \\eta(t)')
+      
+      if (dict[['tau']]){
+        tabledim = paste0(tabledim,'|c')
+        tablecont1 = paste0(tablecont1,'& $\\tau$')
+        tablecont2 = paste0(tablecont2,'& $',c,'$')
+        equationcont = paste0(equationcont,'+ \\tau')
+      }
+      
+      binaryIndex <- which(manifesttype == 1)
+      ordinalIndex <- which(manifesttype == 2)
+      countIndex <- which(manifesttype == 3)
+      yhat <- paste0('\\nu_{',seq_len(c),'}(t)')
+      yhat[binaryIndex] <- paste0('\\operatorname{logit}^{-1}(\\nu_{',binaryIndex,'}(t))')
+      yhat[ordinalIndex] <- paste0('\\operatorname{logit}^{-1}(\\tau_{',
+        ordinalIndex,',k}-\\nu_{',ordinalIndex,'}(t))')
+      yhat[countIndex] <- paste0('\\exp(\\nu_{',countIndex,'}(t))')
+      yhatString <- paste0('\\begin{bmatrix}',paste(yhat,collapse=' \\\\ '),'\\end{bmatrix}')
+      equationcont = paste0(equationcont,'\\\\','\n',
+        '\\hat{Y}(t) &= ',yhatString)
+      equationcont = paste0(equationcont,'\\\\','\n',
+        '\\mathbf{y}(t) &= \\hat{Y}(t) + \\epsilon(t)')
+      
+      tabledim = paste0(tabledim,'|c|c')
+      tablecont1 = paste0(tablecont1,'& $\\epsilon(t)$ & $\\Theta$')
+      tablecont2 = paste0(tablecont2,'& $',c,'$','& $',c,'\\times', c,'$')
+      noisestring = paste0(noisestring,'\\epsilon(t) &\\sim N(\\mathbf{0},\\Theta) \\\\','\n' )
+      if(nbinary > 0){
+        noisestring = paste0(noisestring,'\\Theta_{',binaryIndex,',',binaryIndex,'} &= \\hat{Y}_{',
+          binaryIndex,'}(t)(1-\\hat{Y}_{',binaryIndex,'}(t)) \\\\','\n',
+          collapse='')
+      }
+      if(ncount > 0){
+        noisestring = paste0(noisestring,'\\Theta_{',countIndex,',',countIndex,
+          '} &= \\hat{Y}_{',countIndex,'}(t) \\\\','\n', collapse='')
+      }
+      
+      tabledim = paste0(tabledim,'}')
+      tablecont1 = paste0(tablecont1,' \\\\','\n', '\\hline')
     }
-    
-    tabledim = tabledim = paste0(tabledim,'|c|c}')
-    tablecont1 = paste0(tablecont1,'& $\\epsilon(t)$ & $\\Theta$ \\\\','\n', '\\hline')
-    tablecont2 = paste0(tablecont2,'& $',c,'$','& $',c,'\\times', c,'$')
-    noisestring = paste0(noisestring,'\\epsilon(t) &\\sim N(\\mathbf{0},\\Theta) \\\\','\n' )
-    equationcont = paste0(equationcont,'+ \\epsilon(t)')
     
     
     tablestring = paste0(tablestring,tabledim,'\n',tablecont1,'\n',tablecont2,'\n','\\end{tabular}','\n','\\end{center}')
@@ -405,7 +1158,7 @@ ctModelLatex<- function(x,matrixnames=TRUE,digits=3,linearise=class(x) %in% 'ctS
     
     # if(covMatrices){
     #   if('ctStanFit' %in% class(m)){
-    #     cp <- ctStanContinuousPars(m)
+    #     cp <- ctSummaryMatrices(m)
     #     ctmodel$T0VAR <- cp$T0COV
     #     ctmodel$DIFFUSION <- cp$DIFFUSIONcov
     #     } else {
@@ -413,92 +1166,56 @@ ctModelLatex<- function(x,matrixnames=TRUE,digits=3,linearise=class(x) %in% 'ctS
     #       ctmodel$DIFFUSION[upper.tri(ctmodel$DIFFUSION)] <- t(ctmodel$DIFFUSION)[upper.tri(ctmodel$DIFFUSION)]
     #     }
     # }
-          
-        
-        
+    
+    
+    
+    
+    initialStateLatex <- if(!dopop) paste0("\\parbox{10em}{\\centering{Initial\\linebreak latent\\linebreak state:}}
+  &\\underbrace{",bmatrix(matrix(paste0(ctmodel$latentNames)))," 
+    \\big(t_0\\big)}_{\\vect{\\eta} (t_0)}	\\sim \\mathrm{N} \\left(
+              \\underbrace{
+        ",bmatrix(ctmodel$T0MEANS),"
+      ",ifelse(!matrixnames,"}_{{", "}_{\\underbrace{"),"\\vect{}}",ifelse(!matrixnames,"}","_\\textrm{T0MEANS}}"),",
+      \\underbrace{UcorSDtoCov \\left\\{","
+        ",bmatrix(ctmodel$T0VAR),"\\right\\}"," 
+      ",ifelse(!matrixnames,"}_{{", "}_{\\underbrace{"),"\\vect{Q^{*}}_{t0}}",ifelse(!matrixnames,"}","_\\textrm{T0VAR}}"),"
+      \\right) \\\\
+") else ""
     
     out <- paste0(out, "
  \\setcounter{MaxMatrixCols}{200}
  \\begin{flalign*}
   &\\begin{aligned}
-  ",if(dopop) paste0("\\parbox{10em}{\\centering{Subject\\linebreak parameter\\linebreak distribution:}}
-             &\\underbrace{",bmatrix(matrix(paste0('\\text{',
-               texPrep(colnames(popcov)),'}_i')),nottext=TRUE)," 
-            }_{\\vect{\\phi}(i)} ",ifelse(linearise,"\\approx","\\sim"),
-    ifelse(linearise,"","\\textrm{tform}\\left\\{"),
-    " \\mathrm{N} \\left(
-              ",bmatrix(popmeans),", ", bmatrix(popcov)," \\right) ",
-    if(doti) paste0(" + \\underbrace{",bmatrix(timat),"}_{\\vect{",ifelse(linearise,"\\hat",""),"\\beta}}","
-  \\underbrace{
-    ",bmatrix(matrix(colnames(timat))),"}_{\\vect{z}}"),
-    ifelse(linearise,"","\\right\\}")," \\\\"),
-      "\\parbox{10em}{\\centering{Initial\\linebreak latent\\linebreak state:}}
-  &\\underbrace{",bmatrix(matrix(paste0(ctmodel$latentNames)))," 
-    \\big{(}t_0\\big{)}}_{\\vect{\\eta} (t_0)}	\\sim \\mathrm{N} \\left(
-              \\underbrace{
-        ",bmatrix(ctmodel$T0MEANS),"
-      ",ifelse(!matrixnames,"}_{{", "}_{\\underbrace{"),"\\vect{}}",ifelse(!matrixnames,"}","_\\textrm{T0MEANS}}"),",
-      \\underbrace{UcorSDtoCov \\left\\{","
-        ",bmatrix(ctmodel$T0VAR),"\\right\\}","
-      ",ifelse(!matrixnames,"}_{{", "}_{\\underbrace{"),"\\vect{Q^{*}}_{t0}}",ifelse(!matrixnames,"}","_\\textrm{T0VAR}}"),"
-      \\right) \\\\
-      \\parbox{10em}{\\centering{Deterministic\\linebreak change:}}
-  &\\underbrace{",showd,"
-    ",bmatrix(matrix(paste0(ctmodel$latentNames)))," 
-    \\big{(}t\\big{)}}_{",showd," \\vect{\\eta} (t)}	=  \\left(
-      \\underbrace{
-        ",bmatrix(ctmodel$DRIFT),"
-      ",ifelse(!matrixnames,"}_{{", "}_{\\underbrace{"),"\\vect{A}}",ifelse(!matrixnames,"}","_\\textrm{DRIFT}}")," \\underbrace{
-        ",bmatrix(matrix(paste0(ctmodel$latentNames)))," 
-        \\big{(}t\\big{)}
-      }_{\\vect{\\eta} (t",ifelse(continuoustime,"","-1"),")}	+ \\underbrace{
-        ",bmatrix(ctmodel$CINT),"
-      ",ifelse(!matrixnames,"}_{{", "}_{\\underbrace{"),"\\vect{b}}",ifelse(!matrixnames,"}","_\\textrm{CINT}}"),
-      if(ctmodel$n.TDpred > 0) paste0( "+ \\underbrace{
-        ",bmatrix(ctmodel$TDPREDEFFECT),"
-      ",ifelse(!matrixnames,"}_{{", "}_{\\underbrace{"),"\\vect{M}}",ifelse(!matrixnames,"}","_\\textrm{TDPREDEFFECT}}"),"
-      \\underbrace{
-        ",bmatrix(matrix(ctmodel$TDpredNames))," 
-      }_{\\vect{\\chi} (t)}"),
-      "\\right) ",ifelse(continuoustime,"\\mathrm{d}t","")," \\quad + \\nonumber \\\\ \\\\
-    \\parbox{10em}{\\centering{Random\\linebreak change:}}
-    & \\qquad \\qquad \\quad \\underbrace{UcorSDtoChol\\left\\{
-      ",bmatrix(ctmodel$DIFFUSION),"\\right\\}
-    ",ifelse(!matrixnames,"}_{{", "}_{\\underbrace{"),"\\vect{G}}",ifelse(!matrixnames,"}","_\\textrm{DIFFUSION}}"),"
-    \\underbrace{",showd,"
-      ",bmatrix(matrix(paste0('W_{',1:ctmodel$n.latent,'}')),nottext=TRUE)," 
-      (t)}_{",showd," \\vect{W}(t)} \\\\ \\\\
-              \\parbox{10em}{\\centering{Observations:}}
-&\\underbrace{
-      ",bmatrix(matrix(ctmodel$manifestNames),nottext=FALSE),"  
-      (t)}_{\\vect{Y}(t)} = 
-        \\underbrace{
-          ",bmatrix(ctmodel$LAMBDA)," 
-        ",ifelse(!matrixnames,"}_{{", "}_{\\underbrace{"),"\\vect{\\Lambda}}",ifelse(!matrixnames,"}","_\\textrm{LAMBDA}}")," \\underbrace{
-          ",bmatrix(matrix(ctmodel$latentNames))," 
-          (t)}_{\\vect{\\eta}(t)} +
-        \\underbrace{
-          ",bmatrix(ctmodel$MANIFESTMEANS)," 
-        ",ifelse(!matrixnames,"}_{{", "}_{\\underbrace{"),"\\vect{\\tau}}",ifelse(!matrixnames,"}","_\\textrm{MANIFESTMEANS}}")," + \\nonumber \\\\ \\\\
-    \\parbox{10em}{\\centering{Observation\\linebreak noise:}}
-    & \\qquad \\qquad \\quad  \\underbrace{
-                ",bmatrix(ctmodel$MANIFESTVAR),"  
-              ",ifelse(!matrixnames,"}_{{", "}_{\\underbrace{"),"\\vect{\\Theta}}",ifelse(!matrixnames,"}","_\\textrm{MANIFESTVAR}}"),"
-              \\underbrace{
-          ",bmatrix(matrix(paste0('\\epsilon_{',1:ctmodel$n.manifest,'}')))," 
-          (t)}_{\\vect{\\epsilon}(t)} \\\\ \\\\
-                \\parbox{10em}{\\centering{System noise\\linebreak distribution per time step:}}
+  ",if(dopop) .ctLatexPopulationBlock(popcov, extracov, popmeans, timat,
+        levelmembers, ctmodel, linearise,
+        relabel = !inherits(x, c('ctStanFit','ctJuliaFit'))), initialStateLatex,
+      ctModelLatexDynamicsBlock(ctmodel=ctmodel, showd=showd,
+        continuoustime=continuoustime, matrixnames=matrixnames,
+        splitDynamics=splitDynamics),
+      ctModelLatexMeasurementBlock(ctmodel=ctmodel, matrixnames=matrixnames,
+        splitMeasurement=splitMeasurement),
+      "\\parbox{10em}{\\centering{System noise\\linebreak distribution per time step:}}
           &",ifelse(continuoustime,'\\Delta ',''),"\\big[W_{j \\in [1,",ctmodel$n.latent,"]}\\big](t",
-      ifelse(continuoustime,'-u',''),")   \\sim  \\mathrm{N}(0,",W,") \\quad
-              \\parbox{10em}{\\centering{Observation noise\\linebreak distribution:}}
-            ",bmatrix(matrix(paste0('\\epsilon_{j \\in [1,',ctmodel$n.latent,']}')))," 
-            (t) \\sim  \\mathrm{N}(0,1) \\\\ \\\\
+      ifelse(continuoustime,'-u',''),")   \\sim  \\mathrm{N}(0,",W,") \\\\ \\\\
       \\end{aligned} \\\\",
       if(includeNote) paste0("&\\textrm{Note: } UcorSDtoChol\\textrm{ converts lower tri matrix of standard deviations and unconstrained correlations to Cholesky factor,} \\\\
 &UcorSDtoCov =\\textrm{ transposed cross product of UcorSDtoChol, to give covariance, See Driver \\& Voelkle (2018) p11.} \\\\",
-if(dopop) paste0("&\\textrm{Individual specific notation (subscript i) only shown for subject parameter distribution -- pop. means shown elsewhere.} \\\\
-",if(linearise) "&\\textrm{Linearised approximation of subject parameter distribution shown.} \\\\")),
-"\\end{flalign*}
+        if(dopop) paste0(if(length(extracov)) "&\\textrm{Unit specific notation (subscripts) only shown for the parameter distribution -- pop. means shown elsewhere.} \\\\
+" else "&\\textrm{Individual specific notation (subscript i) only shown for subject parameter distribution -- pop. means shown elsewhere.} \\\\
+",if(linearise) "&\\textrm{Linearised approximation of subject parameter distribution shown.} \\\\",
+          if(length(extracov)) "&\\textrm{A level's random effects are shared by every subject within the same unit of that level; covariate effects act on each subject.} \\\\"),
+        # Only for a model that has such cells: for every other model this line
+        # would be a caveat about something the reader cannot see.
+        if(isTRUE(nrow(contextcells) > 0)) "&\\textrm{Cells depending on the latent state or a time dependent predictor keep their expression, with estimates substituted for parameter labels.} \\\\",
+        # A reduced-rank population covariance is a claim about the individual
+        # differences, and a figure is read long after the message that
+        # announced it. Note only: this branch renders no individual-differences
+        # block at all for a julia fit -- full rank or reduced -- so there is
+        # nothing here for a matrix to qualify, and saying the dimension count
+        # is the honest half of the job that can be done without building that
+        # section first.
+        if(inherits(x,'ctFit')) .ctPopRegressionLatexNote(x)),
+      "\\end{flalign*}
       ")
   }
   
@@ -526,10 +1243,50 @@ if(dopop) paste0("&\\textrm{Individual specific notation (subscript i) only show
         }
       }
       
-      if(!'try-error' %in% class(a) && interactive() && open) try(openPDF(paste0(filename,'.pdf')))
-    }
-    
-  }
+      # Handle PNG rendering
+      if(!'try-error' %in% class(a)) {
+        if(requireNamespace('pdftools', quietly=TRUE)) {
+          bitmap <- pdftools::pdf_render_page(paste0(filename,'.pdf'), dpi=300)
+          
+          # Display PNG in RStudio viewer if available
+          if(interactive() && requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+            # Write bitmap to temp PNG file for viewer
+            temp_png <- tempfile(tmpdir = tempdir(), fileext = ".png")
+            png::writePNG(bitmap, temp_png)
+            # Use relative path from HTML file
+            temp_html <- tempfile(tmpdir = dirname(temp_png), fileext = ".html")
+            png_name <- basename(temp_png)
+            writeLines(paste0('<img src="', png_name, '" style="max-width:100%; height:auto;">'), temp_html)
+            rstudioapi::viewer(temp_html)
+          } else if(interactive()) {
+            # Fallback to plot device - convert bitmap to raster first
+            temp_png <- tempfile(fileext = ".png")
+            png::writePNG(bitmap, temp_png)
+            img <- png::readPNG(temp_png)
+            old_par <- par(mar=c(0,0,0,0))  # Save old settings
+            plot(as.raster(img), asp=1)
+            par(old_par)  # Restore original settings
+            unlink(temp_png)
+          }
+        } else {
+          message('pdftools package required for viewing output within R. Install with: install.packages("pdftools")')
+        }
+        
+        if(savepng){
+          if(requireNamespace('pdftools', quietly=TRUE)) {
+            # Save the bitmap as a PNG file
+            png_filename <- paste0(filename, '.png')
+            png::writePNG(bitmap, png_filename)
+            message(paste("PNG saved to", png_filename))
+          } else {
+            stop("pdftools package required for render_png=TRUE. Install with: install.packages('pdftools')")
+          }
+        }
+        
+        if(interactive() && open) try(openPDF(paste0(filename,'.pdf')))
+      } #end if succcessful compile
+    } #end if compile
+  }# end if tex
   return(invisible(out))
 }
 

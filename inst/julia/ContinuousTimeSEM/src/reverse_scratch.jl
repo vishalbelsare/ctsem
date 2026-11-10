@@ -1,0 +1,125 @@
+"""
+    CTSEMReverseScratch(T, n, m, k, naff)
+
+Working storage for the reverse pass, one set per workspace.
+
+The reverse pass is a few dozen small matrix products per row, and written the
+obvious way each one allocates its result: on a 24-row, one-latent model that
+is 5,454 heap objects per subject sweep, of which `_reverse_update!` and
+`_reverse_predict!` alone are 71%. Serially that costs perhaps ten per cent.
+Across threads it costs everything, because a Julia process has one heap and
+allocation is where the threads queue -- 23 threads on that model run at 0.26x
+of one, and 23 *processes* at 22.8x, which is how the heap was identified as
+the wall.
+
+So every temporary comes from here instead. The buffers are sized once, at the
+full state and manifest dimensions, and a row with missing data takes a view of
+the leading block rather than a fresh array. Names match the derivation in
+`_reverse_update!` and `_reverse_predict!` one for one, so the buffered code
+reads the same as the algebra it replaces.
+"""
+struct CTSEMReverseScratch{T}
+    # --- measurement update, sized (n, m) --------------------------------
+    Pr::Matrix{T}
+    PHt::Matrix{T}
+    S::Matrix{T}
+    Sinv::Matrix{T}
+    G::Matrix{T}
+    M::Matrix{T}
+    Sbar::Matrix{T}
+    Sbar0::Matrix{T}
+    Rbar::Matrix{T}
+    Mbar::Matrix{T}
+    Pnew::Matrix{T}
+    Ps::Matrix{T}
+    Gbar::Matrix{T}
+    Hbar::Matrix{T}
+    Lbar::Matrix{T}
+    PHtbar::Matrix{T}
+    ytilde::Vector{T}
+    ybar::Vector{T}
+    alpha::Vector{T}
+    alphabar::Vector{T}
+    beta::Vector{T}
+    xnew::Vector{T}
+    # generic products, by shape
+    nn1::Matrix{T}
+    nn2::Matrix{T}
+    nm1::Matrix{T}
+    mm1::Matrix{T}
+    mm2::Matrix{T}
+    # --- prediction substep, sized (n, k) --------------------------------
+    Abar::Matrix{T}
+    Pbar_new::Matrix{T}
+    xbar_new::Vector{T}
+    kk1::Matrix{T}
+    kk2::Matrix{T}
+    kk3::Matrix{T}
+    nn3::Matrix{T}
+    nn4::Matrix{T}
+    nn5::Matrix{T}
+    kk4::Matrix{T}
+    kk5::Matrix{T}
+    kk6::Matrix{T}
+    # Lyapunov pullback: the two cotangents and its scratch matrix.
+    kk7::Matrix{T}
+    kk8::Matrix{T}
+    kk9::Matrix{T}
+    kv1::Vector{T}
+    kv2::Vector{T}
+    nv1::Vector{T}
+    # --- intercept solve and affine offset, sized (naff) ------------------
+    # A different and larger block than the diffusion one above -- the leading
+    # states that are genuine dynamics rather than static random-effect
+    # carriers -- and live at the same time as it, so it cannot share the `kk`
+    # and `kv` slots. See `_compute_discrete_time_form!`.
+    aa1::Matrix{T}
+    av1::Vector{T}
+    av2::Vector{T}
+    piv::Vector{Int}
+    # --- the T0VAR block of the reverse, sized (n, n) ---------------------
+    # `sym` holds the symmetrised state cotangent handed to the T0VAR
+    # pullback, once per subject evaluation.
+    # Its own slot rather than a shared one: it is live across
+    # `_sdcovsqrt2cov_pullback!`, which consumes `covsqrt_scratch`, and it is
+    # read out after that call returns.
+    t0var_bar::Matrix{T}
+    sym::Matrix{T}
+    # --- the series discretisation's pullbacks, sized (n, n) ---------------
+    # Each pullback first recomputes its forward kernel into these tapes, from
+    # the inputs the predict record kept. Separate from the forward filter's
+    # buffer in `DiscretizationBuffer`, so the reverse pass never writes into
+    # the filter's workspace.
+    series::SeriesKernelBuffer{T}
+end
+
+function CTSEMReverseScratch(::Type{T}, n::Int, m::Int, k::Int, naff::Int=k) where {T}
+    z(r, c) = zeros(T, r, c)
+    v(r) = zeros(T, r)
+    return CTSEMReverseScratch{T}(
+        z(n, n), z(n, m), z(m, m), z(m, m), z(n, m), z(n, n),
+        z(m, m), z(m, m), z(m, m), z(n, n), z(n, n), z(n, n),
+        z(n, m), z(m, n), z(m, n), z(n, m),
+        v(m), v(m), v(m), v(m), v(m), v(n),
+        z(n, n), z(n, n), z(n, m), z(m, m), z(m, m),
+        z(n, n), z(n, n), v(n), z(k, k), z(k, k), z(k, k), z(n, n), z(n, n),
+        z(n, n), z(k, k), z(k, k), z(k, k),
+        z(k, k), z(k, k), z(k, k),
+        v(k), v(k), v(n),
+        z(naff, naff), v(naff), v(naff), zeros(Int, max(n, k, naff)),
+        z(n, n), z(n, n), SeriesKernelBuffer(T, max(n, k, naff)))
+end
+
+"""The leading `r x c` block of a scratch buffer, as a view."""
+@inline _rs(A::Matrix, r::Int, c::Int) = view(A, 1:r, 1:c)
+"""The leading `r` entries of a scratch vector, as a view."""
+@inline _rs(a::Vector, r::Int) = view(a, 1:r)
+
+"""`destination .= (A + A') / 2`, in place."""
+@inline function _symmetrize_into!(destination, A)
+    n = size(A, 1)
+    @inbounds for j in 1:n, i in 1:n
+        destination[i, j] = (A[i, j] + A[j, i]) / 2
+    end
+    return destination
+end

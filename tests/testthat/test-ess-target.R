@@ -1,0 +1,155 @@
+# One effective sample size for every route that produces draws, and a warning
+# from each when it ends short of it. Fit-free: the defaults, the sampler's
+# budget rule and the three shortfall rules, on hand-built inputs.
+
+test_that("every draw-producing route defaults to the same effective sample size", {
+  target <- ctsem:::.ctEssTarget
+  expect_identical(target, 200)
+  # The particle sampler writes the number out in its signature.
+  expect_identical(formals(ctsem:::.ctParticleCorrect)$target_ess, target)
+  # The internal ones name it.
+  expect_identical(eval(formals(ctsem:::.ctOptimImisDraws)$target_ess,
+    asNamespace("ctsem")), target)
+  expect_identical(eval(formals(ctsem:::imis_is)$target_ess,
+    asNamespace("ctsem")), target)
+  expect_identical(ctsem:::.ctBackendSampleControl(list())$min_ess, target)
+  # uncertainty = 'is' sets isESS inside the draw stage when it is not given.
+  body_text <- paste(deparse(body(ctsem:::.ctOptimDrawSamples)), collapse = "\n")
+  expect_match(body_text, "control$isESS <- .ctEssTarget", fixed = TRUE)
+})
+
+test_that("the sampler's budget reaches past the draws asked for only with a target", {
+  budget <- ctsem:::.ctBackendSampleBudget
+  # A target: the first batch is sized from it, the budget is four times the
+  # count asked for.
+  b <- budget(500L, 4L, list(min_ess = 200))
+  expect_identical(b$first, 50L)
+  expect_identical(b$max_draws, 2000L)
+  # Small targets keep the 50-draw floor; a count below it is respected.
+  expect_identical(budget(500L, 1L, list(min_ess = 200))$first, 200L)
+  expect_identical(budget(30L, 4L, list(min_ess = 200))$first, 30L)
+  # maxDraws given is the budget, and the run starts with the count asked for.
+  given <- budget(500L, 4L, list(min_ess = 200, max_draws = 900L))
+  expect_identical(given$first, 500L)
+  expect_identical(given$max_draws, 900L)
+  # No target (minESS = 0): exactly the count asked for.
+  none <- budget(500L, 4L, ctsem:::.ctBackendSampleControl(list(minESS = 0)))
+  expect_identical(none$first, 500L)
+  expect_null(none$max_draws)
+})
+
+test_that("a sample that ends short of its target says so, and one without a target keeps the old floor", {
+  diag <- function(ess, target) list(chains = 4L, warmup = 200L, draws = 500L,
+    divergent = 0L, rhat = c(a = 1.001, b = 1.002), ess = c(a = 900, b = ess),
+    saturated = 0L, max_depth = 10L, unidentified = character(0),
+    ess_target = target)
+  floor <- ctsem:::.ctSampleEssFloor
+  expect_identical(floor(diag(150, 200)), 200)
+  expect_identical(floor(diag(150, NA_real_)), 100)
+  expect_identical(floor(list()), 100)
+  # Short of 200: warned, naming the target and the budget to raise.
+  expect_warning(ctsem:::.ctSampleWarn(diag(150, 200)),
+    "short of the target of 200.*maxDraws")
+  expect_match(ctsem:::.ctSampleDiagnosis(diag(150, 200))$problems,
+    "smallest effective sample size 150 \\(target 200\\)")
+  # Met: nothing said, nothing recorded.
+  expect_no_warning(ctsem:::.ctSampleWarn(diag(250, 200)))
+  expect_length(ctsem:::.ctSampleDiagnosis(diag(250, 200))$problems, 0L)
+  # No target: 150 passes, 80 does not, with the old advice.
+  expect_no_warning(ctsem:::.ctSampleWarn(diag(150, NA_real_)))
+  expect_warning(ctsem:::.ctSampleWarn(diag(80, NA_real_)),
+    "set sampleControl\\$minESS")
+  # Chains that disagree: with a target the run chose its own length, so the
+  # advice is the budget, not the count asked for.
+  rough <- function(target) utils::modifyList(diag(900, target),
+    list(rhat = c(a = 1.001, b = 1.05)))
+  expect_warning(ctsem:::.ctSampleWarn(rough(200)),
+    "Raise sampleControl\\$maxDraws.*past the 500 draws per chain")
+  expect_warning(ctsem:::.ctSampleWarn(rough(NA_real_)),
+    "Raise the draw count -- iter in ctFit \\(now 700")
+})
+
+test_that("a run is judged by the R-hat target it stopped by", {
+  # rhatTarget = 1.07 is the documented quick, approximate posterior. A run
+  # that met it used to warn that its chains had not agreed and to raise the
+  # budget, because the warning, the verdict and the summary held 1.01.
+  diag <- function(rhat, target) list(chains = 4L, warmup = 200L, draws = 100L,
+    divergent = 0L, rhat = c(a = 1.001, b = rhat), ess = c(a = 900, b = 900),
+    saturated = 0L, max_depth = 10L, unidentified = character(0),
+    ess_target = 50, rhat_target = target)
+  ceiling <- ctsem:::.ctSampleRhatCeiling
+  expect_identical(ceiling(diag(1.04, 1.07)), 1.07)
+  expect_identical(ceiling(diag(1.04, NULL)), 1.01)
+  expect_identical(ceiling(list()), 1.01)
+  # Met: no warning, converged.
+  expect_no_warning(ctsem:::.ctSampleWarn(diag(1.04, 1.07)))
+  expect_true(ctsem:::.ctSampleDiagnosis(diag(1.04, 1.07))$converged)
+  # Missed: warned, and the problem names the target.
+  expect_warning(ctsem:::.ctSampleWarn(diag(1.09, 1.07)), "Largest R-hat is 1.09")
+  expect_match(ctsem:::.ctSampleDiagnosis(diag(1.09, 1.07))$problems,
+    "largest R-hat 1.09 \\(target 1.07\\)")
+  expect_false(ctsem:::.ctSampleDiagnosis(diag(1.09, 1.07))$converged)
+  # A fit sampled before the target was recorded keeps 1.01.
+  expect_warning(ctsem:::.ctSampleWarn(diag(1.04, NULL)), "Largest R-hat is 1.04")
+  expect_false(ctsem:::.ctSampleDiagnosis(diag(1.04, NULL))$converged)
+})
+
+test_that("importance sampling that ends short of its target says so, not only below half of it", {
+  report <- function(ess) ctsem:::.ctOptimImisReport(list(ess = ess), 200,
+    weighted = TRUE, remedy = "REMEDY")
+  # 150 against 200 passed silently when the bar was half the target.
+  expect_warning(report(150), "150, short of its target of 200.*REMEDY")
+  expect_no_warning(report(200))
+  # The fixed-batch rule elsewhere has no target and does not claim one.
+  expect_warning(ctsem:::.ctOptimEffectiveSampleWarn(40, floor = 50,
+    remedy = "R", ndraws = 400), "40 from 400 draws\\. The intervals")
+})
+
+test_that("divergences at the correlation bound are reported and leave the verdict to the rest", {
+  # The engine places a divergence on a trajectory that crossed the
+  # random-effect correlation bound (`_divergence_at_bound`): the parameter
+  # space's own edge, past which there is no mass. On the race's joint samples
+  # nine divergent steps in ten were past it, and every one of five such fits
+  # read converged = FALSE with its targets met.
+  diag <- function(divergent, bound) list(chains = 4L, warmup = 200L, draws = 100L,
+    divergent = divergent, divergent_bound = bound, rhat = c(a = 1.001, b = 1.002),
+    ess = c(a = 900, b = 900), saturated = 0L, max_depth = 10L,
+    unidentified = character(0), ess_target = 200, rhat_target = 1.01)
+  verdict <- ctsem:::.ctSampleDiagnosis
+  # All at the bound: converged, said once as a fact, a message and no warning.
+  v <- verdict(diag(5L, 5L))
+  expect_true(v$converged)
+  expect_length(v$problems, 1L)
+  expect_match(v$problems, "5 of 400 transitions stopped at the random-effect correlation bound")
+  expect_message(expect_no_warning(ctsem:::.ctSampleWarn(diag(5L, 5L))),
+    "correlation bound: the posterior reaches it")
+  # Any other divergence fails it as before, and is the one warned about.
+  v <- verdict(diag(5L, 3L))
+  expect_false(v$converged)
+  expect_match(v$problems[1L], "^2 of 400 transitions diverged$")
+  expect_warning(suppressMessages(ctsem:::.ctSampleWarn(diag(5L, 3L))),
+    "^2 of 400 transitions diverged")
+  # A fit sampled before the bound was recorded, or by a sampler that does not
+  # place its divergences, counts every one against the verdict.
+  old <- diag(5L, 0L)
+  old$divergent_bound <- NULL
+  expect_false(verdict(old)$converged)
+  expect_identical(ctsem:::.ctSampleDivergent(old), 5L)
+  expect_identical(ctsem:::.ctSampleDivergentBound(old), 0L)
+  # Where the draws' covariance points below its number of effects, the
+  # message suggests the poprank that would fit it, as a fit on the bound's
+  # warning does; at full rank it says nothing more, and with several levels
+  # it names each.
+  ranked <- diag(5L, 5L)
+  ranked$corbound_rank <- data.frame(level = "id", k = 4L, rank = 2L)
+  expect_message(ctsem:::.ctSampleWarn(ranked),
+    "about rank 2 of 4 in the median draw: consider poprank = 2")
+  ranked$corbound_rank$rank <- 4L
+  expect_identical(ctsem:::.ctSampleBoundRankNote(ranked), "")
+  ranked$corbound_rank <- data.frame(level = c("person", "couple"), k = c(4L, 3L),
+    rank = c(2L, 3L))
+  note <- ctsem:::.ctSampleBoundRankNote(ranked)
+  expect_match(note, "rank 2 of 4 at level person", fixed = TRUE)
+  expect_false(grepl("couple", note, fixed = TRUE))
+  expect_identical(ctsem:::.ctSampleBoundRankNote(diag(5L, 5L)), "")
+})

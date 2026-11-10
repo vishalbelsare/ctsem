@@ -1,0 +1,1419 @@
+using DataFrames, ForwardDiff, LinearAlgebra, Random
+
+# Laplace-approximate marginal likelihood for subject-level random effects.
+#
+# Two things need proving, and they need proving separately.
+#
+#  1. That the *approximation* is assembled correctly -- right mode, right
+#     curvature, right constants. This is checked where the approximation is
+#     not an approximation at all: when a random effect enters the state mean
+#     linearly through an identity transform in a linear-Gaussian model, the
+#     integrand is exactly Gaussian in `z`, Laplace is exact, and the integral
+#     has a closed form. `_gaussian_reference` computes that closed form from
+#     the log likelihood itself, by recovering the quadratic it must be, so the
+#     reference shares no code with the thing it is checking.
+#
+#  2. That the *outer gradient* is the gradient of the value actually returned.
+#     That is finite differences of the Laplace value, and it has to hold for
+#     nonlinear models too, where the value is genuinely approximate. Getting
+#     the approximation slightly wrong but differentiating it consistently is a
+#     failure mode that the exactness check above cannot see, and vice versa.
+
+# Shared with `test_quadrature.jl`; see `laplace_fixtures.jl`.
+isdefined(@__MODULE__, :_LAPLACE_LINEAR_OBJECTIVE) ||
+    include(joinpath(@__DIR__, "laplace_fixtures.jl"))
+isdefined(@__MODULE__, :_oracle_hessian) ||
+    include(joinpath(@__DIR__, "dual_oracles.jl"))
+
+################################################################################
+# Independent references
+################################################################################
+
+"""
+    _subject_loglik(laplace, i, values, z)
+
+Subject `i`'s process log likelihood at the shifted parameter vector, through
+the ordinary primal objective -- no adjoint, no tape, no Laplace machinery.
+"""
+function _subject_loglik(laplace, i, values, z)
+    spec = laplace.spec
+    L = ContinuousTimeSEM._laplace_popchol(collect(Float64, values), spec)
+    shifted = ContinuousTimeSEM._laplace_subject_values(collect(Float64, values), spec, L, collect(Float64, z))
+    return laplace.objective.subject_objectives[i](shifted)
+end
+
+"""
+    _gaussian_reference(laplace, i, values)
+
+`log integral exp(ll_i(z)) N(z|0,I) dz`, in closed form, for a model whose log
+likelihood is exactly quadratic in `z`.
+
+The quadratic is recovered from the log likelihood by evaluation -- value at
+the origin, at each axis, and at each pair -- rather than assumed, so this
+reference is derived from the same likelihood the Laplace code sees but by a
+completely different route. `_assert_quadratic` checks the recovery is faithful
+before the reference is trusted.
+
+With `ll(z) = c + b'z + z'Az` and `P = I/2 - A`,
+
+    log integral = c + b'P^-1 b / 4 - logdet(2P) / 2
+"""
+function _gaussian_reference(laplace, i, values)
+    k = ContinuousTimeSEM.nrandomeffects(laplace.spec)
+    ll(z) = _subject_loglik(laplace, i, values, z)
+    c = ll(zeros(k))
+    b = zeros(k)
+    A = zeros(k, k)
+    for j in 1:k
+        e = zeros(k); e[j] = 1.0
+        plus = ll(e); minus = ll(-e)
+        b[j] = (plus - minus) / 2
+        A[j, j] = (plus + minus) / 2 - c
+    end
+    for j in 1:k, l in (j + 1):k
+        e = zeros(k); e[j] = 1.0; e[l] = 1.0
+        off = ll(e) - c - b[j] - b[l] - A[j, j] - A[l, l]
+        A[j, l] = off / 2
+        A[l, j] = off / 2
+    end
+    P = Matrix(I / 2 - A)
+    return (value=c + dot(b, P \ b) / 4 - logdet(2 .* P) / 2, c=c, b=b, A=A)
+end
+
+"""Confirm the recovered quadratic reproduces the log likelihood off its knots."""
+function _assert_quadratic(laplace, i, values, reference)
+    k = ContinuousTimeSEM.nrandomeffects(laplace.spec)
+    for probe in (fill(0.7, k), fill(-1.3, k), collect(range(-0.4, 0.9, length=k)))
+        predicted = reference.c + dot(reference.b, probe) + dot(probe, reference.A * probe)
+        @test isapprox(predicted, _subject_loglik(laplace, i, values, probe); rtol=1e-9)
+    end
+end
+
+"""Central difference of the Laplace *value*, the referee for its gradient."""
+function _value_finite_difference(laplace, values; step=1e-5, )
+    x = collect(Float64, values)
+    out = similar(x)
+    for j in eachindex(x)
+        h = step * max(1.0, abs(x[j]))
+        plus = copy(x); plus[j] += h
+        minus = copy(x); minus[j] -= h
+        vp = ctsem_laplace_evaluate(laplace, plus; gradient=false).value
+        vm = ctsem_laplace_evaluate(laplace, minus; gradient=false).value
+        out[j] = (vp - vm) / (2h)
+    end
+    return out
+end
+
+
+################################################################################
+# Tests
+################################################################################
+
+@testset "two levels: units couple the subjects that share a study" begin
+    laplace, values = _fresh_twolevel()
+    units = laplace.units
+    # Three studies of two subjects each, so three units rather than six.
+    @test length(units.members) == 3
+    @test sort(vcat(units.members...)) == collect(1:6)
+    for U in 1:3
+        @test length(units.members[U]) == 2
+        # Two subject blocks of 2 plus one shared study block of 1.
+        @test units.dims[U] == 2 * 2 + 1
+        # Both members point at the *same* study block -- that sharing is the
+        # coupling, and it is the thing that makes a study one integration unit.
+        @test units.offsets[U][1][2] == units.offsets[U][2][2]
+        # ...and at different subject blocks.
+        @test units.offsets[U][1][1] != units.offsets[U][2][1]
+    end
+end
+
+@testset "two levels: Laplace is exact for a Gaussian integrand" begin
+    # The same argument as the single-level exactness test, but over a unit
+    # latent vector that mixes two subject blocks and a shared study block. If
+    # the offsets, the per-level Cholesky factors or the shared block were
+    # wrong, this is where it shows.
+    laplace, values = _fresh_twolevel()
+    result = ctsem_laplace_evaluate(laplace, values; gradient=false)
+    @test isfinite(result.value)
+    @test result.converged
+
+    reference = sum(_unit_gaussian_reference(laplace, U, values) for U in 1:3)
+    @test isapprox(result.value, reference; rtol=1e-8)
+end
+
+@testset "two levels: the outer gradient is the gradient of the value" begin
+    laplace, values = _fresh_twolevel()
+    result = ctsem_laplace_evaluate(laplace, values; gradient=true)
+    reference = _value_finite_difference(laplace, values)
+    @test norm(result.gradient - reference) / norm(reference) < 1e-6
+end
+
+# The score rows come from the evaluation's own seeded sweep, unit by unit and
+# in parallel; the forward-mode Jacobian of the per-unit terms they replaced is
+# an independent route to the same matrix (it shares the primal and nothing
+# else), so it is the reference. Elementwise, so a row in the wrong place or a
+# prior share counted twice shows by name.
+@testset "score rows are the units' own gradients" begin
+    for (label, fresh) in (("one level", _fresh_linear), ("two levels", _fresh_twolevel))
+        laplace, values = fresh()
+        seeded = ctsem_subject_gradients(laplace, values)
+        forward = ContinuousTimeSEM._laplace_subject_gradients_forward(laplace, values)
+        @test isapprox(seeded.value, forward.value; rtol=1e-10)
+        @test size(seeded.scores) == size(forward.scores)
+        @test all(isapprox.(seeded.scores, forward.scores; rtol=1e-7, atol=1e-9))
+        total = ctsem_laplace_evaluate(laplace, values; gradient=true).gradient
+        @test all(isapprox.(vec(sum(seeded.scores; dims=1)), total; rtol=1e-9, atol=1e-10))
+    end
+end
+
+@testset "two levels: an empty outer level reduces to one level" begin
+    # A study level carrying no random effects is a hierarchy that does not do
+    # anything, and it must not change the answer -- only how the subjects are
+    # grouped for integration. This is the degenerate case that catches an
+    # offset or dimension bug in the unit layout.
+    single, values = _fresh_linear()
+    grouped = ctsem_laplace_objective(_LAPLACE_LINEAR_OBJECTIVE;
+        re_index=[1, 2], sd_index=[6, 7], cor_index=[8], sd_scale=[1.0, 1.0],
+        level_nre=[2, 0], group=vcat(1:6, _TWOLEVEL_GROUP), level_ngroups=[6, 3])
+
+    a = ctsem_laplace_evaluate(single, values; gradient=true, nested_gradient=true)
+    b = ctsem_laplace_evaluate(grouped, values; gradient=true)
+    @test isapprox(a.value, b.value; rtol=1e-9)
+    @test norm(a.gradient - b.gradient) / norm(a.gradient) < 1e-7
+end
+
+@testset "two levels: modes are reported per level and per group" begin
+    laplace, values = _fresh_twolevel()
+    ctsem_laplace_evaluate(laplace, values; gradient=false)
+
+    subject = ctsem_laplace_modes(laplace, values, 1)
+    study = ctsem_laplace_modes(laplace, values, 2)
+    # One row per subject at level 1, one per *study* at level 2 -- a study
+    # effect is one vector shared by its members, not one per member.
+    @test size(subject.z) == (6, 2)
+    @test size(study.z) == (3, 1)
+    @test study.ngroups == 3
+    @test study.group == _TWOLEVEL_GROUP
+    @test all(isfinite, subject.z)
+    @test all(isfinite, study.z)
+    @test all(study.z_sd .> 0)
+    # Studies differ; a collapsed study mode would mean the level is doing
+    # nothing.
+    @test maximum(abs, diff(study.z; dims=1)) > 1e-8
+end
+
+@testset "Laplace is exact for a Gaussian integrand" begin
+    laplace, values = _fresh_linear()
+    nsubjects = length(laplace.objective.subject_objectives)
+
+    # The Laplace total, less the terms that are not per-subject integrals.
+    result = ctsem_laplace_evaluate(laplace, values; gradient=false)
+    @test isfinite(result.value)
+    @test result.converged
+
+    reference_total = 0.0
+    for i in 1:nsubjects
+        reference = _gaussian_reference(laplace, i, values)
+        _assert_quadratic(laplace, i, values, reference)
+        reference_total += reference.value
+    end
+    # No prior is attached to this objective, so the value is the sum of the
+    # per-subject integrals and nothing else.
+    @test isapprox(result.value, reference_total; rtol=1e-9)
+end
+
+@testset "the prior floor is the prior's own volume, and switchable" begin
+    # `logdet(M) >= 0` is `det(M) >= 1`, which is the condition under which the
+    # approximating Gaussian claims no more volume than the prior. Above it the
+    # term is untouched; below it the term is the bound.
+    @test ContinuousTimeSEM._laplace_prior_floor_logdet(2.5) == 2.5
+    @test ContinuousTimeSEM._laplace_prior_floor_logdet(0.0) == 0.0
+    @test ContinuousTimeSEM._laplace_prior_floor_logdet(-3.0) == 0.0
+    previous = ctsem_set_prior_floor!(false)
+    try
+        @test ContinuousTimeSEM._laplace_prior_floor_logdet(-3.0) == -3.0
+    finally
+        ctsem_set_prior_floor!(previous)
+    end
+    @test ContinuousTimeSEM._laplace_prior_floor_logdet(-3.0) == 0.0
+end
+
+@testset "the prior floor is inactive where the likelihood is concave in u" begin
+    # `M = -d2 loglik/du du + I`, the `I` being the standard normal prior on
+    # the random effects, so a likelihood concave in `u` puts every eigenvalue
+    # at or above 1 and the floor cannot bind. A linear-Gaussian integrand is
+    # concave everywhere and the Laplace is exact for it, which makes this the
+    # case where the floor has to change nothing whatever.
+    laplace, values = _fresh_linear()
+    floored = ctsem_laplace_evaluate(laplace, values; gradient=true)
+    diagnostics = ctsem_laplace_diagnostics(laplace)
+    @test !any(diagnostics.logdet_floored)
+
+    previous = ctsem_set_prior_floor!(false)
+    local bare
+    try
+        bare = ctsem_laplace_evaluate(laplace, values; gradient=true)
+    finally
+        ctsem_set_prior_floor!(previous)
+    end
+    # Equality, not a tolerance: where the floor does not bind it is not
+    # approximately the same computation, it is the same computation. Except
+    # in the gradient's last bit: units are summed per worker slot and which
+    # worker takes which unit is decided at run time, so with more than one
+    # thread two evaluations of the same thing differ there (measured, at -t 2).
+    @test floored.value == bare.value
+    @test isapprox(floored.gradient, bare.gradient; rtol=1e-13)
+end
+
+@testset "a floored unit's gradient is the gradient of its floored term" begin
+    # The floored term drops `logdet`, so its derivative drops the trace terms
+    # the seeded assembly builds from the selected inverse -- and by the
+    # envelope theorem, `dg_U/du = 0` at the mode, the mode's own movement
+    # drops out too. What is left is the partial at fixed `uhat`, which is what
+    # `_laplace_floored_unit_gradient!` computes. The nested route
+    # differentiates the term itself and is this file's oracle elsewhere, so
+    # the two must agree wherever the floor binds.
+    #
+    # Asserted on every unit of the nonlinear fixture rather than only the
+    # floored ones: where nothing is floored this is the ordinary seeded
+    # agreement, and the point is that one branch does not disturb the other.
+    laplace, values = _fresh_nonlinear()
+    seeded = ctsem_laplace_evaluate(laplace, values; gradient=true)
+    nested = ctsem_laplace_evaluate(laplace, values; gradient=true,
+        nested_gradient=true)
+    @test isapprox(seeded.gradient, nested.gradient; rtol=1e-8, atol=1e-10)
+end
+
+@testset "a floored unit past the pool width is accumulated in its own slot" begin
+    # The test above floors nothing: its random effect is on T0MEANS, where the
+    # integrand stays log-concave. On the drift it floors every unit, which is
+    # what reaches the floored branch at all.
+    #
+    # And past the pool width, which is what matters. The gradient is summed
+    # into one accumulator per pool slot, while the subject loop is cut into
+    # one piece per unit, so a floored unit indexing by its piece rather than
+    # its slot reads beyond the accumulators. Under `@inbounds` that is not a
+    # BoundsError: it killed the process with EXCEPTION_ACCESS_VIOLATION, and
+    # R, waiting on the socket, hung with no message. A pool of one makes every
+    # unit after the first such a unit, whatever the machine's thread count.
+    original = ctsem_max_chunks().max_chunks
+    try
+        for chunks in (1, 2)
+            ctsem_set_max_chunks!(chunks)
+            laplace = ctsem_laplace_objective(_LAPLACE_NONLINEAR_OBJECTIVE,
+                [2], [5], Int[], [1.0])
+            values = [0.1, 0.4, -0.2, 0.05, -1.0]
+            seeded = ctsem_laplace_evaluate(laplace, values; gradient=true)
+            floored = findall(laplace.logdet_floored)
+            @test any(>(ContinuousTimeSEM._laplace_pool_width()), floored)
+            nested = ctsem_laplace_evaluate(laplace, values; gradient=true,
+                nested_gradient=true)
+            @test all(isfinite, seeded.gradient)
+            @test isapprox(seeded.gradient, nested.gradient; rtol=1e-8, atol=1e-10)
+        end
+    finally
+        ctsem_set_max_chunks!(original)
+    end
+end
+
+# Two random effects on the nonlinear fixture, T0MEANS and the `-log1p_exp`
+# PARS entry, at a point where one unit's smallest eigenvalue is 0.956 while its
+# logdet is +0.116: the total floor does not engage there although the unit's
+# likelihood is convex in one direction. Raw 6 and 7 are the second scale and
+# the correlation.
+_fresh_nonlinear_two() = (ctsem_laplace_objective(_LAPLACE_NONLINEAR_OBJECTIVE,
+    [1, 2], [5, 6], [7], [1.0, 1.0]), [0.1, -2.0, -0.2, 0.05, -0.25, 2.0, 0.0])
+
+# The trace terms' jet sweeps (`CTSEMTraceJet`) against the nested gradient,
+# which shares only the primal with them, with one effect and with two: a
+# block's directions go through a sweep together.
+@testset "jet sweeps give the nested Laplace gradient" begin
+    for (laplace, values) in (_fresh_nonlinear(), _fresh_nonlinear_two())
+        jet = ctsem_laplace_evaluate(laplace, values; gradient=true)
+        nested = ctsem_laplace_evaluate(laplace, values; gradient=true,
+            nested_gradient=true)
+        @test jet.value == nested.value
+        @test isapprox(jet.gradient, nested.gradient; rtol=1e-9, atol=1e-11)
+    end
+end
+
+# A sweep of one or two directions runs at the narrow width
+# (`_ctsem_jet_width`); the same directions at the wide width, the rest of it
+# zero, give the same sums.
+@testset "a jet sweep's width does not change its sums" begin
+    laplace, values = _fresh_nonlinear_two()
+    ctsem_laplace_evaluate(laplace, values; gradient=false)
+    theta = ContinuousTimeSEM._laplace_extend(laplace, collect(Float64, values))
+    Ls = ContinuousTimeSEM._laplace_popchols(theta, laplace.spec)
+    D = randn(MersenneTwister(5), length(theta), ContinuousTimeSEM._CTSEM_JET_WIDTH)
+    for U in eachindex(laplace.units.members), nd in (1, 2)
+        members = eachindex(laplace.units.members[U])
+        u = copy(laplace.modes[U])
+        narrow = ContinuousTimeSEM._laplace_unit_jet_gradient(laplace, U, theta, Ls,
+            u, members, D, nd, Val(ContinuousTimeSEM._CTSEM_JET_NARROW))
+        narrow = (ok=narrow.ok, d0=copy(narrow.d0), dS=copy(narrow.dS))
+        wide = ContinuousTimeSEM._laplace_unit_jet_gradient(laplace, U, theta, Ls,
+            u, members, D, nd, Val(ContinuousTimeSEM._CTSEM_JET_WIDTH))
+        @test narrow.ok && wide.ok
+        @test isapprox(narrow.d0, wide.d0; rtol=1e-13, atol=1e-13)
+        @test isapprox(narrow.dS, wide.dS; rtol=1e-12, atol=1e-12)
+    end
+    @test ContinuousTimeSEM._ctsem_jet_width(2) == ContinuousTimeSEM._CTSEM_JET_NARROW
+    @test ContinuousTimeSEM._ctsem_jet_width(3) == ContinuousTimeSEM._CTSEM_JET_WIDTH
+end
+
+@testset "the hand-written symmetric eigensolver matches LAPACK" begin
+    rng = MersenneTwister(3)
+    for n in (1, 2, 3, 6, 12)
+        A = randn(rng, n, n); A = A + transpose(A)
+        A[1, :] .*= 100; A[:, 1] .*= 100
+        E = ContinuousTimeSEM._ctsem_symeig(A)
+        scale = maximum(abs, A)
+        @test isapprox(E.values, eigvals(Symmetric(A)); atol=1e-12 * scale)
+        @test norm(A * E.vectors - E.vectors * Diagonal(E.values)) < 1e-12 * scale * n
+        @test norm(transpose(E.vectors) * E.vectors - I) < 1e-12 * n
+    end
+end
+
+@testset "curvature conditioning is reported at report time and changes nothing" begin
+    C = ContinuousTimeSEM
+    # Concave everywhere: every unit passes the `M - I` test, nothing is
+    # decomposed, nothing is reported.
+    laplace, values = _fresh_linear()
+    ctsem_laplace_evaluate(laplace, values; gradient=false)
+    cond = ctsem_laplace_conditioning(laplace)
+    @test all(==(Inf), cond.min_eigenvalue)
+    @test cond.below_one == 0 && cond.near_singular == 0
+    # Mildly convex: some unit has an eigenvalue below one, none near zero,
+    # and what is reported is that unit's exact smallest eigenvalue.
+    laplace, values = _fresh_nonlinear_two()
+    first = ctsem_laplace_evaluate(laplace, values; gradient=true)
+    flags = copy(laplace.logdet_floored)
+    diagnostics = ctsem_laplace_diagnostics(laplace)
+    @test diagnostics.below_one >= 1
+    @test diagnostics.near_singular == 0
+    Ls = C._laplace_popchols(values, laplace.spec)
+    for U in eachindex(laplace.units.members)
+        isfinite(diagnostics.min_eigenvalue[U]) || continue
+        u = laplace.modes[U]
+        dense = C._laplace_block_dense(C._laplace_unit_curvature(laplace, U,
+            values, Ls, u), laplace.units.blocks[U], length(u))
+        @test isapprox(diagnostics.min_eigenvalue[U],
+            eigmin(Symmetric(dense)); rtol=1e-10)
+    end
+    # Asking changes nothing: the next evaluation is the same computation.
+    @test laplace.logdet_floored == flags
+    again = ctsem_laplace_evaluate(laplace, values; gradient=true)
+    @test again.value == first.value
+    @test isapprox(again.gradient, first.gradient; rtol=1e-13)
+end
+
+@testset "the soft-direction quadrature: value, and its gradient against nested and differences" begin
+    C = ContinuousTimeSEM
+    # Units 1, 2, 4, 5 have smallest eigenvalues 1.16 to 1.17 at this point and
+    # unit 3 has 0.956, so the three bands below put nothing, one unit, and one
+    # unit fully soft plus four inside the ramp (with lambda above one, so the
+    # node scale moves with lambda too).
+    laplace, values = _fresh_nonlinear_two()
+    @test laplace.soft_directions === :logdet_floor
+    total = ctsem_laplace_evaluate(laplace, values; gradient=true)
+    for (label, lo, hi, nflag) in (("above the band", 0.2, 0.7, 0),
+                                   ("inside the ramp", 0.8, 1.1, 1),
+                                   ("below the ramp", 1.0, 1.2, 5))
+        soft, _ = _fresh_nonlinear_two()
+        ctsem_set_soft_directions!(soft, :quadrature; lo=lo, hi=hi)
+        seeded = ctsem_laplace_evaluate(soft, values; gradient=true)
+        @test (label, soft.soft_quadrature_units) == (label, nflag)
+        nested = ctsem_laplace_evaluate(soft, values; gradient=true,
+            nested_gradient=true)
+        reference = _value_finite_difference(soft, values)
+        # The Float64 reference computes the same rule by a separate route.
+        ctsem_laplace_evaluate(laplace, values; gradient=false)
+        prototype = sum(C._laplace_soft_quadrature_unit_reference(laplace, values, U; lo=lo,
+            hi=hi, nodes=3, newton_steps=1).value
+            for U in eachindex(laplace.units.members))
+        @test (label, isapprox(seeded.value, prototype; rtol=1e-10)) == (label, true)
+        if nflag == 0
+            @test seeded.value == total.value
+            @test isapprox(seeded.gradient, total.gradient; rtol=1e-13)
+        else
+            @test (label, seeded.value != total.value) == (label, true)
+        end
+        @test (label, isapprox(seeded.gradient, nested.gradient; rtol=1e-8,
+            atol=1e-10)) == (label, true)
+        @test (label, norm(seeded.gradient - reference) / norm(reference) < 1e-5) ==
+            (label, true)
+    end
+end
+
+@testset "the soft-direction quadrature on a two-level unit" begin
+    C = ContinuousTimeSEM
+    laplace = ctsem_laplace_objective(_LAPLACE_NONLINEAR_OBJECTIVE;
+        re_index=[1, 2, 4], sd_index=[5, 6, 8], cor_index=[7],
+        sd_scale=[1.0, 1.0, 1.0], level_nre=[2, 1],
+        group=vcat(1:5, [1, 1, 2, 2, 3]), level_ngroups=[5, 3])
+    values = [0.1, -2.0, -0.2, 0.05, -0.25, 1.0, 0.0, 0.5]
+    ctsem_set_soft_directions!(laplace, :quadrature; lo=0.3, hi=1.1)
+    seeded = ctsem_laplace_evaluate(laplace, values; gradient=true)
+    @test laplace.soft_quadrature_units >= 1
+    nested = ctsem_laplace_evaluate(laplace, values; gradient=true,
+        nested_gradient=true)
+    reference = _value_finite_difference(laplace, values)
+    @test isapprox(seeded.gradient, nested.gradient; rtol=1e-8, atol=1e-10)
+    @test norm(seeded.gradient - reference) / norm(reference) < 1e-5
+end
+
+@testset "a soft-direction node's Newton step that loses is taken back" begin
+    C = ContinuousTimeSEM
+    stepped, slope = C._laplace_soft_node_stepped, C._laplace_soft_node_stepped_slope
+    c = C._LAPLACE_SOFT_NODE_STEP_LOSS
+    h0 = -213.25
+    # A step that gains or loses nothing is the stepped value itself, bit for bit.
+    for hs in (h0, h0 + 1e-14, h0 + 3.0)
+        @test stepped(h0, hs) === hs
+        @test slope(h0, hs) == 1.0
+    end
+    # One that loses 2c or more, or lands where nothing can be evaluated, is the
+    # node's own value less c, and reads nothing at the stepped point.
+    for hs in (h0 - 2c, h0 - 40.0, NaN, -Inf)
+        @test stepped(h0, hs) == h0 - c
+        @test slope(h0, hs) == 0.0
+    end
+    # Between, monotone in the stepped value, never below either end, C2 at both
+    # joins, and its slope is its derivative.
+    grid = range(h0 - 2c, h0; length=201)
+    vals = [stepped(h0, hs) for hs in grid]
+    @test all(diff(vals) .>= 0)
+    @test all(v -> h0 - c <= v <= h0, vals)
+    for hs in grid[2:end-1]
+        @test isapprox(ForwardDiff.derivative(x -> stepped(h0, x), hs), slope(h0, hs);
+            rtol=1e-12, atol=1e-14)
+    end
+    e = 1e-6
+    for join in (h0 - 2c, h0)
+        @test isapprox(stepped(h0, join - e), stepped(h0, join + e) - (slope(h0, join) * 2e);
+            atol=1e-10)
+        @test isapprox(slope(h0, join - e), slope(h0, join + e); atol=1e-10)
+        second = x -> ForwardDiff.derivative(
+            y -> ForwardDiff.derivative(z -> stepped(h0, z), y), x)
+        @test abs(second(join - e)) < 1e-4 && abs(second(join + e)) < 1e-4
+    end
+end
+
+@testset "a unit whose node's step loses: value, gradient, and a step that cannot be evaluated" begin
+    C = ContinuousTimeSEM
+    # On the nonlinear fixture at this point unit 2's node at +1.732 steps 2.4
+    # prior sds and loses 0.42 nats, inside the guard's blend, where both the
+    # stepped point and the node's own point carry the node's value. Each unit
+    # takes its best maximum alone: at points like this the mode sum's shares
+    # between maxima carry most of the gradient, and they are tested elsewhere.
+    lo, hi = 1.0, 1.2
+    point = [1.0, -3.0, -1.0, 0.05, -0.5, 2.0, 0.0]
+    make = function ()
+        laplace, _ = _fresh_nonlinear_two()
+        ctsem_set_soft_directions!(laplace, :quadrature; lo=lo, hi=hi)
+        return laplace
+    end
+    modesum = ctsem_set_mode_sum!(false)
+    try
+    laplace = make()
+    seeded = ctsem_laplace_evaluate(laplace, point; gradient=true)
+    theta = C._laplace_extend(laplace, copy(point))
+    # Each node's loss over 2c, its step taken as the dense rule takes it.
+    losses = Tuple{Int,Float64}[]
+    for U in eachindex(laplace.modes)
+        st = C._laplace_soft_quadrature_setup(laplace, U, theta, laplace.modes[U])
+        st === nothing && continue
+        E = eigen(Symmetric(st.curvf(st.z0)))
+        E.values[1] < hi || continue
+        v1, Vh = E.vectors[:, 1], E.vectors[:, 2:end]
+        for x in (-sqrt(1.5), sqrt(1.5))
+            ub = st.z0 .+ (sqrt(2) * x / sqrt(max(E.values[1], 1.0))) .* v1
+            r = st.objf(ub)
+            Bc = C._laplace_soft_node_floored_curvature(transpose(Vh) * st.curvf(ub) * Vh)
+            step = Matrix(C._laplace_symmetrise(Bc)) \ (transpose(Vh) * r.gradient)
+            push!(losses, (U, (st.objf(ub .+ Vh * step).value - r.value) /
+                (2 * C._LAPLACE_SOFT_NODE_STEP_LOSS)))
+        end
+    end
+    blended = [U for (U, t) in losses if -1 < t < -0.05]
+    @test !isempty(blended)
+    # The value against the Float64 reference at the same modes, which takes its
+    # steps back alike.
+    prototype = sum(C._laplace_soft_quadrature_unit_reference(laplace, point, U; lo=lo,
+        hi=hi, nodes=3, newton_steps=1).value for U in eachindex(laplace.units.members))
+    @test isapprox(seeded.value, prototype; rtol=1e-10)
+    # The gradient against forward mode over the rule and against differences.
+    nested = ctsem_laplace_evaluate(make(), point; gradient=true, nested_gradient=true)
+    @test isapprox(seeded.gradient, nested.gradient; rtol=1e-8, atol=1e-10)
+    reference = _value_finite_difference(make(), point; step=1e-6)
+    @test norm(seeded.gradient - reference) / norm(reference) < 1e-6
+    # The dense rule everywhere gives the same value and gradient.
+    previous = ctsem_set_soft_quadrature_factored!(false)
+    dense = try
+        ctsem_laplace_evaluate(make(), point; gradient=true)
+    finally
+        ctsem_set_soft_quadrature_factored!(previous)
+    end
+    @test isapprox(seeded.value, dense.value; rtol=1e-11)
+    @test isapprox(seeded.gradient, dense.gradient; rtol=1e-8, atol=1e-10)
+    # A stepped point that cannot be evaluated is a step that lost everything:
+    # the term and its gradient are those of a step that lost a million nats,
+    # and the reverse pass reads no stepped point.
+    U = first(blended)
+    Ls = C._laplace_popchols(theta, laplace.spec)
+    aws = C._laplace_workspace!(laplace, Float64, length(theta))
+    st = C._laplace_soft_quadrature_setup(laplace, U, theta, laplace.modes[U])
+    far = 1.01 * sqrt(3) / sqrt(max(eigmin(Symmetric(st.curvf(st.z0))), 1.0))
+    beyond = (shift) -> (z -> begin
+        r = st.objf(z)
+        norm(z .- st.z0) > far ? merge(r, (value=shift(r.value),)) : r
+    end)
+    unevaluable, lost = beyond(v -> NaN), beyond(v -> v - 1e6)
+    term = f -> C._laplace_soft_quadrature_term(laplace, U, theta, Ls, st.z0, aws;
+        objective=f, curvature=st.curvb, blocks=st.blocks).value
+    @test isfinite(term(unevaluable))
+    @test term(unevaluable) == term(lost)
+    @test term(unevaluable) != term(st.objf)
+    reverse = f -> C._laplace_soft_quadrature_reverse(laplace, st.z0, f, st.curvf, st.G,
+        length(theta))
+    @test reverse(unevaluable) !== nothing
+    @test reverse(unevaluable) == reverse(lost)
+    # By factorizations too, where the nodes' floor lets it serve.
+    factored = f -> C._laplace_soft_quadrature_reverse_factored(laplace, st.z0, f,
+        st.curvb, st.blocks, st.G, length(theta))
+    if factored(lost) !== nothing
+        @test factored(unevaluable) == factored(lost)
+        @test isapprox(factored(lost), reverse(lost); rtol=1e-8, atol=1e-10)
+    end
+    finally
+        ctsem_set_mode_sum!(modesum)
+    end
+end
+
+# The fixtures of the two testsets above, the rule set to flag units.
+function _soft_factored_cases()
+    one_block = function ()
+        laplace, values = _fresh_nonlinear_two()
+        ctsem_set_soft_directions!(laplace, :quadrature; lo=1.0, hi=1.2)
+        return laplace, values
+    end
+    two_levels = function ()
+        laplace = ctsem_laplace_objective(_LAPLACE_NONLINEAR_OBJECTIVE;
+            re_index=[1, 2, 4], sd_index=[5, 6, 8], cor_index=[7],
+            sd_scale=[1.0, 1.0, 1.0], level_nre=[2, 1],
+            group=vcat(1:5, [1, 1, 2, 2, 3]), level_ngroups=[5, 3])
+        ctsem_set_soft_directions!(laplace, :quadrature; lo=0.3, hi=1.1)
+        return laplace, [0.1, -2.0, -0.2, 0.05, -0.25, 1.0, 0.0, 0.5]
+    end
+    return (("one block", one_block), ("two levels", two_levels))
+end
+
+@testset "the soft-direction quadrature by block factorizations against the dense rule" begin
+    C = ContinuousTimeSEM
+    for (label, make) in _soft_factored_cases()
+        laplace, values = make()
+        factored = ctsem_laplace_evaluate(laplace, values; gradient=true)
+        @test laplace.soft_quadrature_units >= 1
+        theta = C._laplace_extend(laplace, collect(Float64, values))
+        Ls = C._laplace_popchols(theta, laplace.spec)
+        aws = C._laplace_workspace!(laplace, Float64, length(theta))
+        served = 0
+        for U in eachindex(laplace.modes)
+            u = laplace.modes[U]
+            isempty(u) && continue
+            blocks = laplace.units.blocks[U]
+            M = C._laplace_unit_curvature(laplace, U, theta, Ls, u)
+            inner = C._laplace_unit_objective_gradient(laplace, U, theta, Ls, u, aws)
+            ok, logdetM, _, _ = C._laplace_block_factor(M, blocks)
+            ok || continue
+            objf = z -> C._laplace_unit_objective_gradient(laplace, U, theta, Ls, z, aws)
+            curvf = z -> C._laplace_unit_curvature(laplace, U, theta, Ls, z)
+            # Each unit's value by factorizations against the dense rule's.
+            fv = C._laplace_soft_quadrature_factored(laplace, M, blocks, logdetM,
+                inner.value, u, objf, curvf)
+            previous = ctsem_set_soft_quadrature_factored!(false)
+            dv = try
+                C._laplace_soft_quadrature_term(laplace, U, theta, Ls, u, aws; M=M,
+                    logdetM=logdetM, inner=inner)
+            finally
+                ctsem_set_soft_quadrature_factored!(previous)
+            end
+            if fv !== nothing
+                served += 1
+                @test (label, U, fv.flagged, fv.logdet_floor) ==
+                    (label, U, dv.flagged, dv.logdet_floor)
+                @test (label, U, isapprox(fv.value, dv.value; rtol=1e-11)) ==
+                    (label, U, true)
+            end
+            # And its gradient.
+            st = C._laplace_soft_quadrature_setup(laplace, U, theta, u)
+            gf = C._laplace_soft_quadrature_reverse_factored(laplace, st.z0, st.objf,
+                st.curvb, st.blocks, st.G, length(theta))
+            gd = C._laplace_soft_quadrature_reverse(laplace, st.z0, st.objf, st.curvf,
+                st.G, length(theta))
+            gf === nothing || @test (label, U, isapprox(gf, gd; rtol=1e-8, atol=1e-10)) ==
+                (label, U, true)
+        end
+        @test (label, served > 0) == (label, true)
+        # The whole objective, and its gradient, under the dense rule everywhere.
+        previous = ctsem_set_soft_quadrature_factored!(false)
+        dense = try
+            ctsem_laplace_evaluate(laplace, values; gradient=true)
+        finally
+            ctsem_set_soft_quadrature_factored!(previous)
+        end
+        @test isapprox(factored.value, dense.value; rtol=1e-11)
+        @test isapprox(factored.gradient, dense.gradient; rtol=1e-8, atol=1e-10)
+    end
+end
+
+@testset "the factorized soft-direction quadrature's linear algebra" begin
+    C = ContinuousTimeSEM
+    rng = Random.MersenneTwister(31)
+    for (label, make) in _soft_factored_cases()
+        laplace, values = make()
+        ctsem_laplace_evaluate(laplace, values; gradient=false)
+        theta = C._laplace_extend(laplace, collect(Float64, values))
+        spec = laplace.spec
+        Ls = C._laplace_popchols(theta, spec)
+        dL = C._laplace_level_chol_derivatives(theta, spec)
+        positions = Vector{Int}[C._laplace_level_positions(spec, l)
+            for l in eachindex(spec.levels)]
+        for U in eachindex(laplace.modes)
+            u = laplace.modes[U]
+            d = length(u)
+            d >= 2 || continue
+            blocks = laplace.units.blocks[U]
+            M = C._laplace_unit_curvature(laplace, U, theta, Ls, u)
+            Md = C._laplace_block_dense(M, blocks, d)
+            E = eigen(Symmetric(Md))
+            F = C._soft_shifted_factor(M, blocks, 0.0)
+            F === nothing && continue
+            # The members' coordinates are the ones their values read.
+            G = C._SoftQuadratureThetaGradient(laplace, U, theta, Ls, dL, positions, nothing)
+            for m in eachindex(laplace.units.members[U])
+                offsets = laplace.units.offsets[U][m]
+                read = Int[]
+                for (l, level) in enumerate(spec.levels)
+                    r = C.nlatent(level)
+                    (C.nrandomeffects(level) == 0 || r == 0) && continue
+                    append!(read, offsets[l] .+ (1:r))
+                end
+                @test (label, U, m, sort(G.coords[m])) == (label, U, m, sort(read))
+            end
+            # A trace adjoint held as a selected inverse, read on each member.
+            a, b = randn(rng, d), randn(rng, d)
+            Gs = C._SoftGamma(0.7, F, blocks, [1.3, -0.4], [a, b], [b, a])
+            Gd = 0.7 .* inv(Md) .+ 1.3 .* (a * b' .+ b * a') ./ 2 .-
+                0.4 .* (b * a' .+ a * b') ./ 2
+            for m in eachindex(G.coords)
+                @test C._soft_member_gamma(Gs, G, m) ≈ C._soft_member_gamma(Gd, G, m) rtol=1e-10
+            end
+            @test C._soft_block_mulvec(M, blocks, a) ≈ Md * a rtol=1e-12
+            # The smallest eigenpair, the deflated solve and the second eigenvalue.
+            (E.values[2] - E.values[1]) > 1e-3 || continue
+            eig = C._soft_smallest_eigenpair(M, blocks, F)
+            @test eig !== nothing
+            @test isapprox(eig.lambda, E.values[1]; rtol=1e-12)
+            @test isapprox(abs(dot(eig.v, E.vectors[:, 1])), 1.0; atol=1e-10)
+            rhs = randn(rng, d)
+            rhs .-= eig.v .* dot(eig.v, rhs)
+            x = C._soft_deflated_solve(eig, blocks, rhs)
+            xr = sum(E.vectors[:, k] .* (dot(E.vectors[:, k], rhs) / (E.values[k] - E.values[1]))
+                for k in 2:d)
+            @test isapprox(x, xr; rtol=1e-8)
+            for s in (E.values[2] - 1e-3, E.values[2] + 1e-3)
+                @test C._soft_second_above(M, blocks, eig.v, eig.lambda, s) == (E.values[2] > s)
+            end
+        end
+    end
+end
+
+@testset "the soft-direction rule belongs to the objective, not the session" begin
+    # Two objectives over the same model: setting one to :quadrature leaves the
+    # other at :logdet_floor, value and gradient, and a fresh objective starts at
+    # :logdet_floor whatever was done before it.
+    soft, values = _fresh_nonlinear_two()
+    plain, _ = _fresh_nonlinear_two()
+    before = ctsem_laplace_evaluate(plain, values; gradient=true)
+    previous = ctsem_set_soft_directions!(soft, :quadrature; lo=0.8, hi=1.1)
+    @test previous == (soft_directions=:logdet_floor, lo=0.2, hi=0.7)
+    g = ctsem_laplace_evaluate(soft, values; gradient=true)
+    after = ctsem_laplace_evaluate(plain, values; gradient=true)
+    @test g.value != before.value
+    @test after.value == before.value
+    @test isapprox(after.gradient, before.gradient; rtol=1e-13)
+    fresh, _ = _fresh_nonlinear_two()
+    @test fresh.soft_directions === :logdet_floor
+    @test ctsem_laplace_evaluate(fresh, values; gradient=false).value == before.value
+    @test_throws ArgumentError ctsem_set_soft_directions!(plain, :eigen)
+    @test_throws ArgumentError ctsem_set_soft_directions!(plain, :quadrature; lo=0.7, hi=0.2)
+    @test ctsem_laplace_diagnostics(soft).soft_directions === :quadrature
+end
+
+@testset "first-order eigen-quantities are the derivatives they claim" begin
+    C = ContinuousTimeSEM
+    A0 = [3.0 0.4 0.1; 0.4 1.2 -0.3; 0.1 -0.3 0.5]
+    dA = [0.2 -0.1 0.3; -0.1 0.4 0.05; 0.3 0.05 -0.2]
+    lam(t) = C._laplace_eig_first_order(A0 .+ t .* dA).values[1]
+    vec1(t) = C._laplace_eig_first_order(A0 .+ t .* dA).vectors[:, 1]
+    floored(t) = C._laplace_soft_node_floored_curvature(A0 .+ t .* dA)
+    h = 1e-6
+    sgn(v) = v .* sign(v[1])
+    @test ForwardDiff.derivative(lam, 0.0) ≈ (lam(h) - lam(-h)) / (2h) rtol = 1e-6
+    @test ForwardDiff.derivative(t -> sgn(vec1(t)), 0.0) ≈
+        (sgn(vec1(h)) - sgn(vec1(-h))) ./ (2h) rtol = 1e-5
+    @test ForwardDiff.derivative(floored, 0.0) ≈ (floored(h) - floored(-h)) ./ (2h) rtol = 1e-5
+end
+
+@testset "the inner mode is a mode" begin
+    laplace, values = _fresh_linear()
+    ctsem_laplace_evaluate(laplace, values; gradient=false)
+    diagnostics = ctsem_laplace_diagnostics(laplace)
+    @test all(diagnostics.converged)
+    @test all(diagnostics.max_gradient .< 1e-9)
+    @test !any(diagnostics.hessian_repaired)
+
+    # A directly checked stationarity condition: perturbing z away from the
+    # reported mode may not increase the inner objective.
+    spec = laplace.spec
+    k = ContinuousTimeSEM.nrandomeffects(spec)
+    for i in 1:length(laplace.objective.subject_objectives)
+        zhat = laplace.modes[i]
+        at_mode = _subject_loglik(laplace, i, values, zhat) - dot(zhat, zhat) / 2
+        for j in 1:k, delta in (-0.05, 0.05)
+            probe = copy(zhat); probe[j] += delta
+            nearby = _subject_loglik(laplace, i, values, probe) - dot(probe, probe) / 2
+            @test nearby <= at_mode + 1e-10
+        end
+    end
+end
+
+@testset "the exact outer gradient is the gradient of the value" begin
+    laplace, values = _fresh_linear()
+    result = ctsem_laplace_evaluate(laplace, values; gradient=true)
+    reference = _value_finite_difference(laplace, values)
+    @test norm(result.gradient - reference) / norm(reference) < 1e-6
+end
+
+@testset "the exact gradient holds for a nonlinear model too" begin
+    # The value here is genuinely approximate -- the integrand is not Gaussian
+    # in z. The gradient still has to be the gradient *of that value*, which is
+    # what makes the outer optimizer's convergence meaningful.
+    laplace, values = _fresh_nonlinear()
+    result = ctsem_laplace_evaluate(laplace, values; gradient=true)
+    @test isfinite(result.value)
+    reference = _value_finite_difference(laplace, values)
+    @test norm(result.gradient - reference) / norm(reference) < 1e-5
+end
+
+@testset "the seeded gradient matches the nested one it replaces" begin
+    # The production gradient assembles `dT/dtheta` from `k + 1` seeded reverse
+    # sweeps plus a good deal of chain rule. The nested route computes the same
+    # quantity by running ForwardDiff over the entire per-subject term. They
+    # share the primal and nothing else -- no seeding, no hand-written
+    # assembly, no popchol derivatives -- so agreement to machine precision is
+    # a real check on every term of that assembly, and much sharper than the
+    # finite-difference comparison can be.
+    for (label, fresh) in (("linear", _fresh_linear), ("nonlinear", _fresh_nonlinear))
+        laplace, values = fresh()
+        seeded = ctsem_laplace_evaluate(laplace, values; gradient=true)
+        nested = ctsem_laplace_evaluate(laplace, values; gradient=true,
+            nested_gradient=true)
+        @test seeded.value == nested.value
+        @test norm(seeded.gradient - nested.gradient) / norm(nested.gradient) < 1e-8
+    end
+end
+
+@testset "the seed orders against the tags it meets" begin
+    # A nested differentiation (a categorical row's moment Jacobian) reading
+    # a value the seed perturbs: d/dz (z^2 x) at z = x is 2 x^2, whose
+    # derivative along the seed is 4 x. Without an order between the tags
+    # this threw DualMismatchError.
+    e = ForwardDiff.Dual{ContinuousTimeSEM._LaplaceSeedInner}(0.0, 1.0)
+    x = 0.3 + e
+    f = z -> z[1]^2 * x
+    g = ForwardDiff.gradient(f, [x], ForwardDiff.GradientConfig(f, [x],
+        ForwardDiff.Chunk(1), ContinuousTimeSEM._ctsem_nested_tag([x])), Val{false}())
+    @test typeof(g[1]) == typeof(x)
+    @test ForwardDiff.value(g[1]) ≈ 2 * 0.3^2
+    @test ForwardDiff.partials(g[1])[1] ≈ 4 * 0.3
+    # An ordinary tag goes inside the seed: the seed perturbs a point that is
+    # itself being differentiated.
+    y = ForwardDiff.Dual{ForwardDiff.Tag{typeof(sin),Float64}}(0.3, 1.0)
+    p = y * (0.3 + e)
+    @test p isa ForwardDiff.Dual{ContinuousTimeSEM._LaplaceSeedInner}
+    @test ForwardDiff.partials(ForwardDiff.value(p))[1] ≈ 0.3
+end
+
+@testset "the inner solve ends at the mode, whichever curvature it walks on" begin
+    # Ended by the gradient bound alone, which is relative to the unit's value,
+    # a solve stopped up to the bound over the curvature short of the mode --
+    # and SR1, converging only superlinearly, further than Newton -- so the
+    # objective moved with the solver. Each solve must end with the Newton
+    # step left, on the exact curvature at the mode it returns, under
+    # `inner_tol`. With SR1 (probes off, so the fixture's unit uses it) and
+    # without, at two points.
+    probes = ContinuousTimeSEM._LAPLACE_MODE_PROBES[]
+    sr1 = ContinuousTimeSEM._LAPLACE_INNER_SR1[]
+    C = ContinuousTimeSEM
+    function newton_left(laplace, v)
+        Ls = C._laplace_popchols(v, laplace.spec)
+        aws = C._laplace_workspace!(laplace, Float64, length(v))
+        worst = 0.0
+        for U in eachindex(laplace.modes)
+            u = laplace.modes[U]
+            isempty(u) && continue
+            r = C._laplace_unit_objective_gradient(laplace, U, v, Ls, u, aws,
+                zeros(length(u)))
+            M = C._laplace_block_dense!(zeros(length(u), length(u)),
+                C._laplace_unit_curvature(laplace, U, v, Ls, u),
+                laplace.units.blocks[U])
+            worst = max(worst, maximum(abs, M \ collect(r.gradient)))
+        end
+        return worst
+    end
+    try
+        ContinuousTimeSEM._LAPLACE_MODE_PROBES[] = false
+        for v in ([0.1, 0.4, -0.2, 0.05, -0.25], [0.6, -1.2, 0.4, 0.3, 0.5])
+            out = map((true, false)) do on
+                ContinuousTimeSEM._LAPLACE_INNER_SR1[] = on
+                laplace, _ = _fresh_nonlinear()
+                r = ctsem_laplace_evaluate(laplace, v; gradient=true)
+                (r=r, left=newton_left(laplace, v), tol=laplace.inner_tol)
+            end
+            with, without = out
+            @test with.left < 2 * with.tol
+            @test without.left < 2 * without.tol
+            @test with.r.value ≈ without.r.value atol=1e-9
+            @test maximum(abs, with.r.gradient .- without.r.gradient) < 1e-7
+        end
+    finally
+        ContinuousTimeSEM._LAPLACE_MODE_PROBES[] = probes
+        ContinuousTimeSEM._LAPLACE_INNER_SR1[] = sr1
+    end
+end
+
+@testset "from any start the inner solve measures its distance before it ends" begin
+    # The gradient bound once ended a solve at its first iterate from any
+    # start, as from the origin: a start under the bound -- an anchor from the
+    # last accepted point, a known mode -- was taken for the mode, up to the
+    # bound over the curvature short of it, where a start a little further out
+    # went on to the mode. An anchored unit's term then read lower at the
+    # anchors' own point than beside it (the affect pilot's unit 201, by
+    # 2.4e-7). Started from each unit's mode moved along its softest direction
+    # to half the bound, the solve must end with the Newton step left on the
+    # exact curvature under `inner_tol`. The fixture's units are small: under
+    # their bound a start lies within about the default `inner_tol` of its
+    # mode, which either rule accepts, so `inner_tol` is set lower here.
+    C = ContinuousTimeSEM
+    laplace, values = _fresh_nonlinear()
+    laplace.inner_tol = 1e-12
+    ctsem_laplace_evaluate(laplace, values)
+    theta = C._laplace_extend(laplace, collect(Float64, values))
+    Ls = C._laplace_popchols(theta, laplace.spec)
+    aws = C._laplace_workspace!(laplace, Float64, length(theta))
+    function left(U, u)
+        r = C._laplace_unit_objective_gradient(laplace, U, theta, Ls, u, aws,
+            zeros(length(u)))
+        M = C._laplace_block_dense!(zeros(length(u), length(u)),
+            C._laplace_unit_curvature(laplace, U, theta, Ls, u),
+            laplace.units.blocks[U])
+        return (step=maximum(abs, M \ collect(r.gradient)),
+            gradient=maximum(abs, r.gradient), value=r.value, M=M)
+    end
+    tested = 0
+    for U in eachindex(laplace.modes)
+        u = copy(laplace.modes[U])
+        isempty(u) && continue
+        at = left(U, u)
+        E = eigen(Symmetric(at.M))
+        v = E.vectors[:, 1]
+        bound = C._laplace_inner_tolerance(laplace, at.value)
+        start = u .+ (bound / (2 * E.values[1] * maximum(abs, v))) .* v
+        from = left(U, start)
+        # A start the bound alone would have ended on, short of the mode.
+        (from.gradient < bound && from.step > 10 * laplace.inner_tol) || continue
+        tested += 1
+        r = C._laplace_newton_unit_mode(laplace, U, theta, Ls, aws, start)
+        @test r.converged
+        @test left(U, r.u).step < 2 * laplace.inner_tol
+    end
+    @test tested > 0
+end
+
+@testset "the seeded gradient is exercised away from the optimum" begin
+    # A single test point can hide a term that happens to vanish there. These
+    # perturb the population scales and correlations, which are the parameters
+    # the assembly treats specially -- they move `v` through `L` as well as
+    # directly, and they are the only ones with an explicit `psi` term.
+    laplace, values = _fresh_linear()
+    spec = laplace.spec
+    for shift in (0.4, -0.6, 1.1)
+        probe = collect(values)
+        probe[spec.levels[1].sd_index] .+= shift
+        probe[spec.levels[1].cor_index] .-= shift / 2
+        seeded = ctsem_laplace_evaluate(laplace, probe; gradient=true)
+        nested = ctsem_laplace_evaluate(laplace, probe; gradient=true,
+            nested_gradient=true)
+        @test norm(seeded.gradient - nested.gradient) / norm(nested.gradient) < 1e-8
+    end
+end
+
+@testset "chunking the subject loop does not change the answer" begin
+    # `cores` reaches this path as a chunk count, and each chunk owns its own
+    # adjoint workspace rather than indexing one by thread id -- a task can
+    # migrate between threads at any yield point, so thread-indexed scratch
+    # would be a race. Splitting only reorders a sum, so the tolerance is
+    # floating-point association, not an approximation.
+    laplace, values = _fresh_linear()
+    original = ctsem_max_chunks().max_chunks
+    try
+        ctsem_set_max_chunks!(1)
+        serial = ctsem_laplace_evaluate(laplace, values; gradient=true)
+        for chunks in (2, 3, 8)
+            fresh, _ = _fresh_linear()
+            ctsem_set_max_chunks!(chunks)
+            split = ctsem_laplace_evaluate(fresh, values; gradient=true)
+            @test isapprox(split.value, serial.value; rtol=1e-12)
+            @test isapprox(split.gradient, serial.gradient; rtol=1e-9)
+            @test isapprox(split.subject_loglik, serial.subject_loglik; rtol=1e-12)
+        end
+    finally
+        ctsem_set_max_chunks!(original)
+    end
+end
+
+@testset "the blocked curvature equals the dense one" begin
+    # The production curvature is assembled one block of `u` at a time, using
+    # the fact that a member outside a block has structurally zero second
+    # derivative with respect to it. The dense route differentiates the whole
+    # gradient at once and knows nothing about that structure, so agreement is
+    # a real check on the block bookkeeping -- which members own which block,
+    # and where each block sits in `u`.
+    for (label, fresh) in (("one level", _fresh_linear), ("two levels", _fresh_twolevel))
+        laplace, values = fresh()
+        theta = collect(Float64, values)
+        Ls = ContinuousTimeSEM._laplace_popchols(theta, laplace.spec)
+        for U in eachindex(laplace.units.members)
+            u = 0.1 .* collect(1.0:laplace.units.dims[U])
+            # `_laplace_unit_curvature`, which is what production calls, against
+            # the dense Hessian. Both arguments used to be
+            # `_oracle_unit_hessian` -- once with the default and once with a
+            # `dense=true` keyword whose ternary made both the same path, so the
+            # test compared a value with itself and passed without checking
+            # anything. That keyword and its unreachable branch are gone; the
+            # Hessian is deliberately structure-blind now, which is what makes
+            # it a reference worth comparing the blocked assembly against.
+            #
+            # The curvature is the negated Hessian, and it comes back as a
+            # block matrix, so it is densified before comparing.
+            blocks = laplace.units.blocks[U]
+            curvature = ContinuousTimeSEM._laplace_unit_curvature(
+                laplace, U, theta, Ls, u)
+            blocked = ContinuousTimeSEM._laplace_block_dense(curvature, blocks,
+                laplace.units.dims[U])
+            reference = -_oracle_unit_hessian(laplace, U, theta, Ls, u)
+            @test size(blocked) == size(reference)
+            @test norm(blocked - reference) / max(norm(reference), 1) < 1e-10
+        end
+    end
+end
+
+@testset "the curvature is arrow structured, and the blocks say where" begin
+    # Subjects in a study are conditionally independent given the study effect,
+    # so their blocks do not couple to each other -- only to the study block.
+    # That is the sparsity the blocked assembly exploits, so it is worth
+    # asserting rather than assuming.
+    laplace, values = _fresh_twolevel()
+    theta = collect(Float64, values)
+    Ls = ContinuousTimeSEM._laplace_popchols(theta, laplace.spec)
+    U = 1
+    u = 0.1 .* collect(1.0:laplace.units.dims[U])
+    H = _oracle_unit_hessian(laplace, U, theta, Ls, u)
+
+    blocks = laplace.units.blocks[U]
+    subjectblocks = [b for b in blocks if length(b.members) == 1]
+    studyblocks = [b for b in blocks if length(b.members) > 1]
+    @test length(subjectblocks) == 2      # two subjects per study
+    @test length(studyblocks) == 1        # one shared study block
+
+    for a in subjectblocks, b in subjectblocks
+        a === b && continue
+        rows = (a.offset + 1):(a.offset + a.size)
+        cols = (b.offset + 1):(b.offset + b.size)
+        @test all(abs.(H[rows, cols]) .< 1e-12)
+    end
+    # ...and the coupling to the study block is genuinely there, so the test
+    # above is not passing because everything is zero.
+    sb = studyblocks[1]
+    srows = (sb.offset + 1):(sb.offset + sb.size)
+    a = subjectblocks[1]
+    arows = (a.offset + 1):(a.offset + a.size)
+    @test maximum(abs, H[arows, srows]) > 1e-8
+end
+
+@testset "the mode Jacobian is the derivative it claims to be" begin
+    # Subject parameters at posterior draws linearise the mode rather than
+    # re-solving it. That is only defensible if the Jacobian is right and the
+    # error is second order, so both are checked rather than asserted: halving
+    # the step should quarter the discrepancy against a re-solved mode.
+    laplace, values = _fresh_twolevel()
+    theta = collect(Float64, values)
+    J = ctsem_laplace_mode_jacobian(laplace, theta)
+    base = [copy(laplace.modes[U]) for U in eachindex(laplace.units.members)]
+
+    direction = normalize(collect(1.0:length(theta)))
+    errors = Float64[]
+    for step in (0.02, 0.01)
+        probe = theta .+ step .* direction
+        Ls = ContinuousTimeSEM._laplace_popchols(probe, laplace.spec)
+        worst = 0.0
+        for U in eachindex(laplace.units.members)
+            linear = base[U] .+ J[U] * (probe .- theta)
+            # Re-solve from scratch at the probe, not warm-started from the
+            # linearised guess, so the two are genuinely independent.
+            laplace.modes[U] = zeros(length(base[U]))
+            ContinuousTimeSEM._laplace_solve_unit_mode!(laplace, U, probe, Ls)
+            worst = max(worst, maximum(abs, linear .- laplace.modes[U]))
+        end
+        push!(errors, worst)
+        for U in eachindex(base); laplace.modes[U] = copy(base[U]); end
+    end
+    @test errors[1] < 1e-3
+    # Second order: halving the step should cut the error by roughly four.
+    @test errors[2] < errors[1] / 3
+end
+
+@testset "the block factorization equals the dense one" begin
+    # The elimination exploits that a block couples only to its ancestors, so
+    # it must reproduce what a dense Cholesky of the same matrix gives -- both
+    # the log determinant and the solve. The dense route knows nothing about
+    # the block tree, which is what makes agreement meaningful.
+    laplace, values = _fresh_twolevel()
+    theta = collect(Float64, values)
+    Ls = ContinuousTimeSEM._laplace_popchols(theta, laplace.spec)
+    for U in eachindex(laplace.units.members)
+        blocks = laplace.units.blocks[U]
+        u = 0.1 .* collect(1.0:laplace.units.dims[U])
+        H = _oracle_unit_hessian(laplace, U, theta, Ls, u)
+        _, M = ContinuousTimeSEM._laplace_negate_definite(H)
+
+        blocked = ContinuousTimeSEM._laplace_block_of(M, blocks)
+        # Round tripping through the block form must not lose anything: if it
+        # did, the sparsity pattern would be wrong rather than the arithmetic.
+        @test ContinuousTimeSEM._laplace_block_dense(blocked, blocks,
+            size(M, 1)) ≈ M
+
+        ok, ld, factors, coupling = ContinuousTimeSEM._laplace_block_factor(blocked, blocks)
+        @test ok
+        @test ld ≈ logdet(cholesky(Symmetric(M)))
+
+        rhs = collect(1.0:size(M, 1)) ./ size(M, 1)
+        x = ContinuousTimeSEM._laplace_block_solve(factors, coupling, blocks, rhs)
+        @test norm(M * x - rhs) / norm(rhs) < 1e-9
+    end
+end
+
+@testset "the block factorization reports a curvature it cannot factor" begin
+    laplace, values = _fresh_twolevel()
+    blocks = laplace.units.blocks[1]
+    M = ContinuousTimeSEM.CTSEMBlockMatrix(blocks)
+    for d in M.diag; d .= -Matrix(I, size(d)...); end   # negative definite
+    ok, ld, _, _ = ContinuousTimeSEM._laplace_block_factor(M, blocks)
+    @test !ok
+    @test isnan(ld)
+end
+
+@testset "the selected inverse matches the dense inverse on the pattern" begin
+    # Only the entries inside `M`'s own sparsity pattern are produced, because
+    # the full inverse of an arrow matrix is dense and is exactly what must not
+    # be formed. Those entries have to be right, so they are compared with the
+    # dense inverse of the same matrix.
+    for (label, fresh) in (("one level", _fresh_linear), ("two levels", _fresh_twolevel))
+        laplace, values = fresh()
+        theta = collect(Float64, values)
+        Ls = ContinuousTimeSEM._laplace_popchols(theta, laplace.spec)
+        for U in eachindex(laplace.units.members)
+            blocks = laplace.units.blocks[U]
+            isempty(blocks) && continue
+            u = 0.1 .* collect(1.0:laplace.units.dims[U])
+            M = ContinuousTimeSEM._laplace_unit_curvature(laplace, U, theta, Ls, u)
+            ContinuousTimeSEM._laplace_repair_blocks!(M, blocks)
+            ok, _, factors, elim = ContinuousTimeSEM._laplace_block_factor(M, blocks)
+            @test ok
+
+            dense = ContinuousTimeSEM._laplace_block_dense(M, blocks,
+                laplace.units.dims[U])
+            reference = inv(Symmetric(dense))
+            Cd, Cc = ContinuousTimeSEM._laplace_selected_inverse(factors, elim, blocks)
+
+            for (b, block) in enumerate(blocks)
+                rows = (block.offset + 1):(block.offset + block.size)
+                @test norm(Cd[b] - reference[rows, rows]) /
+                      max(norm(reference[rows, rows]), 1) < 1e-8
+                for (t, a) in enumerate(block.ancestors)
+                    cols = (blocks[a].offset + 1):(blocks[a].offset + blocks[a].size)
+                    @test norm(Cc[b][t] - reference[rows, cols]) /
+                          max(norm(reference[rows, cols]), 1) < 1e-8
+                end
+            end
+        end
+    end
+end
+
+@testset "the seeded nested gradient matches the nested oracle" begin
+    # The production route for a hierarchy assembles `dT/dtheta` from
+    # `O(members)` seeded sweeps plus the selected inverse. The nested route
+    # computes the same quantity by running ForwardDiff over the whole
+    # per-unit term, at a cost that scales with the parameter count. They
+    # share the primal and nothing else, so agreement pins every term of the
+    # assembly.
+    for (label, fresh) in (("two levels", _fresh_twolevel),
+                           ("three levels", _fresh_threelevel))
+    laplace, values = fresh()
+    theta = collect(Float64, values)
+    Ls = ContinuousTimeSEM._laplace_popchols(theta, laplace.spec)
+    dL = ContinuousTimeSEM._laplace_level_chol_derivatives(theta, laplace.spec)
+
+    nunits = length(laplace.units.members)
+    Ms = Vector{Any}(undef, nunits)
+    curv = Vector{Any}(undef, nunits)
+    for U in 1:nunits
+        ContinuousTimeSEM._laplace_solve_unit_mode!(laplace, U, theta, Ls)
+        M = ContinuousTimeSEM._laplace_unit_curvature(laplace, U, theta, Ls,
+            laplace.modes[U])
+        ContinuousTimeSEM._laplace_repair_blocks!(M, laplace.units.blocks[U])
+        ok, _, f, e = ContinuousTimeSEM._laplace_block_factor(M, laplace.units.blocks[U])
+        @test ok
+        Ms[U] = M; curv[U] = (f, e)
+    end
+
+    seeded = zeros(Float64, length(theta))
+    allok = true
+    dLsolved = ContinuousTimeSEM._laplace_level_chol_solves(laplace.spec, Ls, dL)
+    for U in 1:nunits
+        allok &= ContinuousTimeSEM._laplace_seeded_unit_gradient!(seeded, laplace, U,
+            theta, Ls, dL, dLsolved, Ms[U], curv[U][1], curv[U][2])
+    end
+    @test allok
+    ContinuousTimeSEM._ctsem_log_prior_gradient!(seeded, laplace.objective, theta)
+
+    nested = ContinuousTimeSEM._laplace_nested_gradient(laplace, theta, Ls, curv)
+    @test (label, norm(seeded - nested) / norm(nested) < 1e-8) == (label, true)
+    end
+end
+
+@testset "the population covariance follows the Stan parameterisation" begin
+    laplace, values = _fresh_linear()
+    spec = laplace.spec
+    L = ContinuousTimeSEM._laplace_popchol(collect(Float64, values), spec)
+    @test size(L) == (2, 2)
+    @test istril(L)
+
+    # Reconstructed here the way ctModelWriter.R writes it, so a change to
+    # either parameterisation shows up as a disagreement rather than as a
+    # quietly different population distribution.
+    scales = [ContinuousTimeSEM.log1p_exp(2 * values[spec.levels[1].sd_index[j]] - 1) *
+              spec.levels[1].sd_scale[j] + 1e-10 for j in 1:2]
+    base = zeros(2, 2)
+    base[1, 1] = scales[1]; base[2, 2] = scales[2]
+    # Raw: constraincorsqrt1 applies the (-1, 1) squash itself now, on this
+    # path and on stan's, so applying it here too would compare against a
+    # double squash.
+    base[2, 1] = values[spec.levels[1].cor_index[1]]
+    corsqrt = ContinuousTimeSEM.constraincorsqrt1(base)
+    correlation = corsqrt * corsqrt'
+    # No second floor: `scales` already carries the 1e-10 its own transform
+    # applies, and `_laplace_popchol` no longer adds 1e-8 on top of it. One
+    # floor, in the diagonal element's transform, matching the stan path.
+    expected = (scales .* correlation) .* scales'
+    @test isapprox(L * L', expected; rtol=1e-12)
+
+    covariance = ctsem_laplace_popcov(laplace, values)
+    @test isapprox(covariance, L * L'; rtol=1e-12)
+    @test isposdef(Symmetric(covariance))
+end
+
+@testset "per-subject modes and conditional standard errors" begin
+    laplace, values = _fresh_linear()
+    nsubjects = length(laplace.objective.subject_objectives)
+    modes = ctsem_laplace_modes(laplace, values)
+
+    @test size(modes.z) == (nsubjects, 2)
+    @test size(modes.raw) == (nsubjects, 2)
+    @test all(modes.converged)
+    @test all(modes.z_sd .> 0)
+    @test all(modes.raw_sd .> 0)
+
+    # The raw-scale mode is the standardized one pushed through L, which is the
+    # same change of variables the model applies to produce a subject's
+    # parameters.
+    L = ContinuousTimeSEM._laplace_popchol(collect(Float64, values), laplace.spec)
+    for i in 1:nsubjects
+        @test isapprox(modes.raw[i, :], L * modes.z[i, :]; rtol=1e-10)
+    end
+    # Subjects differ: a collapsed mode vector would mean the random effects
+    # are not being identified at all.
+    @test maximum(abs, diff(modes.z; dims=1)) > 1e-6
+end
+
+@testset "warm starting does not change the answer" begin
+    # The modes persist between calls, so a second evaluation at the same point
+    # starts from the answer rather than from zero. That must be an efficiency,
+    # not a difference.
+    laplace, values = _fresh_linear()
+    first_result = ctsem_laplace_evaluate(laplace, values; gradient=true)
+    second_result = ctsem_laplace_evaluate(laplace, values; gradient=true)
+    @test isapprox(first_result.value, second_result.value; rtol=1e-12)
+    @test isapprox(first_result.gradient, second_result.gradient; rtol=1e-10)
+
+    fresh, _ = _fresh_linear()
+    fresh_result = ctsem_laplace_evaluate(fresh, values; gradient=true)
+    @test isapprox(fresh_result.value, first_result.value; rtol=1e-10)
+end
+
+@testset "zero random effects reduces to the ordinary likelihood" begin
+    # The degenerate case has to be a no-op rather than an error: it is what a
+    # model with the Laplace path selected but nothing declared varying is.
+    df = _laplace_test_dataframe(
+        drift=[-0.5;;], jax=[-0.5;;], cint=[0.0;;], diffusion=[0.2;;],
+        lambda=[1.0;;], jy=[1.0;;], manifestmeans=[0.0;;], manifestvar=[0.3;;],
+        t0var=[0.4;;], t0means=[0.0;;],
+        free=Dict(
+            (:T0MEANS, 1, 1) => (1, "param[1]"),
+            (:DRIFT, 1, 1) => (2, "-log1p_exp(param[2])"),
+            (:JAx, 1, 1) => (2, "-log1p_exp(param[2])"),
+        ),
+    )
+    sp = ekf_from_data_frame(df)
+    subject_starts, times, data = _laplace_test_data(4, 1)
+    objective = ctsem_objective(sp, subject_starts, times, data)
+    laplace = ctsem_laplace_objective(objective, Int[], Int[], Int[], Float64[])
+    values = [0.2, 0.3]
+
+    result = ctsem_laplace_evaluate(laplace, values; gradient=true)
+    @test isapprox(result.value, objective(values); rtol=1e-12)
+    @test isapprox(result.gradient, ctsem_adjoint_gradient(objective, values).gradient; rtol=1e-8)
+end
+
+@testset "the outer Hessian is symmetric and matches the gradient" begin
+    laplace, values = _fresh_linear()
+    H = ctsem_laplace_hessian(laplace, values; step=1e-4)
+    n = length(values)
+    @test size(H) == (n, n)
+    @test H == transpose(H)
+    @test all(isfinite, H)
+
+    # Referee: a directional derivative of the exact gradient.
+    direction = normalize(collect(1.0:n))
+    h = 1e-5
+    gp = ctsem_laplace_evaluate(laplace, values .+ h .* direction; gradient=true).gradient
+    gm = ctsem_laplace_evaluate(laplace, values .- h .* direction; gradient=true).gradient
+    @test norm(H * direction - (gp .- gm) ./ (2h)) / norm(H * direction) < 1e-4
+end
+
+@testset "the outer Hessian's columns alone are its columns" begin
+    laplace, values = _fresh_linear()
+    n = length(values)
+    cols = [2, n]
+    full = ctsem_laplace_hessian(laplace, values; step=1e-4)
+    some = ctsem_hessian_columns(laplace, values, cols)
+    @test size(some) == (n, length(cols))
+    # The full matrix is the symmetrised one; columns are differenced alone.
+    @test all(isapprox.(some, full[:, cols]; rtol=1e-5, atol=1e-8))
+end
+
+@testset "the outer Hessian is differenced over the units that read each parameter" begin
+    # Three indicators, the second never observed for the odd subjects and the
+    # third never for the even ones: the odd subjects' units do not read the
+    # second's intercept (6) or error (7), the even ones' not the third's (8,
+    # 9), so those columns are differenced over half the units each, and a
+    # column of the second's shares its points with one of the third's
+    # (`_ctsem_local_colours`). The third loads no state, and subject 1
+    # observes it at exactly its intercept: at `values` that unit's score in 8
+    # is zero though it reads it, with curvature there, which only the moved
+    # point of `_laplace_hessian_readers` shows. A prior and unequal subject
+    # weights make the columns from scores add what the gradient adds. Nothing
+    # about the matrix may change.
+    df = _laplace_test_dataframe(
+        drift=[-0.5;;], jax=[-0.5;;], cint=[0.0;;], diffusion=[0.2;;],
+        lambda=[1.0; 0.8; 0.0;;], jy=[1.0; 0.8; 0.0;;],
+        manifestmeans=[0.0; 0.0; 0.0;;], manifestvar=[0.3 0.0 0.0; 0.0 0.3 0.0;
+            0.0 0.0 0.3], t0var=[0.4;;], t0means=[0.0;;],
+        free=Dict(
+            (:T0MEANS, 1, 1) => (1, "param[1]"),
+            (:CINT, 1, 1) => (2, "param[2]"),
+            (:DRIFT, 1, 1) => (3, "-log1p_exp(param[3])"),
+            (:JAx, 1, 1) => (3, "-log1p_exp(param[3])"),
+            (:DIFFUSION, 1, 1) => (4, "log1p_exp(param[4])"),
+            (:MANIFESTMEANS, 1, 1) => (5, "param[5]"),
+            (:MANIFESTMEANS, 2, 1) => (6, "param[6]"),
+            (:MANIFESTVAR, 2, 2) => (7, "log1p_exp(param[7])"),
+            (:MANIFESTMEANS, 3, 1) => (8, "param[8]"),
+            (:MANIFESTVAR, 3, 3) => (9, "log1p_exp(param[9])"),
+        ))
+    sp = ekf_from_data_frame(df)
+    starts, times, data = _laplace_test_data(6, 3)
+    stops = vcat(starts[2:end] .- 1, size(data, 2))
+    for s in 1:6
+        data[isodd(s) ? 2 : 3, starts[s]:stops[s]] .= NaN
+    end
+    data[3, starts[1]:stops[1]] .= 0.0
+    objective = ctsem_objective(sp, starts, times, data, zeros(0, size(data, 2));
+        prior_index=collect(1:12), prior_scale=fill(2.0, 12),
+        subject_weights=[1.0, 2.0, 0.5, 1.0, 1.5, 1.0])
+    laplace = ctsem_laplace_objective(objective, [1, 2], [10, 11], [12], [1.0, 1.0])
+    values = [0.2, -0.1, 0.3, -0.2, 0.05, -0.05, 0.1, 0.0, 0.2, -0.3, -0.15, 0.4]
+    scores = ContinuousTimeSEM.ctsem_subject_gradients(laplace, values;
+        prior=false).scores
+    # What the localised columns rely on: exactly zero where a unit does not
+    # read the parameter, and not elsewhere -- but for subject 1's symmetry.
+    @test count(iszero, scores[:, 6]) == 3
+    @test count(iszero, scores[:, 7]) == 3
+    @test count(iszero, scores[:, 9]) == 3
+    @test count(iszero, scores[:, 5]) == 0
+    @test iszero(scores[1, 8]) && count(iszero, scores[:, 8]) == 4
+    readers = ContinuousTimeSEM._laplace_hessian_readers(laplace, values, scores,
+        collect(1:12), laplace.inner_maxiter, 2, nothing, 1e-4)
+    @test readers == (scores .!= 0) .| [U == 1 && j == 8 for U in 1:6, j in 1:12]
+    localised = ctsem_laplace_hessian(laplace, values)
+    full = ctsem_laplace_hessian(laplace, values; localised=false)
+    @test all(isfinite, localised)
+    @test localised ≈ full rtol = 1e-8
+    # Columns asked for alone take the same route; 6 and 8 share their points.
+    some = ctsem_hessian_columns(laplace, values, [6, 7, 8])
+    @test all(isapprox.(some, full[:, [6, 7, 8]]; rtol=1e-5, atol=1e-8))
+    @test ContinuousTimeSEM._laplace_hessian_columns(laplace, values, [6, 8]) ≈
+        ContinuousTimeSEM._laplace_hessian_columns(laplace, values, [6, 8];
+            localised=false) rtol = 1e-8
+    # And without the warm start, which leaves the base modes unstored.
+    cold = ctsem_laplace_hessian(laplace, values; warm=false)
+    @test cold ≈ full rtol = 1e-6
+    # The local curvature's columns (`_ctsem_local_columns`), forward
+    # differences of the minimised objective's, from the scores at `values`,
+    # to a forward difference's accuracy (0.002 in 2.5 at its step): read off
+    # those scores alone, subject 1's share of 8 is lost.
+    S = zeros(6, 12)
+    ctsem_laplace_evaluate(laplace, values; gradient=true, scores=S)
+    near = ContinuousTimeSEM._ctsem_local_columns(laplace, values, [6, 8], S;
+        readers=readers)
+    @test all(isapprox.(near, -full[:, [6, 8]]; rtol=1e-2, atol=1e-6))
+    blind = ContinuousTimeSEM._ctsem_local_columns(laplace, values, [6, 8], S)
+    @test !isapprox(blind[8, 2], -full[8, 8]; rtol=0.05)
+end
+
+@testset "an unusable inner curvature is reported, not hidden" begin
+    laplace, values = _fresh_linear()
+    # A population scale driven to essentially zero makes the random effects
+    # unidentified; the run must still produce a finite value and say what
+    # happened, rather than returning a silently meaningless number.
+    degenerate = copy(values)
+    degenerate[laplace.spec.levels[1].sd_index] .= -40.0
+    result = ctsem_laplace_evaluate(laplace, degenerate; gradient=false)
+    @test isfinite(result.value)
+    diagnostics = ctsem_laplace_diagnostics(laplace)
+    @test length(diagnostics.converged) == length(laplace.objective.subject_objectives)
+    @test all(isfinite, diagnostics.max_gradient)
+end

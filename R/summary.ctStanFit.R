@@ -1,3 +1,68 @@
+priorchecker <- function(sf,pars=c('rawpopmeans','rawpopsdbase','tipredeffectparams'),digits=2){
+  e=ctExtract(sf)
+  funcs <- c(base::mean,stats::sd)
+  pars=unlist(lapply(pars,function(x) if(!is.null(dim(e[[x]]))) x))
+  out=round(do.call(cbind,lapply(funcs, function(fn) do.call(c,
+    lapply(pars, function(obji) apply(e[[obji]],2,fn,na.rm=TRUE)) ))),digits)
+  rownames(out)=do.call(c,c(lapply(pars, function(obji) paste0(obji,'_',1:ncol(e[[obji]])))))
+  out=data.frame(out,do.call(c,c(lapply(pars, function(obji) 1:ncol(e[[obji]])))))
+  out=data.frame(out,do.call(c,c(lapply(pars, function(obji) rep(obji, ncol(e[[obji]]))))),stringsAsFactors = FALSE)
+  colnames(out)=c('mean','sd', 'param', 'object')
+  
+  
+  getparnamesfromraw <- function(priorcheck, sf){
+    newnames=rownames(priorcheck)
+    for(ni in 1:nrow(priorcheck)){
+      if(priorcheck$object[ni] %in% 'rawpopmeans'){
+        newnames[ni]=paste0('rawpop_',sf$setup$popsetup$parname[sf$setup$popsetup$param %in% priorcheck$param[ni]][1])
+      }
+      if(priorcheck$object[ni] %in% 'tipredeffectparams'){
+        newnames[ni]=paste0('rawtipredeffect_',paste0(
+          which(sf$standata$TIPREDEFFECTsetup == priorcheck$param[ni],arr.ind = TRUE),collapse='_'))
+      }
+    }
+    return(newnames)
+  }
+  
+  rownames(out) = getparnamesfromraw(priorcheck=out,sf=sf)
+  return(out)
+}
+
+ctFitgetparnamesfromraw <- function(sf){
+  names=list()
+  ms <- sf$setup$matsetup
+  names$popmeans <- unique(ms$parname[ms$when==0 & ms$param > 0 & ms$copyrow ==0])
+  nvarying <- sum(.ctVaryingRows(sf$ctstanmodelbase, 'indvarying'))
+  if(nvarying > 0){
+    names$popsd <- paste0(ms$parname[ms$when==0 & ms$param > 0 & ms$copyrow == 0 & ms$indvarying > 0],'_SD')
+  } 
+  if(nvarying > 1){
+    popcorrmat <- matrix(paste0(gsub('_SD','',rep(names$popsd,times=length(names$popsd))), '_', gsub('_SD','',rep(names$popsd,each=length(names$popsd))),'_corr'),ncol=length(names$popsd),nrow=length(names$popsd))
+    names$popcorr <- as.vector(popcorrmat[lower.tri(popcorrmat)])
+  } 
+  
+  if(sf$ctstanmodelbase$n.TIpred > 0){
+    names$tipreds <- sapply(sf$standata$TIPREDEFFECTsetup[sf$standata$TIPREDEFFECTsetup!=0],function(x){
+      index <- which(sf$standata$TIPREDEFFECTsetup == x,arr.ind = TRUE)
+      paste0('rawtipredeffect_',paste0(
+        names$popmeans[index[1]],'_',sf$ctstanmodelbase$TIpredNames[index[2]]))
+    })
+  }
+  return(names)
+  
+}
+
+
+priorcheckreport <- function(sf, meanlim = 2, sdlim= .2,digits=2){
+  p=priorchecker(sf)
+  ps=sf$setup$popsetup
+  p=p[abs(p$mean) > meanlim | p$sd > sdlim,]
+  out<-p[,c('mean','sd')]
+  return(out)
+}
+
+
+
 ctStanRawSamples<-function(fit){
   if(length(fit$stanfit$stanfit@sim)==0) {
     samples = fit$stanfit$rawposterior
@@ -8,27 +73,232 @@ ctStanRawSamples<-function(fit){
 }
 
 
-#' Extract an array of subject specific parameters from a ctStanFit object.
+
+#' ctSummaryMatrices
 #'
-#' @param fit fit object
+#' Summarise model-implied parameter matrices from a ctsem fit object.
+#' \code{ctStanContinuousPars} is maintained as a backward-compatible alias.
+#'
+#'@param fit fit object from \code{\link{ctFit}}
+#'@param calcfunc Function to apply over samples, must return a single value. 
+#'By default the median over all samples is returned using the \code{\link[stats]{quantile}} function, 
+#'but one might also be interested in the \code{\link[base]{mean}} or \code{\link[stats]{sd}}, for instance.
+#'@param calcfuncargs A list of additional parameters to pass to calcfunc. 
+#'For instance, with the default of calcfunc = quantile, 
+#'the probs argument is needed to ensure only a single value is returned.
+#'@param timeinterval time interval for discrete time parameter matrix computation.
+#'@param state The latent state at which state dependent matrix cells are
+#'evaluated: \code{'T0MEANS'} (the default), \code{'mean'}, \code{'asymptotic'},
+#'or a numeric state vector. Only \code{backend='julia'} can materialise the
+#'matrices anywhere other than the default, so anything else is an error on a
+#'stan fit rather than being silently ignored. Irrelevant to a linear model,
+#'whose matrices are the same everywhere.
+#'@param ... arguments passed to the method for the fit's backend.
+#'@examples
+#'\donttest{
+#'#posterior median over all subjects (also reflects mean of unconstrained pars)
+#'ctSummaryMatrices(ctstantestfit)
+#'}
+#'@return A named list of matrices, each summarised over the posterior (or
+#'approximate posterior) draws by \code{calcfunc}: the model's own
+#'(\code{DRIFT}, \code{DIFFUSION}, \code{LAMBDA}, ...), the covariances
+#'built from them (\code{DIFFUSIONcov}, \code{MANIFESTcov}, and \code{T0cov},
+#'the initial latent covariance over subjects: \code{T0VAR} plus the
+#'population covariance of any individually varying \code{T0MEANS}), the
+#'asymptotic \code{asymCINT} and \code{asymDIFFUSIONcov}, and
+#'\code{dtDRIFT} at \code{timeinterval}. Where parameters vary over subjects,
+#'also their population covariance on the natural scale, \code{popcov}, and
+#'their raw-scale correlations, \code{rawpopcorr}, named by parameter (with
+#'several grouping levels, \code{popcov.<level>} and \code{rawpopcorr.<level>}).
+#'\code{popcov} combines the sds \code{summary()} reports as \code{popsd} with
+#'those correlations, so it is exact where a parameter's transform is affine,
+#'as for intercepts and initial means.
+#'
+#'On an optimised fit, \code{estimate} holds the same matrices at the fit's
+#'estimate, unrounded: \code{ctSummaryMatrices(fit)$estimate$DRIFT} is the
+#'estimated drift matrix, which a summary of the draws need not equal. A
+#'\code{backend='stan'} fit's has no \code{popcov}, which stan simulates.
+#'@aliases ctStanContinuousPars
+#'@export
+# `state` is part of the generic, not an extra the julia method happens to
+# accept. It used to reach ctSummaryMatrices.ctStanFit() through `...` and be
+# dropped there, so the same call reported the matrices at a caller-chosen state
+# on julia and at T0MEANS on stan, with nothing said either way -- the worst
+# available outcome for the one argument whose whole purpose is to say where a
+# number came from. Declaring it here forces every method to answer for it.
+ctSummaryMatrices <- function(fit,
+  calcfunc=quantile, calcfuncargs=list(probs=0.5), timeinterval=1,
+  state=NULL, ...) UseMethod("ctSummaryMatrices")
+
+#' @export
+ctSummaryMatrices.ctStanFit <- function(fit,
+  calcfunc=quantile,calcfuncargs=list(probs=0.5),timeinterval=1, state=NULL, ...){
+
+  if(!'ctStanFit' %in% class(fit)) stop(paste0('Not an object of class ctStanFit! Instead is ',paste0(class(fit),collapse=', ')))
+  .ctContextRequireStateSupport(fit, state)
+
+  # The collapse itself lives in .ctSummaryMatricesFromArrays (ctBackendSummary.R)
+  # so that the stan and julia backends summarise identical pop_* arrays with
+  # identical code rather than with two copies that can drift; the population
+  # covariance and correlations likewise (.ctSummaryPopulationMatrices), named
+  # by parameter as the julia method names them.
+  ms <- ctMatsetupFreePars(fit$setup$matsetup)
+  ms <- ms[ms$indvarying > 0, , drop = FALSE]
+  popnames <- ms$parname[order(ms$indvarying)]
+  at <- function(e, calcfunc, calcfuncargs) {
+    for (name in c('popcov', 'rawpopcorr')) {
+      if (length(dim(e[[name]])) == 3L && dim(e[[name]])[2L] == length(popnames))
+        dimnames(e[[name]]) <- list(NULL, popnames, popnames)
+    }
+    c(.ctSummaryMatricesFromArrays(e,
+      continuoustime = fit$ctstanmodel$continuoustime,
+      latentNames = fit$ctstanmodel$latentNames,
+      manifestNames = fit$ctstanmodel$manifestNames,
+      TDpredNames = fit$ctstanmodel$TDpredNames,
+      calcfunc = calcfunc, calcfuncargs = calcfuncargs, timeinterval = timeinterval),
+      .ctSummaryPopulationMatrices(e, calcfunc, calcfuncargs))
+  }
+  out <- at(ctExtract(fit,cores=1), calcfunc, calcfuncargs)
+  # The matrices at an optimised fit's estimate, unrounded, as the julia method
+  # gives them -- without popcov, which stan simulates at each point: two calls
+  # gave covariances 0.35 apart, which is no estimate.
+  if (length(fit$stanfit$stanfit@sim) == 0L && length(fit$stanfit$rawest)) {
+    estimate <- stan_constrainsamples(sm = fit$stanmodel, standata = fit$standata,
+      samples = matrix(fit$stanfit$rawest, nrow = 1L), cores = 1L,
+      savescores = FALSE, savesubjectmatrices = FALSE, dokalman = FALSE, quiet = TRUE)
+    estimate$popcov <- NULL
+    out$estimate <- at(estimate, mean, list())
+  }
+  .ctContextMessage(fit, .ctContextPopLabel)
+  .ctContextAttach(out, fit)
+}
+
+#' @export
+ctStanContinuousPars <- ctSummaryMatrices
+
+
+
+
+#' Extract an array of subject specific parameters from a fit
+#'
+#' Extract an array of subject specific parameters from a fit from
+#' \code{\link{ctFit}}, on either backend.
+#' \code{ctStanSubjectPars} is maintained as a backward-compatible alias.
+#'
+#' @param fit A fit from \code{\link{ctFit}}.
 #' @param pointest if TRUE, returns only the set of individual difference parameters
 #' based on the max a posteriori estimate (or the median if sampling approaches were used).
-#' @param cores Number of cores to use.
+#' @param cores Number of cores to use. \code{backend='stan'} only -- a julia fit already
+#' carries the subject matrices, so there is nothing here to split, and \code{cores} is refused
+#' by name rather than accepted and ignored.
 #' @param nsamples Number of samples to calculate parameters for. Not used if pointest=TRUE.
-#' 
-#' @details This function returns the estimates of individual parameters, taking into account any
-#' covariates and random effects. 
+#' @param level For a model with nested ids (\code{id = c('person', 'couple')}
+#' in \code{\link{ctModel}}), the level to report: the subject level (the
+#' default, the first id) or a grouping level above it, which gives each
+#' group's own parameter values -- the population values shifted by that
+#' group's random effects and those of the levels above it, without the
+#' subject-level ones or TI predictor effects. Grouping levels need a
+#' \code{backend='julia'} fit; their draws take \code{uncertainty} as a
+#' subject's do.
+#' @param uncertainty For \code{backend='julia'} fits with \code{pointest=FALSE}:
+#' what the draws carry. \code{'total'} (the default) pairs each draw of the
+#' population parameters with a draw of each subject's random effects from their
+#' posterior given that subject's data -- plausible values, whose spread is both
+#' the population parameters' uncertainty and how well the subject's own data
+#' determine its parameters. \code{'conditional'} keeps the population
+#' parameters at the estimate and draws only the subject's effects;
+#' \code{'population'} varies only the population parameters, with each subject
+#' at its estimate given them, which understates a subject's uncertainty
+#' whenever its own data say little. A fit that sampled its random effects
+#' (\code{optimize=FALSE}) already has draws of both, so only \code{'total'}
+#' applies there.
 #'
-#' @return an nsamples by nsubjects by nparams array.
+#' @details This function returns the estimates of individual parameters, taking into account any
+#' covariates and random effects, at every level of a nested model.
+#'
+#' A julia fit also stores, for every level with random effects, each group's
+#' conditional posterior of its effects on the raw parameter scale --
+#' \code{fit$randomeffects}, one entry per level with the groups' \code{mean}
+#' deviation from the population value and their covariance packed column by
+#' column (\code{cov}). The draws with \code{uncertainty='total'} are built from
+#' the same posterior.
+#'
+#' @return an nsamples by nsubjects by nparams array, with the subjects (or
+#' groups, for a grouping \code{level}) labelled by their ids in the data.
+#' @aliases ctStanSubjectPars
 #' @export
 #'
 #' @examples
-#' indpars <- ctStanSubjectPars(ctstantestfit)
+#' indpars <- ctSubjectPars(ctstantestfit)
 #' dimnames(indpars)
 #' plot(indpars[1,,'cint1'],indpars[1,,'cint2'])
-ctStanSubjectPars <- function(fit,pointest=TRUE,cores=2,nsamples='all'){
-  
-  if(!nsamples[1] %in% 'all') fit$stanfit$rawposterior <- 
+ctSubjectPars <- function(fit,pointest=TRUE,cores=getOption("mc.cores", 2L),nsamples='all',level=NULL,
+  uncertainty=NULL){
+
+  # `cores` is a stan-path argument: with pointest=FALSE it is handed to
+  # ctExtract() to rebuild the subject matrices across R worker processes.
+  # .ctBackendSubjectPars() has no such parameter -- it reads the arrays the
+  # julia fit already carries -- so a `cores` given here reached nothing.
+  # Refused rather than honoured: there is no per-sample work on this path to
+  # split, so honouring it would mean accepting it and doing nothing, which is
+  # what this refusal exists to stop. Before the conflated-cell warning below,
+  # so a rejected call does not also emit a warning about a result it will not
+  # produce.
+  if(.ctFitIsJulia(fit) && !missing(cores)) stop(
+    "ctSubjectPars(cores=) is only available for backend='stan' fits: it ",
+    "splits ctExtract()'s subject-matrix reconstruction across R worker ",
+    "processes, and a julia fit already carries those arrays. Drop it -- ",
+    "ctFit(cores=) is where the julia engine takes a thread count.",
+    call.=FALSE)
+  if(!is.null(uncertainty)){
+    if(!.ctFitIsJulia(fit)) stop("ctSubjectPars(uncertainty=) is for ",
+      "backend='julia' fits. A stan fit's draws vary the population parameters, ",
+      "and with intoverpop each subject's own uncertainty is ctKalman()'s ",
+      "smoothed covariance of its individually varying states.", call.=FALSE)
+    uncertainty <- match.arg(uncertainty, c('total', 'conditional', 'population'))
+    if(isTRUE(pointest)) stop("uncertainty describes draws; use pointest=FALSE ",
+      "with it.", call.=FALSE)
+  }
+
+  # A cell that reads a carrier state *is* that subject's parameter, and the
+  # last row is the fully informed estimate of it -- nothing to warn about, and
+  # nothing here evaluates it anywhere else. A cell that reads a carrier state
+  # *and* something dynamic is the exception: its last-row value conflates the
+  # individual difference with wherever that subject's trajectory ended.
+  conflated <- .ctContextConflatedCells(fit)
+  if(nrow(conflated)) warning(call.=FALSE, paste0(
+    'Cells of ', paste0(unique(conflated$matrix),collapse=', '),
+    ' reference both an individually varying parameter and the latent state or a ',
+    'time dependent predictor. Their values here mix the individual difference ',
+    'with the state at each subject\'s last observed row, and are not subject ',
+    'parameters. Read them with ctSummaryMatrices() at an explicit evaluation ',
+    'point instead.'))
+
+  # A grouping level reports each group's own values; the subject level is
+  # what the rest of this function computes.
+  if(!is.null(level)){
+    base <- .ctFitBaseModel(fit)
+    levels <- c(base$subjectIDname, base$groupIDnames)
+    if(length(level) != 1L || !level %in% levels) stop("level must be one of ",
+      "this model's id levels: ", paste(levels, collapse=', '), call.=FALSE)
+    if(!identical(level, levels[1L])){
+      if(!.ctFitIsJulia(fit) || is.null(.ctBackendSpec(fit)$laplace)) stop(
+        "ctSubjectPars(level=) for a grouping level needs a backend='julia' fit ",
+        "with nested ids.", call.=FALSE)
+      return(.ctBackendGroupPars(fit, level, pointest=pointest,
+        nsamples=nsamples,
+        uncertainty=if(is.null(uncertainty)) 'total' else uncertainty))
+    }
+  }
+
+  # backend='julia' fits reach the same quantity by the same route -- the
+  # subject matrices ctExtract() returns -- but reach the model metadata through
+  # the spec rather than through matsetup; see R/ctBackendSummary.R.
+  if(.ctFitIsJulia(fit)) return(.ctSubjectParsLabel(.ctBackendSubjectPars(fit,
+    pointest=pointest, nsamples=nsamples,
+    uncertainty=if(is.null(uncertainty)) 'total' else uncertainty), fit))
+
+  if(!nsamples[1] %in% 'all') fit$stanfit$rawposterior <-
       fit$stanfit$rawposterior[sample(1:nrow(fit$stanfit$rawposterior),nsamples),,drop=FALSE]
   pnames <- getparnames(fit,subjvariationonly = TRUE)
   if(length(pnames)==0) stop('No individually varying parameters in model!')
@@ -52,16 +322,34 @@ ctStanSubjectPars <- function(fit,pointest=TRUE,cores=2,nsamples='all'){
     }
   }
   p=p[,,order(dimnames(p)[[3]]),drop=FALSE]
-  return(p)
+  return(.ctSubjectParsLabel(p, fit))
 }
+
+# Subjects labelled by their ids in the data rather than by their position --
+# which is all the second dimension said before, and which for a nested id
+# such as '1005_1' names nothing a user can find.
+.ctSubjectParsLabel <- function(p, fit) {
+  ids <- try(as.character(.ctFitIdMap(fit)$original), silent = TRUE)
+  if (inherits(ids, 'try-error') || length(ids) != dim(p)[2L]) return(p)
+  dn <- dimnames(p)
+  if (is.null(dn)) dn <- list(iter = NULL, subject = NULL, param = NULL)
+  dn[[2L]] <- ids
+  dimnames(p) <- dn
+  p
+}
+
+#' @export
+ctStanSubjectPars <- ctSubjectPars
 
 
 getparnames <- function(fit,reonly=FALSE, subjvariationonly=FALSE, popstatesonly=FALSE){
   ms <- fit$setup$matsetup
   
   if(popstatesonly)  indices=ms$param > 0 & ms$copyrow <1 & ms$matrix==1 & ms$indvarying > 0 & ms$row > fit$standata$nlatent
-  if(!popstatesonly)  indices=ms$when %in% c(0,-1) & ms$param > 0 & ms$copyrow < 1
-  if(subjvariationonly) indices = ms$when %in% c(0,-1) & ms$param > 0 & ms$copyrow < 1 & (ms$tipred >0 | ms$indvarying > 0)
+  # The `parname` test is this caller's own: a bracketed name is a state or
+  # tdpred reference rather than something to report as a parameter.
+  if(!popstatesonly)  indices=.ctMatsetupFreeRows(ms, defining = TRUE) & !grepl('[',ms$parname,fixed=TRUE)
+  if(subjvariationonly) indices = .ctMatsetupFreeRows(ms, defining = TRUE, varying = TRUE)
   pars <- data.frame(parnames = ms$parname[indices],  parindices = ms$param[indices])
   
   pars<-pars[!duplicated(pars$parnames),]
@@ -72,29 +360,37 @@ getparnames <- function(fit,reonly=FALSE, subjvariationonly=FALSE, popstatesonly
   return(parnames)
 }
 
-#' summary.ctStanFit
+#' Summarise a ctsem fit
 #'
-#' Summarise a ctStanFit object that was fit using \code{\link{ctStanFit}}. 
-#' 
-#' @param object fit object from \code{\link{ctStanFit}}, of class ctStanFit.
+#' Summarise a fit from \code{\link{ctFit}}, on either backend: population
+#' parameters with their uncertainty, random-effect spreads and correlations,
+#' time independent predictor effects, the parameter matrices, and the log
+#' likelihood and AIC.
+#'
+#' @param object fit object from \code{\link{ctFit}}, of class \code{ctStanFit}
+#' or \code{ctJuliaFit}.
 #' @param timeinterval positive numeric indicating time interval to use for discrete time parameter calculations
-#' reported in summary. 
+#' reported in summary.
 #' @param digits integer denoting number of digits to report.
 #' @param parmatrices if TRUE, also return additional parameter matrices -- can be slow to compute
 #' for large models with many samples.
-#' @param priorcheck Whether or not to use \code{ctsem:::priorchecking} to compare posterior mean and sd to prior mean and sd.
+#' @param priorcheck Whether or not to use \code{priorchecking} to compare
+#'   posterior mean and sd to prior mean and sd. \code{backend='stan'} only: a
+#'   julia fit carries no prior block to compare against, and refuses
+#'   \code{priorcheck = TRUE} given explicitly.
 #' @param residualcov Whether or not to show standardised residual covariance. Takes a little longer to compute.
-#' @param ... Additional arguments to pass to \code{ctsem:::priorcheckreport}, such as \code{meanlim}, or \code{sdlim}.
-#' @return List containing summary items.
+#' @param ... Additional arguments to pass to \code{priorcheckreport}, such as \code{meanlim}, or \code{sdlim}.
+#' @return List containing summary items, with a \code{print} method for readable console and knitr output.
+#'   On an optimised \code{backend = 'julia'} fit with uncertainty draws, the
+#'   parameter tables and \code{parmatrices} carry a \code{mode} column beside
+#'   the draws' mean, sd and quantiles: the fit's estimate on the same scale,
+#'   the point a likelihood ratio or an information criterion refers to.
 #' @examples
-#' if(w32chk()){
-#'
 #' summary(ctstantestfit)
-#' }
 #' @method summary ctStanFit
 #' @export
 
-summary.ctStanFit<-function(object,timeinterval=1,digits=4,parmatrices=TRUE,priorcheck=TRUE,residualcov = TRUE,...){
+summary.ctStanFit<-function(object,timeinterval=1,digits=3,parmatrices=TRUE,priorcheck=TRUE,residualcov = TRUE,...){
   
   if(!'ctStanFit' %in% class(object)) stop('Not a ctStanFit object!')
   
@@ -103,7 +399,6 @@ summary.ctStanFit<-function(object,timeinterval=1,digits=4,parmatrices=TRUE,prio
     class(out) <- 'data.frame'
     return(out)
   }
-  
   
   out=list()
   monvars <- c('mean','sd','2.5%','50%','97.5%')
@@ -119,16 +414,15 @@ summary.ctStanFit<-function(object,timeinterval=1,digits=4,parmatrices=TRUE,prio
   e <- ctExtract(object) 
   
   if(residualcov){ #cov of residuals
-    obscov <- cov(object$data$Y,use='pairwise.complete.obs')
-    idobscov <- diag(1/sqrt(diag(obscov)),ncol(obscov))
-    rescov <- cov(matrix(object$stanfit$kalman$errprior,ncol=ncol(obscov)),use='pairwise.complete.obs')
-    narescov <- which(is.na(rescov))
-    rescov[narescov] <- 0
-    
-    out$residCovStd <- round(idobscov %*% rescov %*% idobscov ,3)
-    out$residCovStd[narescov] <- NA
-    dimnames(out$residCovStd) <- list(object$ctstanmodel$manifestNames,object$ctstanmodel$manifestNames)
-    out$resiCovStdNote <- 'Standardised covariance of residuals'
+    # Shared with the julia backend (.ctBackendResidCovStd in ctBackendSummary.R)
+    # rather than recomputed here -- same algorithm, reached through the
+    # backend-neutral accessors, and it also carries the conditioning note the
+    # julia summary already reports.
+    residCovStd <- .ctBackendResidCovStd(object, digits = digits)
+    if(!is.null(residCovStd)){
+      out$residCovStd <- residCovStd
+      out$residCovStdConditioning <- attr(residCovStd, 'conditioning')
+    }
   }
   
   ms=object$setup$matsetup
@@ -157,12 +451,16 @@ summary.ctStanFit<-function(object,timeinterval=1,digits=4,parmatrices=TRUE,prio
       colnames(rawpopcorrout)[ncol(rawpopcorrout)] <- 'z'
       
       out$rawpopcorr = round(rawpopcorrout,digits)
+      out$rawpopcorrNote = 'These reflect correlations between the raw / unconstrained parameters.'
     }
   }
   
-  if(priorcheck & object$standata$nopriors==0) {
+  if(priorcheck && object$standata$priors) {
     priorcheckres <- priorcheckreport(object,...)
-    if(nrow(priorcheckres$priorcheck) > 0) out = c(out,priorcheckres)
+    if(nrow(priorcheckres) > 0){
+      out$priorcheck=priorcheckres
+      out$priorcheckNote='These posteriors exceeded arbitrary limits re normal(0,1) -- priors / transforms are likely somewhat informative (Not necessarily a problem).'
+    }
   }
   
   if(object$ctstanmodel$n.TIpred > 0) {
@@ -180,26 +478,43 @@ summary.ctStanFit<-function(object,timeinterval=1,digits=4,parmatrices=TRUE,prio
     tipreds <- tipreds[c(object$data$TIPREDEFFECTsetup)>0,,drop=FALSE]
     z = tipreds[,'mean'] / tipreds[,'sd'] 
     out$tipreds= round(cbind(tipreds,z),digits) #[order(abs(z)),]
+    out$tipredsNote = 'Approximate (linearised) effects on the transformed parameters.'
   }
   
   
   
   if(parmatrices){
-    Mean=ctStanContinuousPars(object,calcfunc = mean,calcfuncargs=list(),timeinterval=timeinterval)
-    sd=ctStanContinuousPars(object,calcfunc = sd,calcfuncargs = list(na.rm=TRUE),timeinterval=timeinterval)
-    `2.5%` = ctStanContinuousPars(object,calcfunc = quantile,calcfuncargs = list(probs=.025),timeinterval=timeinterval)
-    `50%` = ctStanContinuousPars(object,calcfunc = quantile,calcfuncargs = list(probs=.5),timeinterval=timeinterval)
-    `97.5%` = ctStanContinuousPars(object,calcfunc = quantile,calcfuncargs = list(probs=.975),timeinterval=timeinterval)
+    # Five collapses of the draws already extracted, as the julia summary
+    # does: the model's matrices only (ctSummaryMatrices() adds the population
+    # and the estimate, which summary() reports in sections of their own), and
+    # the context note is emitted once here as a summary section.
+    collapse <- function(calcfunc, calcfuncargs) {
+      .ctSummaryMatricesFromArrays(e,
+        continuoustime = object$ctstanmodel$continuoustime,
+        latentNames = object$ctstanmodel$latentNames,
+        manifestNames = object$ctstanmodel$manifestNames,
+        TDpredNames = object$ctstanmodel$TDpredNames,
+        calcfunc = calcfunc, calcfuncargs = calcfuncargs, timeinterval = timeinterval)
+    }
+    Mean=collapse(mean, list())
+    sd=collapse(stats::sd, list(na.rm=TRUE))
+    `2.5%` = collapse(quantile, list(probs=.025))
+    `50%` = collapse(quantile, list(probs=.5))
+    `97.5%` = collapse(quantile, list(probs=.975))
     
     d <- data.frame(ctModelUnlist(Mean,matnames = names(Mean)))
     colnames(d)[colnames(d) %in% 'value'] <- 'Mean'
-    lapply(c('sd','2.5%','50%','97.5%'),function(x) d[[x]] <<-round(ctModelUnlist(get(x),names(Mean))$value,digits))
+    lapply(c('sd','2.5%','50%','97.5%'),function(x){
+      d[[x]] <<-round(ctModelUnlist(get(x),names(Mean))$value,digits)
+      })
     d$param <- NULL
     d$Mean <- round(d$Mean,digits)
     rm(sd)
     d <- d[!d$matrix %in% c('DIFFUSION','T0VAR'),]
-    
+
     out$parmatrices=d
+    out$parmatNote <- .ctContextNote(.ctFitConditionalCells(object),
+      .ctContextPopLabel, .ctContextRemedy(object))
   }
   
   
@@ -240,24 +555,184 @@ summary.ctStanFit<-function(object,timeinterval=1,digits=4,parmatrices=TRUE,prio
   
   out$popmeans=round(popmeans,digits=digits)
   
-  out$popNote=paste0('popmeans are reported as specified in ctModel -- covariance related matrices are in sd / unconstrained correlation form -- see $parmatrices for simpler interpretations!')
+  out$popNote=paste0('covariance pars in sd / unconstrained cor form, see System Matrices (or ctSummaryMatrices function) for cor/cov.')
   
+  out$logposterior=logposterior
   if(optimize) {
-    
+    # Identical whenever there are no priors -- the print method (not this
+    # builder) skips the duplicate row, so summary(fit)$loglik is always
+    # present. See summaryCtStanFitLoglikDuplicatesPosterior() below.
     out$loglik=loglik
     out$npars = npars
     out$aic = aic
   }
-  out$logposterior=logposterior
-  if(optimize) out$nsamples <- nrow(object$stanfit$samples)
-  
-  if(!parmatrices) out$parmatNote <- 'For additional summary matrices, use argument: parmatrices = TRUE'
-  
+
+  # `Number of samples` on an optimised fit meant the uncertainty draws, and
+  # read as MCMC samples. Named for what it is.
+  if(optimize) out$ndraws <- nrow(object$stanfit$samples)
+
   out <- lapply(out,function(x){
     if('matrix' %in% class(x)){
       x <- data.frame(x,check.names=FALSE)
     }
+    x <- roundSummaryCtStanFitValue(x,digits=digits)
     x})
   
+  attr(out,'digits') <- digits
+  class(out) <- 'summary.ctStanFit'
   return(out)
+}
+
+roundSummaryCtStanFitValue <- function(x,digits){
+  if(is.data.frame(x)){
+    for(col in seq_along(x)){
+      if(is.numeric(x[[col]])) x[[col]] <- round(x[[col]],digits)
+    }
+    return(x)
+  }
+  
+  if(is.numeric(x)) return(round(x,digits))
+  x
+}
+
+summaryCtStanFitLabel <- function(x){
+  labels <- c(
+    residCovStd = 'Standardised residual covariance',
+    residCovStdConditioning = 'Note',
+    rawpopcorr = 'Random-effects correlations',
+    rawpopcorrNote = 'Note',
+    popsdNote = 'Note',
+    priorcheck = 'Prior check',
+    priorcheckNote = 'Note',
+    tipreds = 'Time-independent predictor effects',
+    tipredsNote = 'Note',
+    smooths = 'Smooth time-independent predictor terms',
+    smoothsNote = 'Note',
+    parmatrices = 'System Matrices',
+    popsd = 'Random-effects standard deviations',
+    popmeans = 'Fixed-effects / Population means',
+    thresholds = 'Ordinal thresholds',
+    thresholdsNote = 'Note',
+    popNote = 'Note',
+    units = 'Units',
+    loglik = 'Log likelihood',
+    loglikNote = 'Note',
+    weights = 'Sampling weights',
+    loglik_weighted = 'Weighted log likelihood (maximised)',
+    npars = 'Number of parameters',
+    aic = 'AIC',
+    logposterior = 'Log posterior',
+    nsamples = 'Number of samples',
+    ndraws = 'Uncertainty draws',
+    backendNote = 'Note',
+    # Not 'Note'. It is the first thing printed and it is the one line that says
+    # whether the tables below it are a posterior at all, so it is labelled for
+    # what it is rather than filed with the footnotes.
+    sampleNote = 'Sampling',
+    uncertaintyNote = 'Note',
+    # The certification's verdict; the field name read as 'optimgap Note'.
+    optimgapNote = 'Convergence',
+    parmatNote = 'Note')
+  if(x %in% names(labels)) return(unname(labels[x]))
+  # A hierarchy names its levels, so a section can be `popsd.study`. The label
+  # is the base label with the level in brackets, which keeps a multilevel
+  # summary readable without a separate print method for it.
+  if(grepl('.', x, fixed=TRUE)){
+    base <- sub('\\..*$', '', x)
+    level <- sub('^[^.]*\\.', '', x)
+    if(base %in% names(labels)) return(paste0(unname(labels[base]), ' (', level, ')'))
+  }
+  gsub('([a-z])([A-Z])', '\\1 \\2', x)
+}
+
+printSummaryCtStanFitValue <- function(x,width,row.names,...){
+  if(is.character(x) && is.null(dim(x))){
+    wrapped <- unlist(strwrap(x,width=width),use.names=FALSE)
+    if(length(wrapped)) cat(paste(wrapped,collapse='\n'),'\n',sep='')
+    return(invisible(x))
+  }
+  
+  if(is.data.frame(x)){
+    print(x,row.names=row.names,...)
+    return(invisible(x))
+  }
+  
+  print(x,...)
+  invisible(x)
+}
+
+summaryCtStanFitIsScalar <- function(x){
+  is.atomic(x) && length(x)==1
+}
+
+summaryCtStanFitIsNote <- function(section){
+  grepl('Note$',section)
+}
+
+printSummaryCtStanFitScalar <- function(label,x,width){
+  prefix <- paste0(label,': ')
+  if(is.character(x)){
+    wrapped <- unlist(strwrap(x,width=width,initial=prefix,exdent=nchar(prefix)),use.names=FALSE)
+    if(length(wrapped)) cat(paste(wrapped,collapse='\n'),'\n',sep='')
+    return(invisible(x))
+  }
+  
+  cat(prefix,format(as.vector(x),trim=TRUE),'\n',sep='')
+  invisible(x)
+}
+
+# Log likelihood and log posterior are identical whenever there are no
+# priors -- true of essentially every default-argument fit, since ctFit()
+# defaults to priors=FALSE. Printing one number twice under two names
+# invites the reader to look for a difference that is not there, so the
+# print method skips the row; the value itself is always returned by
+# summary(). Shared by both summary.ctStanFit() and .ctBackendSummary(),
+# which produce objects of the same print class.
+summaryCtStanFitLoglikDuplicatesPosterior <- function(x){
+  !is.null(x$loglik) && !is.null(x$logposterior) &&
+    isTRUE(all.equal(as.numeric(x$loglik), as.numeric(x$logposterior)))
+}
+
+#' Print ctStanFit summaries
+#'
+#' @param x Object returned by \code{\link{summary.ctStanFit}}.
+#' @param width Console width to use for wrapping note text and formatting tables.
+#' @param sections Optional character vector of summary sections to print.
+#' @param row.names Logical. Print row names for data frame sections?
+#' @param ... Additional arguments passed to \code{\link{print}} for individual sections.
+#' @return Invisibly returns \code{x}.
+#' @method print summary.ctStanFit
+#' @export
+print.summary.ctStanFit <- function(x,width=getOption('width'),sections=names(x),row.names=TRUE,...){
+  defaultsections <- missing(sections)
+  width <- suppressWarnings(as.integer(width)[1])
+  if(is.na(width)) width <- getOption('width')
+  width <- max(20,width)
+  oldwidth <- getOption('width')
+  options(width=width)
+  on.exit(options(width=oldwidth),add=TRUE)
+  
+  sections <- intersect(sections,names(x))
+  # `randomEffects` is the machine-readable payload behind the
+  # `popsd.<level>` and `rawpopcorr.<level>` tables -- one entry per level,
+  # each holding the raw draws. Reachable as `summary(fit)$randomEffects`, but
+  # printing it means thousands of rows of draws ahead of the tables that
+  # summarise them, so it is skipped unless asked for by name.
+  if(defaultsections) sections <- setdiff(sections,'randomEffects')
+  loglikDuplicatesPosterior <- summaryCtStanFitLoglikDuplicatesPosterior(x)
+  for(section in sections){
+    if(identical(section,'loglik') && loglikDuplicatesPosterior) next
+    label <- summaryCtStanFitLabel(section)
+    if(summaryCtStanFitIsScalar(x[[section]])){
+      if(summaryCtStanFitIsNote(section)) cat('\n')
+      printSummaryCtStanFitScalar(label,x[[section]],width=width)
+      if(summaryCtStanFitIsNote(section)) {
+        cat(paste(rep('-',min(width,72)),collapse=''),'\n',sep='')
+      }
+      next
+    }
+    cat('\n',label,'\n',paste(rep('-',nchar(label)),collapse=''),'\n',sep='')
+    printSummaryCtStanFitValue(x[[section]],width=width,row.names=row.names,...)
+  }
+  invisible(x)
 }

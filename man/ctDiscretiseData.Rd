@@ -30,10 +30,14 @@ ctDiscretiseData(
 long format ctsem data.
 }
 \description{
-Extends and rounds timing information so equal intervals, according to specified
-timestep, are achieved. NA's are inserted in other columns as necessary,
-any columns specified by TDpredNames or TIpredNames have zeroes rather than NA's
-inserted (because some estimation routines do not tolerate NA's in covariates).
+Rounds timing information so equal intervals, according to specified
+timestep, are achieved. Each subject's times are moved to the nearest point of a
+grid that starts at the subject's first time; values that land on the same point
+are averaged, with a warning. NA's are inserted in other columns as necessary.
+Any columns specified by TDpredNames have zeroes rather than NA's inserted
+(because some estimation routines do not tolerate NA's in covariates), while
+columns specified by TIpredNames are left as NA's -- since a time independent
+predictor is constant within a subject, inserting zeroes for it would be incorrect.
 }
 \examples{
 long <- ctDiscretiseData(dlong=ctstantestdat, timestep = .1,

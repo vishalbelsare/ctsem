@@ -1,0 +1,801 @@
+"""
+Progress reporting for long fits.
+
+# Why this can exist at all
+
+Output written by the engine reaches the R console *while a call is still
+running* -- JuliaConnectoR forwards the subprocess's output as it arrives rather
+than collecting it at the end. Measured: a Julia function printing once a second
+for six seconds had its first line visible in R after one second and its last
+before the call returned. So a fit can report on itself as it goes, which is the
+only kind of progress report worth having.
+
+# Which stream, and why it matters
+
+`stderr`, through `_console()`, and everything the engine prints to a console
+goes there -- the progress line and the `verbose` messages alike.
+
+JuliaConnectoR redirects both of the subprocess's streams and relays them to the
+R side asynchronously, `stdout` to R's `stdout()` and `stderr` to R's `stderr()`
+(`handleCallbacksAndOutput` and `readOutput` in its `communicating.jl` and R
+sources; the relay adds no newline of its own and strips ANSI escapes, which is
+why the carriage return survives and colour would not).
+
+R's `stderr()` is where `message()` writes, so a front end that styles R's
+messages styles the engine's too -- reported from RStudio, where the engine's
+lines had been arriving as plain white console output alongside grey message
+boxes from the R side of the same fit. The second reason is the one that also
+fixes the in-place line: a console that separates the two streams puts a break
+between them, so a progress line on one stream and a message on the other could
+not share a line however the carriage returns fell. One stream for everything
+the engine says is what makes `_progress_break` mean anything.
+
+# What is reported, and what is not
+
+The rule throughout is that a progress line should answer "is this going to
+finish, and is it going anywhere sensible" -- not "what is the engine doing".
+So the optimiser reports the objective and the gradient norm, because a log
+posterior that has stopped moving while the gradient is still large is a fit in
+trouble; and the sampler reports step size, tree depth and divergences, because
+those are what say whether the draws will be usable before the draws exist.
+
+Updates are on a *time* cadence rather than an iteration one. An iteration
+cadence prints thousands of lines on a fast model and nothing on a slow one,
+which is exactly backwards: the user wants reassurance at a roughly constant
+rate whatever the model costs.
+
+# Threads
+
+With several chains running at once only the first reports, and says so. Lines
+from four threads interleave into something unreadable, and a lock to prevent
+that would serialise the very thing being reported on. One chain's progress is
+representative when the chains are doing the same work.
+"""
+
+using Printf
+
+"""
+    _console()
+
+Where everything the engine prints goes: `stderr`. The file header says why.
+
+A function rather than a `const`, which is load-bearing rather than a
+preference. `stderr` is a global binding that `redirect_stderr()` rebinds, and
+JuliaConnectoR calls it when it starts serving -- so a `const` bound at
+precompile time would hold the stream this module saw while being compiled, and
+every report would be written somewhere nobody is reading. Read at call time it
+is whatever the running session's `stderr` currently is.
+"""
+_console() = stderr
+
+"""Cursor to column zero; see `_emit`."""
+const CARRIAGE = Char(13)   # cursor to column zero
+const NEWLINE = Char(10)
+
+"""
+    CTSEMProgress(enabled; every, label)
+
+A rate-limited reporter. `every` is the minimum seconds between lines.
+"""
+mutable struct CTSEMProgress
+    enabled::Bool
+    every::Float64
+    started::Float64
+    last::Float64
+    label::String
+    lines::Int
+    overwrite::Bool
+    width::Int
+    # Where a line goes instead of being printed: an R function, or `nothing`.
+    # See `_deliver!`.
+    sink::Any
+    # Highest iteration count already shown, so the printed counter never runs
+    # backwards. It did when a fit ran Optim's Hager-Zhang and then a
+    # backtracking fallback whose callback counted from one again: "prior
+    # warm-up 2/10" and then "1/10", which reads as a fit that lost its place.
+    # A resumed L-BFGS stage now continues the count (`iteration0`); the hold
+    # is what guarantees it.
+    shown::Int
+end
+
+# `overwrite` defaults on: a fit reports for as long as it runs, and one line per
+# report turns a five-minute sample into hundreds of lines of scrollback that
+# say nothing the last of them does not. The caller turns it off when the output
+# is going somewhere a carriage return means nothing -- a log file, a knitr
+# chunk, a non-interactive session -- where the same updates should be rarer and
+# on their own lines instead.
+CTSEMProgress(enabled::Bool; every::Real=0.0, label::String="",
+    overwrite::Bool=true, sink=nothing) =
+    CTSEMProgress(enabled, every > 0 ? Float64(every) : (overwrite ? 0.4 : 5.0),
+        time(), 0.0, label, 0, overwrite, 0, sink, 0)
+
+"""Seconds since this reporter was created."""
+_elapsed(p::CTSEMProgress) = time() - p.started
+
+"""Should a line be printed now? True at most once per `every` seconds."""
+function _due(p::CTSEMProgress, force::Bool=false)
+    # Every reporting loop comes through here whether or not it prints, which
+    # makes it the place to notice that R has asked the call to stop.
+    _ctsem_interrupt_check()
+    p.enabled || return false
+    now = time()
+    (force || now - p.last >= p.every) || return false
+    p.last = now
+    return true
+end
+
+"""`1m 04s`, `12.4s`, `2h 05m` -- whichever reads best at that magnitude."""
+function _duration(seconds::Real)
+    seconds = max(0.0, Float64(seconds))
+    seconds < 60 && return @sprintf("%.1fs", seconds)
+    seconds < 3600 && return @sprintf("%dm %02ds", floor(Int, seconds / 60),
+        round(Int, seconds % 60))
+    return @sprintf("%dh %02dm", floor(Int, seconds / 3600),
+        round(Int, (seconds % 3600) / 60))
+end
+
+"""
+    CTSEMConvergence(gradient_tolerance, maxiter)
+
+How far the optimiser has come toward whichever of its stopping rules it will
+reach first, as a percentage.
+
+# The formula is ctsem's, not a new one
+
+`sgd.R` has printed a "Progress est." for years on the stan path, and this is
+the same expression: a log-scale interpolation between the worst value seen,
+the current one, and the tolerance. What it reports is the fraction of the
+*orders of magnitude* between the starting point and the criterion that have
+been covered -- not a fraction of the time, and not a fraction of the
+iterations.
+
+# Three rules, because the fit stops at the first of them
+
+Optim is given `g_tol`, an iteration cap, and `f_reltol`/`x_abstol` of zero.
+The run therefore ends at whichever comes first of: the largest gradient
+falling below `g_tol`; the iteration cap; or the objective (or the iterate)
+ceasing to change *at all*, which the zero tolerances make a test against
+floating point rather than against a number anyone chose.
+
+Each of those has a distance that can be interpolated, and the fit ends at the
+nearest, so what is reported is the largest of the three. The
+objective-change one is normally the binding rule and was the one missing.
+
+# What was wrong with reporting the gradient alone
+
+It was measured against `g_tol = 1e-8` -- and `_ctsem_optimise_verdict` says in
+its own docstring that 1e-8 is an absolute bound a log likelihood of order 1e3
+puts out of reach however good the fit is. So the scale's far end was several
+orders of magnitude beyond where fits actually stop, and every estimate was a
+fraction of a span the fit never traverses. Measured on three fits of a
+3-latent, 200-subject model -- marginal, state augmented and Laplace -- the
+last thing printed before each one finished was 57%, 46% and 60%. Under-claimed
+by 20 to 27 points on average and by as much as 54, and within 20 points of the
+iteration fraction on 28-57% of iterations.
+
+That was not a mistake when it was written: the comment it carried argued that
+the gradient is what this optimiser stops on, and it was. `f_tol` was 0, so
+Optim's `f` criterion was described as off -- but a zero relative tolerance
+does not switch a criterion off, it tightens it to exact equality, and exact
+equality is what these fits reach. The verdict moved to `converge_tol` in
+objective units besides. A true sentence became a false one.
+
+# What is reported instead
+
+The per-iteration change in the objective, relative to its size, interpolated
+toward `eps(Float64)` -- the point at which a further change cannot be
+represented, which is exactly where the zero `f_reltol` bites. On the same
+three fits:
+
+    fit                iters   last line   mean error   within 20pts
+    marginal             164      100%          +7.6           100%
+    state augmented      385      100%          +4.2           100%
+    Laplace              324      100%          -2.3           100%
+
+against -19.6, -22.1 and -27.0 for the gradient alone, and 57%, 45% and 28%.
+Each first reads 90% at 85-89% of the way through.
+
+# Why the reported value never goes down
+
+`sgd.R` does not clamp its output, and does not need to: the quantity it feeds
+in is already smoothed -- a difference of running maxima over an
+`nconvergeiter` window, non-negative by construction. What Optim hands the
+callback is raw and per-iteration, and a line search that has to lengthen its
+step raises it. Measured over 1184 iterations of eight fits, the unclamped
+percentage stepped backwards on 40--51% of iterations of the fits that grind --
+by up to 9.9 points, and on 101 of the 200 lines a user would actually have
+seen on the state-augmented fit. A percentage that goes backwards on half its
+updates is not readable as progress, so the best reached so far is what is
+reported. The raw gradient is on the same line and is where a fit going wrong
+is visible; nothing is hidden by holding this number.
+
+# The test the removed time estimate failed
+
+`_progress_optimise` records what the old "time remaining" said at the end: 13.6
+seconds, 0.27 seconds before the fit finished. The same question, asked of this
+number on the three fits above, is answered by the table: each reads 100% on
+the last periodic line before the closing one.
+
+# Where it is not reported
+
+Not on a stage whose cap is the plan. The prior warm-up takes exactly its ten
+iterations, so `7/10` is already exact there and an estimate would replace a
+correct denominator with a guessed one.
+"""
+mutable struct CTSEMConvergence
+    gradient_tolerance::Float64
+    # The cap, as the one rule certain to be reached. Zero means "not known",
+    # which is how a caller asks for the other two only.
+    maxiter::Int
+    # Running worsts, as in `sgd.R`'s `lpdiff1`. A new worst rebases its scale
+    # rather than sending the percentage out of range.
+    worst_gradient::Float64
+    worst_change::Float64
+    # Previous objective value, so the change can be formed here rather than
+    # asking the caller to keep a second copy of it. NaN until the first.
+    previous::Float64
+    # Best reported so far; see above. NaN until the first estimate exists.
+    best::Float64
+end
+
+CTSEMConvergence(gradient_tolerance::Real, maxiter::Integer = 0) =
+    CTSEMConvergence(Float64(gradient_tolerance), Int(maxiter), 0.0, 0.0, NaN, NaN)
+
+"""
+    _span_percent(current, worst, tolerance)
+
+The shared interpolation: how far `current` has come from `worst` toward
+`tolerance`, on a log scale, or `NaN` when there is nothing honest to say.
+"""
+function _span_percent(current::Real, worst::Real, tolerance::Real)
+    value = Float64(current)
+    (tolerance > 0 && isfinite(value) && value >= 0) || return NaN
+    # At or inside the criterion. Reached before the logarithm below, which
+    # would be asked for `log(0)` at an exactly zero gradient or an objective
+    # that stopped moving.
+    value <= tolerance && return 100.0
+    # No span yet: the first value seen is its own worst.
+    worst <= value && return 0.0
+    clamp(100.0 * (1 - log(value / tolerance) / log(worst / tolerance)), 0.0, 100.0)
+end
+
+# `max` that ignores a `NaN` on either side, so a criterion with nothing to say
+# this iteration neither contributes nor destroys the others.
+_bestof(a::Float64, b::Float64) = isnan(a) ? b : (isnan(b) ? a : max(a, b))
+
+"""
+    _convergence_percent!(c, gradient_norm, value, iteration)
+
+Record this iteration and return the percentage to report, or `NaN` when no
+honest estimate exists -- nothing finite to measure and no cap to measure
+against.
+"""
+function _convergence_percent!(c::CTSEMConvergence, gradient_norm::Real,
+        value::Real, iteration::Integer)
+    reached = NaN
+
+    # Toward the gradient bound.
+    gradient = Float64(gradient_norm)
+    if isfinite(gradient) && gradient >= 0
+        c.worst_gradient = max(c.worst_gradient, gradient)
+        reached = _bestof(reached,
+            _span_percent(gradient, c.worst_gradient, c.gradient_tolerance))
+    end
+
+    # Toward the point where the objective stops changing at all. Relative,
+    # because what `f_reltol = 0` tests is representability: a log likelihood
+    # of 1e4 stops moving around an absolute change of 1e-12, and one of 1e0
+    # around 1e-16.
+    objective = Float64(value)
+    if isfinite(objective)
+        if isfinite(c.previous)
+            change = abs(objective - c.previous) / max(1.0, abs(objective))
+            c.worst_change = max(c.worst_change, change)
+            # Only once something has moved. An objective constant from the
+            # first iteration is an optimiser that never started, and a zero
+            # change is below every tolerance -- so without this it would read
+            # as finished. `stalled` is what reports that case.
+            c.worst_change > 0 && (reached = _bestof(reached,
+                _span_percent(change, c.worst_change, eps(Float64))))
+        end
+        c.previous = objective
+    end
+
+    # Toward the cap. The only rule certain to be reached, and the reason a
+    # grinding fit can report something rather than sitting at a number that
+    # never promises completion. It can only raise the estimate -- the other
+    # two are normally well ahead of it -- so it is a floor rather than a
+    # measure, which is all `maxiter` is entitled to be.
+    if c.maxiter > 0 && iteration >= 0
+        reached = _bestof(reached, clamp(100.0 * iteration / c.maxiter, 0.0, 100.0))
+    end
+
+    # A bad iteration does not destroy an estimate already earned, and it does
+    # not get to report one either.
+    isnan(reached) && return NaN
+    c.best = isnan(c.best) ? reached : max(c.best, reached)
+    return c.best
+end
+
+"""
+    _progress_line(p, done, total, fields...)
+
+One line: what fraction is done, how fast, how long is left, then whatever the
+caller thinks matters.
+
+**Only for work with a target it will actually reach** -- the sampler, which
+takes exactly `nwarmup` and then exactly `ndraws` iterations. There the
+extrapolation is sound, and measured so: a 200-draw chain reported "0.2s at
+this rate" at draw 188 and finished 0.2s later.
+
+An optimiser is the opposite case and uses `_progress_optimise` instead. The
+note there records what extrapolating against `maxiter` actually produced.
+"""
+function _progress_line(p::CTSEMProgress, done::Integer, total::Integer,
+    fields::AbstractString...)
+    elapsed = _elapsed(p)
+    rate = done <= 0 ? 0.0 : done / elapsed
+    remaining = (rate <= 0 || total <= done) ? 0.0 : (total - done) / rate
+    p.lines += 1
+    parts = [@sprintf("%s %5d/%-5d", p.label, done, total),
+             @sprintf("%5.1f/s", rate),
+             @sprintf("%7s at this rate", _duration(remaining))]
+    # Empty fields are dropped rather than joined: a caller with a field that
+    # only sometimes applies passes "" for it, and joining that leaves a
+    # separator with nothing after it.
+    _emit(p, "  " * join(vcat(parts, filter(!isempty, collect(fields))), " | "))
+    return nothing
+end
+
+"""
+    _progress_optimise(p, done, cap, fields...; budget=false, percent=NaN)
+
+The optimiser's line: iterations done, how far toward the stopping rule,
+elapsed, then the caller's fields. Deliberately no time remaining, and usually
+no denominator.
+
+# Why there is no time remaining
+
+An optimiser stops when the gradient is small enough, not when it has taken
+`maxiter` iterations, so `(maxiter - done) / rate` extrapolates against a
+number the fit never approaches. Measured on a 2-latent, 60-subject fit that
+converged at iteration 307 of a cap of 1000, comparing each printed estimate
+with the time the fit actually had left:
+
+    iter    rate    predicted    realised    ratio
+      17    41.0/s      24.0s       5.59s     4.3x
+      99    48.1/s      18.7s       3.94s     4.7x
+     209    51.0/s      15.5s       1.90s     8.1x
+     297    51.8/s      13.6s       0.27s    51.0x
+
+Every estimate was too long, the error grew as the fit approached its optimum,
+and the last thing the user saw was "13.6s at this rate" 0.27s before the fit
+finished. That is worse than useless: it is the number that makes someone kill
+a fit that was nearly done. Elapsed time and an iteration count cannot be
+wrong, so that is what this prints.
+
+The rate is contaminated too, and separably. The prior warm-up has a cap of 10
+that it always exhausts -- a correct denominator -- and still predicted "1m 14s
+at this rate" for a stage that finished 0.1s later, because the first iteration
+pays Julia's compilation and no rate measured across it describes the rest.
+
+# Why the denominator usually is not shown
+
+`maxiter` is a safety limit, not a target. Showing "297/1000" invites reading a
+30% completion that means nothing, when the fit was in fact about to stop. So
+the count stands alone until the cap is close enough to be a real risk -- past
+half of it -- at which point the denominator is the story and appears.
+
+`budget=true` is for a stage whose cap *is* the plan and is always reached, the
+prior warm-up being the only one. There "7/10" is honest at every iteration and
+reaching 10 is not a failure.
+
+# What `percent` replaced
+
+The iteration rate, which used to sit between the elapsed time and the caller's
+fields. Two reasons, and the second is the deciding one.
+
+A rate is worth printing when it is going to be multiplied by a count of work
+remaining, and this line refuses to print a count of work remaining -- so the
+rate was the residue of the estimate that was removed, and `_convergence_percent!`
+answers the question it was standing in for directly. Elapsed and the iteration
+count still give it to anyone who wants it.
+
+And the line has to fit. A line that wraps cannot be overwritten in place: a
+carriage return goes to the start of the last visual row, so the update leaves
+the earlier rows behind as debris. The marginal line was already 81 characters
+and the Laplace one, which also carries an inner-mode count, 102. Adding a
+field without removing one puts those at 92 and 113; trading the rate for the
+estimate leaves them at 83 and 98.
+"""
+function _progress_optimise(p::CTSEMProgress, done::Integer, cap::Integer,
+    fields::AbstractString...; budget::Bool=false, percent::Real=NaN)
+    elapsed = _elapsed(p)
+    # Never rewind; see `shown`.
+    done = p.shown = max(p.shown, Int(done))
+    p.lines += 1
+    counter = (budget || (cap > 0 && 2 * done >= cap)) ?
+        @sprintf("%5d/%-5d", done, cap) : @sprintf("%5d iter ", done)
+    parts = [@sprintf("%s %s", p.label, counter)]
+    # "est." is not decoration. It is the same word `sgd.R` prints, and it is
+    # the difference between a number that is checkable and one that is a
+    # promise; see `CTSEMConvergence` for what the estimate is and is not.
+    isnan(percent) || push!(parts, @sprintf("%3.0f%% est.", percent))
+    push!(parts, @sprintf("%8s", _duration(elapsed)))
+    _emit(p, "  " * join(vcat(parts, filter(!isempty, collect(fields))), " | "))
+    return nothing
+end
+
+"""
+    _progress_fraction(p, text)
+
+A short update for a bounded sub-task inside a larger stage -- forming a
+Hessian, screening quadrature units -- through the same line and sink as
+everything else.
+
+Unlike `_progress_optimise`, whose `cap` is a safety limit the run may never
+approach, the fraction behind `text` here is one the sub-task always reaches:
+so the caller writes it out in full (`"14 of 54 gradients"`) rather than this
+function withholding a denominator the way `_progress_optimise` does. The
+label and the elapsed time are added so the line reads as a continuation of
+the stage's own report rather than something new -- the reason a caller
+passes its `CTSEMProgress` here rather than printing on its own.
+"""
+function _progress_fraction(p::CTSEMProgress, text::AbstractString)
+    p.lines += 1
+    _emit(p, @sprintf("  %s %s | %8s", p.label, text, _duration(_elapsed(p))))
+    return nothing
+end
+
+"""
+    _ctsem_progress_reporter(progress, label, overwrite, sink, every)
+
+One `CTSEMProgress`, built the same way for every caller that takes this same
+five-keyword vocabulary (`ctsem_optimize`, `ctsem_endgame`,
+`ctsem_hessian_progress`) -- always a live struct, `enabled = progress`,
+never `nothing`. Two of those callers used to disagree on this: one built a
+real struct whatever `progress` said, the other built `nothing` when it was
+`false`. The difference was not cosmetic -- `_ctsem_hessian_progress` below
+has to skip building its closure when progress is off, and "off" meant two
+different things depending on which caller reached it. A single, deliberate
+answer here is what makes that check able to ask one question
+(`reporter.enabled`) instead of two (`=== nothing`, or `.enabled`).
+"""
+_ctsem_progress_reporter(progress::Bool, label::AbstractString, overwrite::Bool,
+    sink, every::Real) = CTSEMProgress(progress; label=label, overwrite=overwrite,
+        sink=sink, every=every)
+
+"""
+    _ctsem_hessian_progress(reporter)
+
+The `(done, total[, unit]) -> nothing` callback `ctsem_hessian`'s (and
+`ctsem_laplace_hessian`'s) `progress` parameter expects -- `unit` what `done`
+counts, "gradients" (the Laplace route's finite differences) unless the caller
+says "parameters" (the marginal route's sweeps, a block of columns each) -- reporting through
+`reporter` on its own cadence via `_due`/`_progress_fraction` -- or `nothing`
+when there is nothing to report through, whether that is a literal `nothing`
+(a caller that never built a reporter at all) or a `CTSEMProgress` built
+disabled (`_ctsem_progress_reporter(false, ...)`). Shared by
+`_ctsem_newton_finish`'s own Hessian and by `ctsem_hessian_progress`, the
+standalone entry point for a caller with no finish or certification to borrow
+a reporter from.
+"""
+_ctsem_hessian_progress(reporter) = (reporter === nothing || !reporter.enabled) ?
+    nothing : function (done::Integer, total::Integer,
+            unit::AbstractString="gradients")
+        _due(reporter) && _progress_fraction(reporter,
+            @sprintf("hessian %d of %d %s", done, total, unit))
+        nothing
+    end
+
+"""
+    _ctsem_local_progress(reporter)
+
+The `(done, total)` callback the local curvature's columns report through
+(`CTSEMLocalCurvature`), as `_ctsem_hessian_progress` does a Hessian's, or
+`nothing` when there is nothing to report through. `done` and `total` count
+columns.
+"""
+_ctsem_local_progress(reporter) = (reporter === nothing || !reporter.enabled) ?
+    nothing : function (done::Integer, total::Integer)
+        _due(reporter) && _progress_fraction(reporter,
+            @sprintf("local curvature %d of %d columns", done, total))
+        nothing
+    end
+
+"""
+    _ctsem_probe_progress(reporter)
+
+The `(done, total) -> nothing` callback `_ctsem_overshot` takes, reporting the
+pullback probe's sets through `reporter` as `_ctsem_hessian_progress` does the
+Hessian's columns, or `nothing` when there is nothing to report through. The
+probe is value-only and on a large model runs for minutes where the optimiser's
+own line has stopped.
+"""
+_ctsem_probe_progress(reporter) = (reporter === nothing || !reporter.enabled) ?
+    nothing : function (done::Integer, total::Integer)
+        _due(reporter) && _progress_fraction(reporter,
+            @sprintf("pullback check %d of %d sets", done, total))
+        nothing
+    end
+
+"""
+    _progress_break(p)
+
+End the current in-place line so something else can print on its own.
+
+The engine's own `verbose` messages go to the same stdout as the progress line,
+and a carriage-returned line has no newline on it -- so they landed *inside*
+it: "|g| 2.70e+02ctsem_optimize: Hager-Zhang stopped after 10 iteration(s)".
+Anything that prints while a fit is running calls this first.
+"""
+function _progress_break(p::CTSEMProgress)
+    (p.enabled && p.overwrite && p.lines > 0) || return nothing
+    if _deliver!(p, "", "break")
+        p.width = 0
+        p.lines = 1
+        return nothing
+    end
+    print(_console(), NEWLINE)
+    flush(_console())
+    p.width = 0
+    # Not zero: the cursor is already at the start of a fresh line, so the next
+    # update must not open with `_emit`'s leading newline and leave a blank one.
+    p.lines = 1
+    return nothing
+end
+
+"""
+    _deliver!(p, text, kind)
+
+Hand one line to whoever is displaying it, and say whether it is `"update"`,
+the closing `"done"` line, or a `"break"` that only ends the current line.
+
+# Why a line ever leaves Julia rather than being printed
+
+Because printing it cannot be styled. The R console draws a message -- anything
+delivered through R's condition system -- differently from text that merely
+arrives on the same stream: in RStudio, `message()` output is a shaded block and
+a raw write to `stderr()` is plain body text, verified by the two of them side by
+side. So an engine that prints, however correct the stream, produces a fit whose
+own progress does not look like the rest of what that fit says.
+
+What crosses is the finished line, not the numbers behind it. R could format its
+own from the callback it already gets, and that was the alternative: it would
+have put a second spelling of every field in a second language, drifting from
+this one, and R does not receive the inner mode count, the step size, the tree
+depth or the divergences at all. The whole content stays here; only its delivery
+moves.
+
+Measured through JuliaConnectoR at 0.5 ms per call, against a cadence of one
+line every 0.4 s.
+
+`sink` is dropped on its first failure and the line printed instead, for the
+reason `_invoke_callback` gives: a reporting convenience must never be able to
+take a fit with it.
+"""
+function _deliver!(p::CTSEMProgress, text::AbstractString, kind::AbstractString)
+    p.sink === nothing && return false
+    try
+        p.sink(text, kind)
+        return true
+    catch err
+        err isa InterruptException && rethrow()
+        p.sink = nothing
+        println(_console(), "  progress display failed and was disabled: ", err)
+        flush(_console())
+        return false
+    end
+end
+
+"""
+    _emit(p, text)
+
+One update, in place or on its own line.
+
+In place means a carriage return and no newline, padded to the width of the
+longest line written so far -- without the padding a shorter update leaves the
+tail of a longer one behind it, which reads as garbage rather than as progress.
+Carriage returns survive the trip to the R console intact, which is what makes
+this possible at all.
+"""
+function _emit(p::CTSEMProgress, text::AbstractString)
+    # The sink owns the carriage return and the padding as well as the styling:
+    # it is the side that knows what its console does with either.
+    _deliver!(p, text, "update") && return nothing
+    if !p.overwrite
+        println(_console(), text)
+        flush(_console())
+        return nothing
+    end
+    # The first in-place update opens with a newline. A carriage return only
+    # returns to the start of the current line, and that line may already hold
+    # something written by R: the engine's progress goes to stdout while R's
+    # messages go to stderr, the two are interleaved by the terminal, and the
+    # result was "...afterwards skip it.  optimise 39/1000" on one line. One
+    # newline costs nothing and guarantees the progress line starts on its own.
+    # `<= 1` rather than `== 0`: nothing prints a heading before this any more,
+    # so the first update is the first line either way, and the extra case
+    # costs nothing while covering a caller that has emitted one line already.
+    if p.lines <= 1
+        print(_console(), NEWLINE)
+    end
+    p.width = max(p.width, length(text))
+    print(_console(), CARRIAGE, rpad(text, p.width))
+    flush(_console())
+    return nothing
+end
+
+"""A closing line, with the total cost and whatever the caller wants said."""
+function _progress_done(p::CTSEMProgress, fields::AbstractString...)
+    p.enabled || return nothing
+    text = "  " * join(vcat([@sprintf("%s done in %s", p.label,
+        _duration(_elapsed(p)))], collect(fields)), " | ")
+    if _deliver!(p, text, "done")
+        p.width = 0
+        return nothing
+    end
+    if p.overwrite
+        # Replaces the last in-place update, then ends the line so whatever
+        # comes next starts cleanly.
+        print(_console(), CARRIAGE, rpad(text, p.width), NEWLINE)
+        flush(_console())
+        p.width = 0
+    else
+        println(_console(), text)
+        flush(_console())
+    end
+    return nothing
+end
+
+# ---------------------------------------------------------------------------
+# The trace, and the callback out to R
+#
+# Two consumers, two costs, so two mechanisms rather than one.
+#
+# The *trace* is what a convergence plot is drawn from, and it wants every
+# iteration. Recording one is a push onto a vector in Julia -- free -- and the
+# whole thing crosses the bridge once at the end, where a thousand iterations
+# of three numbers is 24 kB and takes no measurable time.
+#
+# The *callback* is an R function invoked while the fit is still running, which
+# is the only way a front end can show anything live. Measured through
+# JuliaConnectoR it costs 0.5 ms per call: negligible occasionally, and 17% of a
+# three-second fit if called every iteration. So it fires on the same time
+# cadence as the printed line rather than on the iteration count -- what a
+# watcher wants is a roughly constant update rate, not one update per unit of
+# the engine's internal work.
+
+"""
+    CTSEMTrace(keys...)
+
+Per-iteration record of whatever the caller thinks describes progress. Keys are
+fixed at construction so the vectors stay type-stable.
+"""
+struct CTSEMTrace
+    iteration::Vector{Int}
+    values::Dict{Symbol,Vector{Float64}}
+    keys::Vector{Symbol}
+end
+
+CTSEMTrace(keys::Symbol...) = CTSEMTrace(Int[],
+    Dict(k => Float64[] for k in keys), collect(keys))
+
+"""Append one iteration. Values are positional, in the key order given."""
+function _record!(t::CTSEMTrace, iteration::Integer, values::Real...)
+    # Once per optimiser iteration, printed or not; see interrupt.jl.
+    _ctsem_interrupt_check()
+    length(values) == length(t.keys) ||
+        throw(ArgumentError("trace expects $(length(t.keys)) values"))
+    push!(t.iteration, Int(iteration))
+    for (k, v) in zip(t.keys, values)
+        push!(t.values[k], Float64(v))
+    end
+    return nothing
+end
+
+"""
+Flat vectors rather than a matrix or a table: JuliaConnectoR moves a
+`Vector{Float64}` without ceremony, and the R side rebuilds a data frame from
+them in one step.
+"""
+function _trace_result(t::CTSEMTrace)
+    out = Dict{Symbol,Any}(:iteration => t.iteration)
+    for k in t.keys
+        out[k] = t.values[k]
+    end
+    return (; (k => out[k] for k in vcat(:iteration, t.keys))...)
+end
+
+"""
+    _invoke_callback(f, fields...)
+
+Call R, and never let its failure take the fit with it. A callback is a
+reporting convenience; an error inside one -- a plotting device that has gone
+away, a typo in a user's function -- must not lose an optimisation that is
+otherwise fine. It is reported once and then disabled.
+"""
+mutable struct CTSEMCallback
+    f::Any
+    alive::Bool
+    every::Float64
+    last::Float64
+end
+CTSEMCallback(f; every::Real=0.4) =
+    CTSEMCallback(f, f !== nothing, Float64(every), 0.0)
+
+"""
+Its own clock, deliberately not the printed line's.
+
+The two were shared at first and the callback then never fired: `_due` checks
+`enabled`, which follows `verbose`, so a caller who passed a callback and left
+`verbose = 0` -- the obvious combination for a front end that draws rather than
+prints -- got nothing at all. A callback is a programmatic consumer and has no
+reason to depend on whether anything is being printed.
+"""
+function _callback_due(cb::CTSEMCallback, force::Bool=false)
+    _ctsem_interrupt_check()
+    cb.alive || return false
+    now = time()
+    (force || now - cb.last >= cb.every) || return false
+    cb.last = now
+    return true
+end
+
+"""
+    _ctsem_checkpoint_modes(cb, objective, last, every; force=false)
+
+Whether a checkpoint is due -- `every` seconds since the last, or `force` at a
+run's end, where `every > 0` and the callback is alive -- and if so what it
+keeps beside the point: the anchored run's modes (`_ctsem_anchor_modes`), or
+`(units=[0], values=zeros(1, 1))` where the route anchors none, so the caller
+still writes the point. `nothing` where none is due: the modes are 80,000
+numbers on the affect pilot, too many to hand over at the callback's cadence.
+"""
+function _ctsem_checkpoint_modes(cb::CTSEMCallback, objective, last::Ref{Float64},
+    every::Real; force::Bool=false)
+    (every > 0 && cb.alive) || return nothing
+    now = time()
+    (force || now - last[] >= every) || return nothing
+    last[] = now
+    m = _ctsem_anchor_modes(objective)
+    return m === nothing ? (units=[0], values=zeros(1, 1)) : m
+end
+
+"""The callback's checkpoint arguments: none where no checkpoint is due, so a
+callback that takes the point alone is called as before."""
+_ctsem_checkpoint_args(::Nothing) = ()
+_ctsem_checkpoint_args(m) = (m.units, m.values)
+
+function _invoke_callback(cb::CTSEMCallback, values...; force::Bool=false)
+    _callback_due(cb, force) || return nothing
+    try
+        cb.f(values...)
+    catch err
+        cb.alive = false
+        println(_console(), "  progress callback failed and was disabled: ", err)
+        flush(_console())
+    end
+    return nothing
+end
+
+"""
+    _ctsem_call_hook(f, args...)
+
+Calls a caller's hook, `f(args...)`, where there is one (`nothing`, none): a
+stage's progress (`ctsem_laplace_check`'s `progress`) or a Hessian to keep
+(`_ctsem_newton_finish`'s `on_hessian`). Its failure is reported and ignored,
+as a callback's is: the hook is a convenience, and the work it reports on goes
+on.
+"""
+_ctsem_call_hook(::Nothing, args...) = nothing
+function _ctsem_call_hook(f, args...)
+    try
+        f(args...)
+    catch err
+        _ctsem_must_propagate(err) && rethrow()
+        println(_console(), "  a caller's hook failed: ", err)
+        flush(_console())
+    end
+    return nothing
+end

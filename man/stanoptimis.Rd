@@ -9,30 +9,31 @@ stanoptimis(
   sm,
   init = "random",
   initsd = 0.01,
-  sampleinit = NA,
-  deoptim = FALSE,
   estonly = FALSE,
-  tol = 1e-10,
-  decontrol = list(),
+  tol = 1e-08,
   stochastic = TRUE,
-  nopriors = FALSE,
+  priors = TRUE,
   carefulfit = TRUE,
-  bootstrapUncertainty = FALSE,
+  stallretries = 2,
+  stalltol = 0.01,
+  uncertainty = c("hessian", "checked", "is", "bootstrap", "fullbootstrap", "sandwich",
+    "opg"),
+  uncertaintyDraws = "auto",
+  uncertaintyControl = list(),
   subsamplesize = 1,
-  finitediff = FALSE,
   parsteps = c(),
   plot = FALSE,
-  is = FALSE,
-  isloopsize = 1000,
   finishsamples = 1000,
-  tdf = 10,
-  chancethreshold = 100,
-  finishmultiply = 5,
+  lproughnesstarget = 0.2,
   verbose = 0,
   cores = 2,
   matsetup = NA,
-  nsubsets = 10,
-  stochasticTolAdjust = 1
+  nsubsets = 1,
+  stochasticTolAdjust = 1000,
+  g_tol = NULL,
+  x_tol = NULL,
+  maxiter = NULL,
+  lbfgs_memory = NULL
 )
 }
 \arguments{
@@ -46,32 +47,52 @@ random values very close to zero.}
 \item{initsd}{positive numeric specifying sd of normal distribution governing random sample of init parameters,
 if init='random' .}
 
-\item{sampleinit}{either NA, or an niterations * nparams matrix of samples to initialise importance sampling.}
-
-\item{deoptim}{Do first pass optimization using differential evolution? Slower, but better for cases with multiple
-minima / difficult optimization.}
-
 \item{estonly}{if TRUE,just return point estimates under $rawest subobject.}
 
-\item{tol}{objective tolerance.}
+\item{tol}{objective tolerance -- the optimizer stops when the objective
+changes by less than this between evaluations.}
 
-\item{decontrol}{List of control parameters for differential evolution step, to pass to \code{DEoptim.control}.}
+\item{stochastic}{Logical. Use stochastic gradient descent as main optimizer. Always finishes (double checks) with mize (bfgs) optimizer.}
 
-\item{stochastic}{Logical. Use stochastic gradient descent instead of mize (bfgs) optimizer.
-Still experimental, worth trying for either robustness checks or problematic, high dimensional, nonlinear, problems.}
-
-\item{nopriors}{logical. If TRUE, a nopriors integer is set to 1 (TRUE) in the standata object -- only has an effect if 
+\item{priors}{logical. If TRUE, a priors integer is set to 1 (TRUE) in the standata object -- only has an effect if 
 the stan model uses this value.}
 
-\item{carefulfit}{Logical. If TRUE, priors are always used for a rough first pass to obtain starting values when nopriors=TRUE.}
+\item{carefulfit}{Logical. If TRUE, priors are always used for a rough first pass to obtain starting values when priors=FALSE}
 
-\item{bootstrapUncertainty}{Logical. If TRUE, subject wise gradient contributions are resampled to estimate the hessian, 
-for computing standard errors or initializing importance sampling.}
+\item{stallretries}{Integer. Number of times to restart the optimizer from fresh random
+values when it finishes somewhere that is not a maximum -- see \code{stalltol}. Only applies
+when \code{init='random'}; with supplied inits a failed fit is reported but not retried.
+Set to 0 to disable retrying.}
+
+\item{stalltol}{Gradient per data point above which the optimizer is taken to have stopped
+short rather than converged. Rough likelihoods -- binary indicators are the case this was
+built for -- can leave both optimizers unable to find an improving step, which they report as
+convergence, returning the starting values as the estimate. Converged fits sit near 1e-5 per
+data point, stalled ones at 1 or more.}
+
+\item{uncertainty}{Character string selecting the optimized-fit uncertainty
+approximation. Options are \code{'hessian'}, \code{'checked'},
+\code{'is'}, \code{'bootstrap'}, \code{'fullbootstrap'}, \code{'sandwich'},
+and \code{'opg'}.}
+
+\item{uncertaintyDraws}{Character string controlling approximate
+raw-parameter draws
+from the approximate uncertainty. \code{'auto'} uses empirical draws for
+\code{uncertainty='bootstrap'} or \code{uncertainty='fullbootstrap'} and
+normal draws otherwise. \code{'normal'} draws from a multivariate normal
+using the selected covariance, \code{'empirical'} uses empirical draws when
+available, and \code{'imis'} runs importance sampling.}
+
+\item{uncertaintyControl}{List of method-specific options passed to
+\code{\link{ctOptimUncertainty}} internals. Score-based methods use
+subject-level score contributions when there are at least two subjects;
+single-subject models warn and use case-level contributions. Score-based
+methods warn when there are fewer than ten independent subjects or no more
+score rows than raw parameters. Full bootstrap requires at least two
+subjects and warns below ten independent subjects. Bootstrap-style methods
+require at least two returned samples / refits.}
 
 \item{subsamplesize}{value between 0 and 1 representing proportion of subjects to include in first pass fit.}
-
-\item{finitediff}{Either 'ask', TRUE, or FALSE. Whether to use the slow finite difference calculations
-for the Hessian (used for confidence intervals) if other approaches do not give a positive definite result.}
 
 \item{parsteps}{ordered list of vectors of integers denoting which parameters should begin fixed
 at zero, and freed sequentially (by list order). Useful for complex models, e.g. keep all cross couplings fixed to zero 
@@ -79,20 +100,10 @@ as a first step, free them in second step.}
 
 \item{plot}{Logical. If TRUE, plot iteration details. Probably slower.}
 
-\item{is}{Logical. Use importance sampling, or just return map estimates?}
-
-\item{isloopsize}{Number of samples of approximating distribution per iteration of importance sampling.}
-
 \item{finishsamples}{Number of samples to draw (either from hessian
 based covariance or posterior distribution) for final results computation.}
 
-\item{tdf}{degrees of freedom of multivariate t distribution. Higher (more normal) generally gives more efficent
-importance sampling, at risk of truncating tails.}
-
-\item{chancethreshold}{drop iterations of importance sampling where any samples are chancethreshold times more likely to be drawn than expected.}
-
-\item{finishmultiply}{Importance sampling stops once available samples reach \code{finishsamples * finishmultiply} , then the final samples are drawn
-without replacement from this set.}
+\item{lproughnesstarget}{target log posterior roughness for stochastic optimizer (suggest between .05 and .4).}
 
 \item{verbose}{Integer from 0 to 2. Higher values print more information during model fit -- for debugging.}
 
@@ -103,10 +114,24 @@ without replacement from this set.}
 \item{nsubsets}{number of subsets for stochastic optimizer. Subsets are further split across cores, 
 but each subjects data remains whole -- processed by one core in one subset.}
 
-\item{stochasticTolAdjust}{Multiplier for initial subsampling optimizer tolerance.}
+\item{stochasticTolAdjust}{Multiplier for stochastic optimizer tolerance.}
+
+\item{g_tol}{gradient tolerance: stop when the l2 norm of the gradient falls
+below this. \code{NULL} (the default) leaves it off, which is what this
+optimizer has always done -- \code{tol} is its criterion. The julia backend
+reads the same name and defaults it to 1e-8 instead.}
+
+\item{x_tol}{parameter-step tolerance: stop when the update to the parameter
+vector is smaller than this. \code{NULL} leaves it off.}
+
+\item{maxiter}{maximum optimizer iterations. \code{NULL} leaves the existing
+caps in place (99999 for the bfgs optimizer, 5000 for the stochastic one).}
+
+\item{lbfgs_memory}{number of curvature pairs L-BFGS keeps. \code{NULL} uses
+100.}
 }
 \value{
-list containing fit elementsF
+list containing fit elements
 }
 \description{
 Optimize / importance sample a stan or ctStan model.

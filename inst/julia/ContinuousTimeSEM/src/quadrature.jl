@@ -1,0 +1,1334 @@
+"""
+Adaptive Gauss-Hermite quadrature over the same inner integral the Laplace
+approximation approximates -- as a reference, as a diagnostic, and as a
+correction to the estimate.
+
+# Why this exists
+
+`laplace.jl` replaces each subject's integral
+
+    I_i = int exp(ll_i(theta, z)) phi(z) dz
+
+by a single Gaussian fitted at the mode. That is exact when the integrand is
+Gaussian in `z`, which it is when the varying parameters have identity
+transforms and enter the state mean linearly, and it is *not* exact otherwise --
+most visibly for a random effect on DRIFT, whose transform is `-log1p_exp`.
+
+The error is not a constant. Profiling one 40-subject dataset along the
+population sd of DRIFT, holding everything else at the Laplace estimate, the
+gap between the Laplace value and a nine-node quadrature runs
+
+    pop sd    0.36   0.50   0.67   0.89   1.14   1.43   1.75   2.09
+    gap       0.89   1.63   2.60   3.62   4.60   5.62   6.66   7.64
+
+-- monotone in the scale. A term that grows with the parameter tilts the
+profile, and the tilt is the whole of the shrinkage: on that dataset the
+Laplace profile peaks at a population sd of 0.67 and the quadrature profile at
+0.89, against a generating 1.00. Two thirds of the shortfall is the
+approximation rather than the estimand or the data.
+
+# What is here
+
+  * `ctsem_laplace_quadrature` -- the log marginal likelihood by adaptive
+    Gauss-Hermite quadrature, using the mode and curvature the Laplace fit has
+    already computed as the rule's location and scale -- the curvature
+    clipped from below at the prior's, `M~ = V max(Lambda, 1) V'`, see
+    `_quadrature_scale`. `nodes = 1` reproduces the Laplace value
+    exactly wherever `M >= I`, which is what `test_quadrature.jl` asserts; on a
+    unit with an eigenvalue below one it gives `g(uhat) - sum log max(lambda, 1)
+    / 2` instead, the eigenwise-floored term, because that is the one-point rule
+    at the clipped scale.
+  * `ctsem_laplace_correction` -- the first-order correction to the estimate,
+    `delta = (-H)^-1 grad(quadrature - laplace)`, at the cost of `2 * npar`
+    quadrature evaluations and no refit. Cheap enough to report beside every
+    fit; large entries say the estimate is meaningfully approximation-limited.
+  * `ctsem_laplace_refine` -- the estimate that maximises the quadrature
+    objective by L-BFGS on finite-difference gradients. Nothing in R calls it
+    any more: `ctLaplaceCheck(refine = TRUE)` runs the continuation of
+    `laplace_continuation.jl`, which has an exact gradient. It stays as the
+    tests' independent reference for that continuation.
+
+# How a hierarchy is handled
+
+A unit spanning several subjects does not factor over them, so a product rule
+over the whole unit latent vector would need `m^dim(u)` nodes and `dim(u)` grows
+with the study. But the integral does factor *conditionally* -- given the study
+effect the subjects are independent -- and that is exactly the tree the block
+structure already encodes. So the rule recurses over it:
+
+    value(b, u) = logsumexp_j [ w_j - z_j'z_j/2
+                                + ( sum over b's children of value(child, u) ,
+                                    or b's own members' log likelihoods when b
+                                    is a leaf ) ]
+
+with `u[b] = z_j` set before descending. Cost is `m^k` per block times the
+number of blocks, so it is *linear* in the number of groups at each level and
+exponential only in that level's own number of random effects -- 5 nodes on a
+one-effect study level over 40 subjects with two subject effects is
+`5 * 40 * 25` process evaluations, not `5^41`.
+
+Two different rules, for two different reasons. A leaf block re-solves its
+conditional mode at every outer node, because that mode moves a long way with
+the effect above it and the accuracy of the whole thing rests on it. An outer
+block keeps the joint mode, and takes its scale from the *eliminated* diagonal
+the block factorization already produced: the curvature of that block after
+every block beneath it has been integrated out, which is the conditional
+precision of the block given its ancestors under the Gaussian approximation --
+exactly the distribution the recursion is standing in when it gets there. The
+rule does not need the exact conditional mode to be *valid*, only to be
+efficient, and that centre and scale have already been paid for.
+
+With one level the tree is a single leaf with no ancestors, the recursion is one
+call, and the result is identical to the flat rule this file started as -- which
+is what `test_quadrature.jl` pins by checking `nodes = 1` against the Laplace
+value at one, two and three levels (on concave fixtures; see the clipping
+above).
+
+# Deviations the filter integrates
+
+Where each subject's filter integrates deviations of its own (`CTSEMHybrid`),
+the integrand at a node is the members' log likelihood with those deviations
+integrated exactly -- their profile less `logdet(M) / 2`, `_HYBRID_FULL`
+(`_laplace_member_loglik`) -- so the rule spans only the unit's own effects
+and is the integral over both. A leaf's conditional mode and scale are that
+integrand's. The fit's Laplace term is the joint approximation over effects
+and deviations, so `nodes = 1` then differs from it by the difference of the
+two approximations: zero where the deviations' curvature does not depend on
+the effects, as on a linear model with an intercept deviation. With the clip, `nodes = 1` at more than one level clips each block's
+eliminated precision separately, which is not the same as clipping the unit's
+eigenvalues: the two agree only where nothing is clipped.
+"""
+
+using LinearAlgebra
+
+export ctsem_laplace_quadrature, ctsem_laplace_correction, ctsem_laplace_refine,
+    ctsem_laplace_expansion
+
+"""
+    _gauss_hermite(m)
+
+Nodes and weights of the `m`-point Gauss-Hermite rule for weight `exp(-x^2)`,
+by Golub-Welsch: the nodes are the eigenvalues of the Jacobi matrix and the
+weights come from the first components of its eigenvectors.
+
+Computed rather than tabulated so that any `m` is available, and cached because
+the same `m` is asked for once per subject per evaluation.
+"""
+function _gauss_hermite(m::Integer)
+    m >= 1 || throw(ArgumentError("need at least one quadrature node"))
+    key = Int(m)
+    # Locked, following `_TRANSFORM_CACHE` in `r_interface.jl`. Only the
+    # quadrature path warms this cache first; the binary measurement kernels
+    # reach it from every threaded loop in the engine, so an ordinary fit
+    # with binary indicators can reach a cold cache from several threads at
+    # once, and a concurrent `setindex!` during a rehash corrupts a `Dict`. A
+    # node count is built once per session. The kernels ask once per
+    # observation, and for them even the uncontended lock was a few percent of
+    # a pass, so they go through `_binary_rule`, which comes here only when
+    # the count changes.
+    lock(_GH_CACHE_LOCK) do
+        cached = get(_GH_CACHE, key, nothing)
+        cached === nothing || return cached
+        if key == 1
+            built = ([0.0], [sqrt(pi)])
+        else
+            offdiag = [sqrt(i / 2) for i in 1:(key - 1)]
+            decomposition = eigen(SymTridiagonal(zeros(key), offdiag))
+            built = (decomposition.values,
+                sqrt(pi) .* (decomposition.vectors[1, :] .^ 2))
+        end
+        _GH_CACHE[key] = built
+        return built
+    end
+end
+
+const _GH_CACHE = Dict{Int,Tuple{Vector{Float64},Vector{Float64}}}()
+const _GH_CACHE_LOCK = ReentrantLock()
+
+# The most points `_gh_grid` builds. Each point is a member evaluation per unit
+# per value, so a rule anywhere near this is already hours a fit; past it the
+# grid alone is gigabytes, since each point is a vector of its own, and is kept
+# for the session. A unit of thirteen effects at five nodes asked for 5^13
+# points -- over 100 GB, on one thread, before a unit was scored.
+const _CTSEM_GH_GRID_MAXPOINTS = 10_000_000
+
+"""
+    _gh_grid(k, m)
+
+The `k`-dimensional product rule as `(points, logweights)`, with the
+`exp(x^2)` factor that turns the Gauss-Hermite weight into the one an adaptive
+rule wants already folded into the log weight. Refused, with an
+`ArgumentError`, past `_CTSEM_GH_GRID_MAXPOINTS` points.
+"""
+function _gh_grid(k::Integer, m::Integer)
+    key = (Int(k), Int(m))
+    cached = get(_GH_GRID_CACHE, key, nothing)
+    cached === nothing || return cached
+    big(m)^k > _CTSEM_GH_GRID_MAXPOINTS && throw(ArgumentError(string(
+        "a product quadrature rule over ", k, " random effects at ", m,
+        " nodes has ", big(m)^k, " points, too many to evaluate")))
+    x, w = _gauss_hermite(m)
+    npoints = Int(m)^Int(k)
+    points = Vector{Vector{Float64}}(undef, npoints)
+    logweights = Vector{Float64}(undef, npoints)
+    for (position, index) in enumerate(Iterators.product(ntuple(_ -> 1:Int(m), Int(k))...))
+        points[position] = [x[i] for i in index]
+        logweights[position] = sum(log(w[i]) + x[i]^2 for i in index; init=0.0)
+    end
+    built = (points, logweights)
+    _GH_GRID_CACHE[key] = built
+    return built
+end
+
+# Unlocked, unlike `_GH_CACHE`: the only reader is `_quadrature_block`, which
+# runs strictly after `_quadrature_warm_caches` has asked for every
+# `(block.size, nodes)` key it will use, so the cache is read-only for the whole
+# threaded region. Any new caller reached from a thread needs the warm too, or
+# this needs a lock.
+const _GH_GRID_CACHE = Dict{Tuple{Int,Int},Tuple{Vector{Vector{Float64}},Vector{Float64}}}()
+
+"""
+    _quadrature_warm_caches(laplace, nodes, sizes)
+
+Populate the Gauss-Hermite caches for every size this evaluation will ask for.
+
+Called from single-threaded code before the chunk loop spawns, so that
+`_gauss_hermite` and `_gh_grid` are pure reads inside the threads. The set is
+small and known in advance: one node count for the whole call, and the block
+dimensions `sizes` -- by default one per distinct block size in the unit tree,
+which is what the adaptive product rule asks for. A caller whose rule asks for
+fewer passes them: a grid is built in full and kept for the session.
+"""
+function _quadrature_warm_caches(laplace::CTSEMLaplaceObjective, nodes::Integer,
+    sizes=unique(block.size for blocks in laplace.units.blocks for block in blocks))
+    m = Int(nodes)
+    _gauss_hermite(m)
+    # `_CTSEM_BINARY_NODES` is what the measurement kernels ask for, and it is
+    # a different count from the quadrature's own.
+    _gauss_hermite(_CTSEM_BINARY_NODES[])
+    for k in sizes
+        k >= 1 && _gh_grid(k, m)
+    end
+    return nothing
+end
+
+"""
+    _quadrature_children(blocks)
+
+For each block, the blocks immediately beneath it, and the blocks with nothing
+above them.
+
+`ancestors` is ordered outward from the immediate parent, so `c` sits directly
+under `b` exactly when `c.ancestors[1] == b`. A block with no ancestors is a
+root, and a unit normally has exactly one, since the unit *is* its outermost
+group; several appear only when the outermost level carries no random effects
+and the tree is a forest of the level below.
+"""
+function _quadrature_children(blocks::Vector{CTSEMLaplaceBlock})
+    children = [Int[] for _ in blocks]
+    roots = Int[]
+    for (b, block) in enumerate(blocks)
+        if isempty(block.ancestors)
+            push!(roots, b)
+        else
+            push!(children[block.ancestors[1]], b)
+        end
+    end
+    return (children=children, roots=roots)
+end
+
+"""
+    _quadrature_scale(M, k)
+    _quadrature_scale(F, k)
+
+A rule's scale from a block's precision `M`, or from a factor `F` of it
+already formed (an outer block's eliminated precision, `_laplace_factor_repaired!`'s
+`factors`), with the eigenvalues clipped from below at one, the prior's:
+`S = U^-1` for `M~ = U'U`, `M~ = V max(Lambda, 1) V'`, so `S S' = inv(M~)`;
+the log scale `-logdet(M~) / 2`; and, for the derivative through the clip
+(`_placed_mbar`), whether anything was clipped and the eigenvalues and vectors
+of the matrix that was. Every rule's scale comes from here: the product and
+lattice rules of the quadrature, the continuation and the placed objective,
+and SAEM's leaf proposals. `ok` is false where the clipped precision does not
+factor, which only a precision that is not finite gives.
+
+The precision is the Gaussian the rule is centred on, and scaling the nodes by
+`D^(-1/2)` places them where that Gaussian puts its mass. Where the log
+likelihood is concave in `u` every eigenvalue is at least one and that is right.
+Where it has gone convex it is not: an eigenvalue of 1e-3 scatters the nodes
+some thirty prior standard deviations out, where the integrand is negligible,
+and the rule reports mostly its own extrapolation. Measured on 40-subject
+weak-data fits, a 5-point rule scaled by `D` was 1.8 nats high on average on
+such units (2.9 at worst) against an exact reference, and 0.06 when clipped.
+The clip never makes a node wider than the prior's own spread, and the rule is
+a change of variables whatever `S` is, so it stays a quadrature of the same
+integral; only where its nodes go changes.
+
+`M - I` positive definite -- every eigenvalue above one -- returns the Cholesky
+scale exactly as before, bit for bit. Otherwise `M~` is built by the engine's
+own symmetric eigensolver and factored the same way, so the scale is continuous
+in `M` across the switch (`M~ -> M` as its smallest eigenvalue rises to one).
+A precision that factors is read through its factor, `D = F.L F.L'`, as an
+outer block's is.
+"""
+function _quadrature_scale(M::Matrix{Float64}, k::Integer)
+    F = _ctsem_cholesky(copy(M), k)
+    issuccess(F) && return _quadrature_scale(F, k)
+    return _quadrature_clip_scale(M, k)
+end
+
+function _quadrature_scale(F::CTSEMCholesky, k::Integer)
+    Lf = Matrix(F.L)
+    D = Lf * transpose(Lf)
+    issuccess(_ctsem_cholesky(D - Matrix{Float64}(LinearAlgebra.I, k, k), k)) &&
+        return (S=_ctsem_cholesky_uinv(F), U=Matrix(UpperTriangular(F.U[1:k, 1:k])),
+            logdetscale=-logdet(F) / 2, clipped=false, vectors=zeros(0, 0),
+            values=Float64[], ok=true)
+    return _quadrature_clip_scale(D, k)
+end
+
+"""The scale `_quadrature_scale` returns where none can be built (`ok` false),
+of the same type."""
+_quadrature_scale_failed() = (S=zeros(0, 0), U=zeros(0, 0), logdetscale=NaN,
+    clipped=true, vectors=zeros(0, 0), values=Float64[], ok=false)
+
+function _quadrature_clip_scale(D::Matrix{Float64}, k::Integer)
+    E = _ctsem_symeig(D)
+    all(isfinite, E.values) || return _quadrature_scale_failed()
+    clipped = E.vectors * Diagonal(max.(E.values, 1.0)) * transpose(E.vectors)
+    G = _ctsem_cholesky(Matrix(_laplace_symmetrise(clipped)), k)
+    issuccess(G) || return _quadrature_scale_failed()
+    return (S=_ctsem_cholesky_uinv(G), U=Matrix(UpperTriangular(G.U[1:k, 1:k])),
+        logdetscale=-logdet(G) / 2, clipped=true, vectors=Matrix(E.vectors),
+        values=collect(E.values), ok=true)
+end
+
+"""
+    _quadrature_leaf_newton(inner, precision_at, z, current, laplace, k)
+
+Newton on a leaf's log integrand `inner` from `z`, where it is `current`. Each
+step is `M \\ g` on the block's precision `precision_at(z)`, or, where that does
+not factor (away from a maximum), on the precision clipped at the prior's,
+`V max(Lambda, 1) V'`, the matrix the rule's scale is built from
+(`_quadrature_scale`). That is an ascent direction whatever the curvature, and
+no longer along a direction of curvature under the prior's than the gradient
+there; a line search on the integrand sizes it. Floored at 1e-8 of the largest
+eigenvalue instead, an eigenvalue at or below zero made the step about 1e8
+times too long for twenty halvings to bring back: on AnomAuth (race fixture
+anomS1) two units 0.3 se from the estimate stopped with a gradient of 0.1,
+their precision indefinite, the rule placed at no mode. Returns `(z, current)`
+where the solve stopped.
+"""
+function _quadrature_leaf_newton(inner, precision_at, z::Vector{Float64}, current,
+    laplace::CTSEMLaplaceObjective, k::Integer)
+    for _ in 1:laplace.inner_maxiter
+        maximum(abs, current.gradient) < laplace.inner_tol && break
+        M = precision_at(z)
+        # The engine's factorization rather than LAPACK's: once per inner
+        # Newton step per subject, inside the subject loop. See small_linalg.jl.
+        factorization = _ctsem_cholesky(copy(M), k)
+        step = if issuccess(factorization)
+            factorization \ current.gradient
+        else
+            E = _ctsem_symeig(M)
+            E.vectors * ((transpose(E.vectors) * current.gradient) ./
+                max.(E.values, 1.0))
+        end
+        # A step at roundoff is a mode however large the gradient's roundoff
+        # is; see `_laplace_newton_unit_mode`.
+        issuccess(factorization) && maximum(abs, step) < laplace.inner_tol && break
+        # Below what the value resolves the gradient ranks the step, as in
+        # `_laplace_newton_unit_mode` (`_laplace_floor_step`).
+        if issuccess(factorization) &&
+                _laplace_floor_step(laplace, current.gradient, step, current.value)
+            candidate = z .+ step
+            trial = inner(candidate)
+            if isfinite(trial.value) && all(isfinite, trial.gradient)
+                _laplace_floor_step_taken(current.gradient, trial.gradient) || break
+                z = candidate
+                current = trial
+                continue
+            end
+        end
+        accepted = false
+        scale = 1.0
+        for _ in 1:20
+            candidate = z .+ scale .* step
+            trial = inner(candidate)
+            if isfinite(trial.value) && all(isfinite, trial.gradient) &&
+                    trial.value >= current.value - 1e-12
+                z = candidate
+                current = trial
+                accepted = true
+                break
+            end
+            scale /= 2
+        end
+        accepted || break
+    end
+    return z, current
+end
+
+"""
+    _quadrature_leaf_solve(inner, precision_at, z, current, laplace, k)
+
+A leaf's centre from `z`: Newton (`_quadrature_leaf_newton`), and where that
+ends at a precision with a negative eigenvalue, which is no maximum's -- a
+saddle, or a solve stopped on the way to one -- Newton again from a prior sd
+either way along the most negative direction. Newton does not leave a saddle
+along a direction the gradient has no part in; these starts are the inner
+solve's probes' along a soft direction (`_laplace_probe_modes`), and the
+centre moves only where one gains beyond the value's roundoff
+(`_laplace_inner_tolerance`). The direction is signed
+(`_ctsem_signed_columns!`), so which of two equal maxima is taken does not
+depend on the eigensolver. Returns `(z, current, M, sc)`: the centre, the
+integrand there, its precision and the clipped scale (`_quadrature_scale`).
+"""
+function _quadrature_leaf_solve(inner, precision_at, z::Vector{Float64}, current,
+    laplace::CTSEMLaplaceObjective, k::Integer)
+    z, current = _quadrature_leaf_newton(inner, precision_at, z, current, laplace, k)
+    M = precision_at(z)
+    sc = _quadrature_scale(M, k)
+    if sc.ok && sc.clipped && sc.values[1] < 0
+        v = sc.vectors[:, 1:1]
+        _ctsem_signed_columns!(v)
+        bar = current.value + _laplace_inner_tolerance(laplace, current.value)
+        moved = false
+        for s in (1.0, -1.0)
+            zs = z .+ s .* v[:, 1]
+            cs = inner(zs)
+            all(isfinite, cs.gradient) || continue
+            zs, cs = _quadrature_leaf_newton(inner, precision_at, zs, cs, laplace, k)
+            cs.value > bar || continue
+            z, current, moved = zs, cs, true
+            bar = cs.value + _laplace_inner_tolerance(laplace, cs.value)
+        end
+        if moved
+            M = precision_at(z)
+            sc = _quadrature_scale(M, k)
+        end
+    end
+    return (z=z, current=current, M=M, sc=sc)
+end
+
+"""
+    _quadrature_leaf_rule!(laplace, U, theta, Ls, b, u, aws; start=nothing)
+
+The conditional mode and scale for a leaf block, with its ancestors held at
+whatever `u` currently says.
+
+The leaf mode is where the accuracy is. It moves a long way with the effect
+above it -- a subject whose study effect has been pushed two standard deviations
+has a different best guess about its own -- so re-solving it at every outer node
+is the point of the recursion rather than an optimisation within it.
+
+Newton on this block's coordinates only (`_quadrature_leaf_solve`), from
+`start` (the unit's joint mode, from `_quadrature_block`; the block's current
+entries of `u` otherwise). The ancestors are data here, and a member outside
+this block contributes nothing to its curvature, so the problem is `k x k`
+however large the unit is.
+
+Away from the joint mode a leaf need not be concave. A subject whose study
+effect sits at an outer node can put its own drift where `-log1p_exp` bends,
+and the leaf's precision then has an eigenvalue at or below zero on the way to
+its conditional mode. This used to return a failure there, the node scored
+`NaN`, and a unit of a nested model whose study rule reached two prior standard
+deviations out lost the whole quadrature: on the gated-gaps job's N1 fixture
+(8 studies of 5, a random drift and intercept per subject, a random study
+intercept) five of eight studies failed at the Laplace optimum and the
+five-node check reported `NaN`. Such a step is taken on the precision clipped
+at the prior's, and a centre whose precision has a negative eigenvalue, which
+is no maximum, is left along it. Where every Newton step's precision
+factorizes and the full step raises the integrand, the path and the scale are
+what they were, bit for bit.
+
+Returns `(ok, centre, sc, precision, gradmax)`: `sc` the clipped scale at the
+centre (`_quadrature_scale`), `precision` the unclipped `M` there, which a rule
+placed at every evaluation differentiates through (`laplace_placed.jl`), and
+`gradmax` the integrand's largest gradient left there.
+"""
+function _quadrature_leaf_rule!(laplace::CTSEMLaplaceObjective, U::Integer,
+    theta::Vector{Float64}, Ls::Vector{Matrix{Float64}}, b::Integer,
+    u::Vector{Float64}, aws; start=nothing)
+    block = laplace.units.blocks[U][b]
+    k = block.size
+    columns = (block.offset + 1):(block.offset + k)
+    members = block.members
+    failure = (ok=false, centre=Float64[], sc=_quadrature_scale_failed(),
+        precision=zeros(Float64, 0, 0), gradmax=NaN)
+
+    # The block's own log integrand -- its members' log likelihood less
+    # `z'z/2` -- and its gradient, as a function of this block alone.
+    inner = function (z)
+        work = copy(u)
+        @inbounds for (t, c) in enumerate(columns); work[c] = z[t]; end
+        result = _laplace_unit_loglik_gradient(laplace, U, theta, Ls, work, aws,
+            members, nothing, _HYBRID_FULL)
+        isfinite(result.value) || return (value=-Inf, gradient=fill(NaN, k))
+        return (value=result.value - dot(z, z) / 2,
+            gradient=[result.gradient[c] for c in columns] .- z)
+    end
+    precision_at = z -> _laplace_block_precision(laplace, U, theta, Ls, u, b, z;
+        mode=_HYBRID_FULL)
+
+    z0 = start === nothing ? Float64[u[c] for c in columns] : collect(Float64, start)
+    here = inner(z0)
+    all(isfinite, here.gradient) || return failure
+    r = _quadrature_leaf_solve(inner, precision_at, z0, here, laplace, k)
+    r.sc.ok || return failure
+    return (ok=true, centre=r.z, sc=r.sc, precision=r.M,
+        gradmax=maximum(abs, r.current.gradient))
+end
+
+"""
+    _quadrature_block(laplace, U, theta, Ls, b, u, context, aws)
+
+Block `b`'s contribution to its unit's log marginal: its own coordinates
+integrated, and whatever sits beneath it recursed into.
+
+`u` carries the values already chosen for `b`'s ancestors and is written in
+place as the recursion descends. Entries belonging to other branches are stale
+and unread, because a member reads only the blocks on its own path.
+
+`sink(j, z, term)`, when given, sees each of this block's own nodes and its log
+term (`ctsem_laplace_posterior_nodes`); the recursion does not pass it on.
+"""
+function _quadrature_block(laplace::CTSEMLaplaceObjective, U::Integer,
+    theta::Vector{Float64}, Ls::Vector{Matrix{Float64}}, b::Integer,
+    u::Vector{Float64}, context, aws; sink=nothing)
+    blocks = laplace.units.blocks[U]
+    block = blocks[b]
+    k = block.size
+    columns = (block.offset + 1):(block.offset + k)
+    children = context.children[b]
+    leaf = isempty(children)
+
+    rule = if leaf
+        # From the joint mode, not from whatever `u` holds: after the previous
+        # outer node that is this leaf's own last node, an outer point of its
+        # own rule, which made the value depend on the order nodes were taken.
+        _quadrature_leaf_rule!(laplace, U, theta, Ls, b, u, aws;
+            start=Float64[context.mode[c] for c in columns])
+    else
+        # An outer block keeps the joint mode, and takes its scale from the
+        # *eliminated* diagonal the block factorization already produced: the
+        # curvature of this block after every block beneath it has been
+        # integrated out. That is the conditional precision of `u_b` given its
+        # ancestors under the Gaussian approximation, which is exactly the
+        # distribution the recursion is standing in when it gets here.
+        #
+        # The marginal covariance -- this block's diagonal of `inv(M)` -- is the
+        # wrong object and only looks right at two levels, where a block with
+        # nothing above it has marginal and conditional coincide. At three it
+        # loses the coupling to the level above, and the `nodes = 1` identity
+        # (which forces `sum_b logdet(scale_b) = -logdet(M)/2`) fails, because
+        # the elimination is what makes that sum telescope.
+        # Clipped the same way as a leaf's; the eliminated diagonal of an
+        # `M >= I` is itself at least `I` (its inverse is a diagonal block of
+        # `inv(M) <= I`), so this changes nothing where the unit is concave.
+        sc = _quadrature_scale(context.factors[b], k)
+        (ok=sc.ok, centre=Float64[context.mode[c] for c in columns], sc=sc)
+    end
+    rule.ok || return NaN
+
+    points, logweights = _gh_grid(k, context.nodes)
+    terms = Vector{Float64}(undef, length(points))
+    @inbounds for j in eachindex(points)
+        z = rule.centre .+ sqrt(2) .* (rule.sc.S * points[j])
+        for (t, c) in enumerate(columns); u[c] = z[t]; end
+        inner = 0.0
+        if leaf
+            for m in block.members
+                shifted = _laplace_member_values(theta, laplace.spec, Ls, u,
+                    laplace.units.offsets[U][m])
+                inner += _laplace_member_loglik(aws, laplace.objective.subject_objectives[
+                    laplace.units.members[U][m]], shifted)
+            end
+        else
+            for c in children
+                inner += _quadrature_block(laplace, U, theta, Ls, c, u, context,
+                    aws)
+            end
+        end
+        # A child that could not be scored is a failure of the rule, not a node
+        # where the integrand vanishes: scored as `-Inf` it removed that node's
+        # mass without a word. Only a vanishing likelihood scores `-Inf`.
+        leaf || !isnan(inner) || return NaN
+        terms[j] = isfinite(inner) ? inner - dot(z, z) / 2 + logweights[j] : -Inf
+        sink === nothing || sink(j, z, terms[j])
+    end
+    peak = maximum(terms)
+    isfinite(peak) || return NaN
+    accumulated = 0.0
+    @inbounds for j in eachindex(terms)
+        accumulated += exp(terms[j] - peak)
+    end
+    # `(2 pi)^(-k/2)` from the standard normal density and `2^(k/2)` from the
+    # change of variable `z = centre + sqrt(2) * scale * x`. The Laplace value's
+    # own constants cancel against each other instead -- see `_laplace_unit_term`
+    # -- so they are written out here rather than shared.
+    return peak + log(accumulated) + rule.sc.logdetscale + k * (log(2) - log(2 * pi)) / 2
+end
+
+"""
+    ctsem_laplace_quadrature(laplace, values; nodes=5, contributions=false)
+
+The log marginal likelihood by adaptive Gauss-Hermite quadrature, plus the
+prior -- the same quantity `ctsem_laplace_evaluate` approximates, computed with
+`nodes` points per random effect instead of one.
+
+The rule is *adaptive* in the standard sense: centred at an inner mode and
+scaled by the inverse of the curvature there, both of which the Laplace
+machinery already produces -- with the curvature's eigenvalues clipped from
+below at one, the prior's own, so that no node is placed wider than the prior
+spreads (`_quadrature_scale`). Where every eigenvalue is at least one
+that is the unclipped curvature, bit for bit, and with `nodes = 1` the rule has
+a single point at the mode and the result is the Laplace value to machine
+precision, the cheapest available check that the two agree about what they are
+integrating. Where one is below one, `nodes = 1` gives the eigenwise-floored
+term `g(uhat) - sum log max(lambda, 1) / 2` rather than the fit's own, so the
+gap `ctLaplaceCheck` reports is no longer zero at one node on such a unit.
+
+Cost is `nodes^k` process log likelihoods per block. At one level that is
+`nodes^k` per subject -- 5 or 25 for the common one or two random effects. With
+a hierarchy it recurses over the block tree rather than taking a product over
+it, so the cost stays linear in the number of groups at each level; see the
+module docstring.
+
+`contributions` returns the per-unit terms, which sum to the value less the
+prior. They are per *unit*, not per subject: with a group level the integral
+does not decompose over a group's members, which is the same reason
+`ctsem_laplace_evaluate` spreads its own per-unit term evenly.
+"""
+function ctsem_laplace_quadrature(laplace::CTSEMLaplaceObjective,
+    values::AbstractVector; nodes::Integer=5, contributions::Bool=false)
+    nodes >= 1 || throw(ArgumentError("need at least one quadrature node"))
+    theta = _laplace_extend(laplace, collect(Float64, values))
+    _laplace_check_indices(laplace, length(theta))
+    nunits = length(laplace.units.members)
+    unit_term = zeros(Float64, nunits)
+    Ls = _laplace_popchols(theta, laplace.spec)
+
+    nchunks = _ctsem_nchunks(nunits)
+    # The pool sizes the scratch store, not this function, and its workers carry
+    # their own slot -- so the unit functions below need nothing passed to them,
+    # and a nested region gets a sub-budget rather than the whole pool again.
+    _laplace_ensure_pool!(laplace)
+    ranges = _ctsem_chunk_assignment(_laplace_unit_weights(laplace), nchunks)
+    failed = fill(false, nchunks)
+
+    # Fill the quadrature caches here, before anything is spawned.
+    #
+    # `_gauss_hermite` and `_gh_grid` memoise into plain global `Dict`s, and the
+    # chunks below call both -- `_gh_grid` once per block, `_gauss_hermite` once
+    # per row through the measurement kernels. Concurrent `setindex!` during a
+    # rehash corrupts a `Dict`; `laplace.jl` already carries the note about
+    # finding exactly that on the workspace store, where Julia caught it with
+    # "Multiple concurrent writes to Dict detected!" rather than returning wrong
+    # numbers. There is nothing here that makes these two safer, only rarer:
+    # they are hit by every thread on the first row it touches.
+    #
+    # `_gauss_hermite` now takes a lock as well, because its other callers are
+    # on threaded paths that never reach this warm. Warming still matters here:
+    # after this loop `_GH_GRID_CACHE` is read-only for the rest of the call,
+    # which is what lets it stay unlocked on the per-block path.
+    _quadrature_warm_caches(laplace, nodes)
+
+    # A trial point can be invalid in ways that *throw* rather than return a
+    # non-finite number -- a parameter vector an optimizer wandered into can
+    # make the matrix exponential's own scaling step take `ceil(Int, NaN)`. The
+    # engine's contract is that an evaluation reports NaN, and a throw inside a
+    # spawned task escapes as a `TaskFailedException` that kills whatever loop
+    # is above it, so it is caught here rather than left to every caller.
+
+    run = function (c)
+        try
+            _quadrature_chunk!(laplace, theta, Ls, ranges[c], unit_term, nodes)
+        catch err
+            # Numerical failures become NaN; bugs do not.
+            #
+            # This catch is here for a trial point the model cannot evaluate --
+            # a parameter vector whose matrix exponential scaling step takes
+            # `ceil(Int, NaN)` and throws rather than returning a non-finite
+            # number. Converting *that* to NaN is the engine's contract.
+            #
+            # It caught a `MethodError` too, and that is a different thing
+            # entirely. When the worker pool removed the `slot` argument from
+            # the unit functions, two call sites here kept passing one; every
+            # chunk raised `MethodError`, every chunk was marked failed, and
+            # `ctLaplaceCheck` reported a NaN gap that read exactly like a
+            # quadrature that could not be computed for this model. Nothing
+            # errored, nothing warned, and the only reason it was found is that
+            # a test asserted the result was finite.
+            #
+            # So the errors that mean "this code is wrong" are rethrown. A
+            # `TaskFailedException` from a nested region is unwrapped first,
+            # because the pool may have spawned inside the chunk.
+            _ctsem_must_propagate(err) && rethrow()
+            failed[c] = true
+        end
+        return nothing
+    end
+    _laplace_parallel(laplace, 1:nchunks) do c
+        run(c)
+        return true
+    end
+    if any(failed)
+        return contributions ? (value=NaN, subject_loglik=unit_term) :
+            (value=NaN, subject_loglik=Float64[])
+    end
+    total = _laplace_weighted_total(laplace, unit_term) +
+        _ctsem_log_prior(laplace.objective, theta)
+    return contributions ? (value=total, subject_loglik=unit_term) :
+        (value=total, subject_loglik=Float64[])
+end
+
+"""
+    _quadrature_chunk!(laplace, theta, Ls, units, unit_term, nodes)
+
+One chunk of the unit loop, writing each unit's term into `unit_term`.
+
+Throws rather than flagging: the caller wraps it, so that a failure inside a
+spawned task becomes a NaN evaluation rather than an escaping exception.
+"""
+function _quadrature_chunk!(laplace::CTSEMLaplaceObjective, theta::Vector{Float64},
+    Ls::Vector{Matrix{Float64}}, units, unit_term::Vector{Float64},
+    nodes::Integer)
+    aws = _laplace_workspace!(laplace, Float64, length(theta))
+    for U in units
+        blocks = laplace.units.blocks[U]
+        if isempty(blocks)
+            # No random effects anywhere in this unit: there is no integral,
+            # and the term is the plain log likelihood.
+            # With deviations the filter integrates, their exact integral:
+            # what the Laplace term is for a unit with no effects.
+            unit_term[U] = _laplace_unit_term(laplace, U, theta, Ls, Float64[], aws)
+            continue
+        end
+        _laplace_solve_unit_mode!(laplace, U, theta, Ls)
+        mode = copy(laplace.modes[U])
+        M = _laplace_unit_curvature(laplace, U, theta, Ls, mode)
+        factorization = _laplace_factor_repaired!(M, blocks)
+        factorization.ok ||
+            error("the inner curvature could not be factorized")
+        tree = _quadrature_children(blocks)
+        context = (children=tree.children, nodes=Int(nodes), mode=mode,
+            factors=factorization.factors)
+        u = copy(mode)
+        total = 0.0
+        for root in tree.roots
+            total += _quadrature_block(laplace, U, theta, Ls, root, u, context,
+                aws)
+        end
+        isfinite(total) || error("quadrature produced a non-finite unit term")
+        unit_term[U] = total
+    end
+    return nothing
+end
+
+"""
+    _quadrature_gap_gradient(laplace, values, nodes, step)
+
+Central difference of `quadrature - laplace` in every coordinate.
+
+The *difference* is differenced, not the two objectives separately, because the
+difference is the small, smooth quantity: both objectives carry the same
+several-hundred-log-unit level and the same sharp curvature, and subtracting
+first keeps the cancellation out of the finite difference.
+"""
+function _quadrature_gap_gradient(laplace::CTSEMLaplaceObjective,
+    values::Vector{Float64}, nodes::Integer, step::Real)
+    npar = length(values)
+    gradient = zeros(Float64, npar)
+    gap = function (x)
+        result = try
+            quad = ctsem_laplace_quadrature(laplace, x; nodes=nodes).value
+            lap = ctsem_laplace_evaluate(laplace, x; gradient=false).value
+            quad - lap
+        catch err
+            err isa InterruptException && rethrow()
+            NaN
+        end
+        # A step that lands outside the support carries no information about the
+        # gap; treating it as zero difference is the only honest fallback, and
+        # it leaves the corresponding entry of the correction at zero rather
+        # than at NaN, which would poison the whole Newton step.
+        return isfinite(result) ? result : 0.0
+    end
+    for j in 1:npar
+        h = step * max(1.0, abs(values[j]))
+        plus = copy(values); plus[j] += h
+        minus = copy(values); minus[j] -= h
+        gradient[j] = (gap(plus) - gap(minus)) / (2h)
+    end
+    return gradient
+end
+
+"""
+    ctsem_laplace_correction(laplace, values, hessian; nodes=5, step=1e-3)
+
+How far the Laplace estimate sits from the one the exact integral would give,
+to first order, without refitting.
+
+At the Laplace estimate the Laplace gradient is zero, so the quadrature
+objective's gradient there is exactly the *gap* gradient `grad(Q - T)`, and one
+Newton step against the curvature already computed for the standard errors
+gives
+
+    delta = (-H)^-1 grad(Q - T)
+
+Costs `2 * npar` quadrature evaluations. Report it beside the estimate: an
+entry small against that parameter's standard error says the approximation is
+not what is limiting the answer, and a large one says it is. On a 40-subject
+model with a random DRIFT the population scale's entry is about two thirds of
+the distance to the generating value.
+
+`hessian` is the outer Hessian at `values`, as `ctsem_laplace_hessian` returns
+it; it is taken as an argument rather than recomputed because the caller
+computing standard errors has already paid for it.
+
+`laplace_gradient = true` adds the Laplace objective's own gradient at `values`
+to the gap gradient, so the step is a Newton step on the quadrature objective
+from a point that is *not* a Laplace optimum -- a fit already moved off
+it. There `grad(Q - T)` alone is not `grad Q`.
+"""
+function ctsem_laplace_correction(laplace::CTSEMLaplaceObjective,
+    values::AbstractVector, hessian::AbstractMatrix; nodes::Integer=5,
+    step::Real=1e-3, laplace_gradient::Bool=false)
+    theta = collect(Float64, values)
+    gap = _quadrature_gap_gradient(laplace, theta, nodes, step)
+    if laplace_gradient
+        gap .+= ctsem_laplace_evaluate(laplace, theta; gradient=true).gradient
+    end
+    H = Symmetric((hessian .+ transpose(hessian)) ./ 2)
+    delta, dropped = _correction_step(H, gap)
+    quadrature = ctsem_laplace_quadrature(laplace, theta; nodes=nodes).value
+    laplacevalue = ctsem_laplace_evaluate(laplace, theta; gradient=false).value
+    return (delta=delta, corrected=theta .+ delta, gap_gradient=gap,
+        quadrature=quadrature, laplace=laplacevalue,
+        gap=quadrature - laplacevalue, nodes=Int(nodes),
+        dropped_directions=dropped)
+end
+
+"""
+    _correction_step(H, gap) -> (delta, dropped)
+
+Solve `-H \\ gap` along the directions `H` actually identifies, and report how
+many it did not.
+
+A plain solve here is wrong in a way that produces a number rather than an
+error. The gap gradient is a central difference of the quadrature value, so on a
+model where Laplace is exact it sits at floating-point noise -- measured at
+7e-12 and 2e-11 on two runs of the same three-level fixture. If `H` is also
+near-singular, and it is whenever a population scale is weakly identified (six
+studies, in that fixture), `H \\ gap` multiplies that noise by 1/lambda_min.
+The two runs returned corrections of 3.3e+08 and 3.5e-10 standard errors from
+the same fit: one absurd, one fine, both meaningless, and nothing distinguished
+them.
+
+Truncating at `sqrt(eps)` relative to the largest eigenvalue is the standard
+answer and the right one here: a first-order correction along a direction the
+data does not identify is not estimable, and reporting zero for it is honest
+where reporting 3e+08 is not. `dropped_directions` on the result says when it
+happened rather than leaving it to be inferred.
+
+`ascent = true` also drops every direction along which `H` is not negative --
+the objective is not concave there, so `-H \\ gap` along it is a step
+*down*. The default correction needs that: on the AnomAuth real-data model the
+Laplace optimum's Hessian had two positive eigenvalues (a saddle or kink the
+optimiser stopped at), and the unguarded step went away from the better
+optimum while the line search accepted it.
+"""
+function _correction_step(H::Symmetric, gap::AbstractVector; ascent::Bool=false)
+    n = length(gap)
+    n == 0 && return (Float64[], 0)
+    decomposition = try
+        eigen(H)
+    catch err
+        err isa InterruptException && rethrow()
+        return (fill(NaN, n), 0)
+    end
+    lambda = decomposition.values
+    scale = maximum(abs, lambda)
+    (!isfinite(scale) || scale == 0) && return (zeros(n), n)
+    tolerance = sqrt(eps(Float64)) * scale
+    projected = transpose(decomposition.vectors) * gap
+    dropped = 0
+    for i in eachindex(lambda)
+        if abs(lambda[i]) <= tolerance || (ascent && lambda[i] >= 0)
+            projected[i] = 0.0
+            dropped += 1
+        else
+            projected[i] /= lambda[i]
+        end
+    end
+    return (-(decomposition.vectors * projected), dropped)
+end
+
+"""
+    ctsem_laplace_refine(laplace, values; nodes=5, maxiter=50, step=1e-4)
+
+Maximise the quadrature objective, started from the Laplace estimate.
+
+For when `ctsem_laplace_correction` says the first-order step is large enough to
+matter and a linear correction is not enough. The gradient is a central
+difference of the quadrature value -- exact-to-quadrature but `2 * npar`
+evaluations each, so this is minutes rather than the seconds a Laplace fit
+takes, and it is deliberately not the default.
+
+Starting at the Laplace estimate is what makes it affordable: the two optima
+are close, the inner modes are warm, and L-BFGS has a good initial metric.
+
+Not on any R path now: it did not finish in 40 minutes on the 800-subject
+AnomAuth model, where it needs 18 quadratures per gradient, and the
+continuation (`ctsem_laplace_continuation`) takes the same objective's
+gradient exactly. Kept as the independent reference the continuation's tests
+compare against: it shares the rule and the L-BFGS (`_ctsem_lbfgs`) with it,
+and not the gradient, which here is differenced from the quadrature value.
+"""
+function ctsem_laplace_refine(laplace::CTSEMLaplaceObjective,
+    values::AbstractVector; nodes::Integer=5, maxiter::Integer=50,
+    step::Real=1e-4, g_tol::Real=1e-5, verbose::Bool=false)
+    start = collect(Float64, values)
+    invalid = floatmax(Float64) / 1e8
+    objective = function (x)
+        value = try
+            ctsem_laplace_quadrature(laplace, x; nodes=nodes).value
+        catch err
+            err isa InterruptException && rethrow()
+            NaN
+        end
+        return isfinite(value) ? -value : invalid
+    end
+    # `_ctsem_lbfgs`'s contract: `G === nothing` asks for the value alone, and
+    # an invalid point is a huge value with a zero gradient.
+    fg! = function (F, G, x)
+        f = objective(x)
+        G === nothing && return f
+        if f == invalid
+            fill!(G, 0.0)
+        else
+            for j in eachindex(x)
+                h = step * max(1.0, abs(x[j]))
+                plus = copy(x); plus[j] += h
+                minus = copy(x); minus[j] -= h
+                G[j] = (objective(plus) - objective(minus)) / (2h)
+            end
+        end
+        return f
+    end
+    report = verbose ? (state -> (println("refine ", state.iteration, ": ",
+        -state.value, ", |g| ", state.g_norm); false)) : nothing
+    result = _ctsem_lbfgs(fg!, start; maxiter=Int(maxiter), g_tol=g_tol,
+        callback=report)
+    minimizer = result.minimizer
+    return (minimizer=minimizer,
+        maximum_loglik=-result.minimum,
+        laplace_start=start,
+        shift=minimizer .- start,
+        iterations=result.iterations,
+        converged=result.g_converged,
+        nodes=Int(nodes))
+end
+
+################################################################################
+# Reference implementation of the soft-direction quadrature's value
+################################################################################
+#
+# The `:quadrature` floor (`_laplace_soft_quadrature_term` in laplace.jl) is generic in its
+# element type because its gradient differentiates it. These two functions
+# compute the same rule in plain Float64, written separately and first, and
+# `test_laplace.jl` holds the floor's value to them. They are not on any
+# fitting path.
+
+"""
+    _laplace_soft_rule_unit(laplace, values, U; nodes=5, ndirs=1, tau=0.0,
+                            recenter=true, newton_steps=0)
+
+One unit's log marginal likelihood by a Gauss-Hermite rule along the unit's
+softest directions and Laplace in the rest. Value only: the reference the
+soft-direction quadrature is tested against; see
+`CT-SEM/review/LAPLACE-eigenwise-floor-2026-09-23.md`, second and third
+addenda. Reads the modes of the last `ctsem_laplace_evaluate` at `values`.
+
+In the eigenbasis `M = V Lambda V'` at the mode:
+
+  * the `ndirs` smallest directions, and any other with `lambda < tau`, get
+    `nodes` points at the *clipped* scale `1/sqrt(max(lambda, 1))` -- never
+    wider than the prior, which is what `ctsem_laplace_quadrature`'s
+    `M^(-1/2)` scaling gets wrong at a near-singular unit;
+  * at each such node the remaining coordinates are moved to their conditional
+    mode (`recenter`, Newton) and integrated by Laplace with their conditional
+    curvature, its eigenvalues floored as the soft-direction quadrature's nodes
+    floor them (`_laplace_soft_node_curvature_floor`). Without the recentring
+    the rule misses the ridge a nonlinear effect bends the integrand along, and
+    does worse than one node; without the floor, a conditional curvature that
+    collapses at a far node produces a spike of several nats.
+
+`newton_steps = k > 0` replaces the converged recentring by `k` Newton steps,
+each with the node's own conditional curvature, and takes the conditional
+logdet from the last curvature evaluated: `k` gradients, `k` curvatures and one
+value per node. `k = 1` at 3 nodes is the cheap rule of the third addendum.
+Steps that end below the node's own value are taken back as the production
+nodes take them back (`_laplace_soft_node_stepped`).
+The middle node of an odd rule sits at the mode and costs nothing.
+
+`nodes = 1`, `ndirs = 0`, `tau = 1` is `g(uhat) - sum log max(lambda, 1) / 2`:
+every direction below one is then soft, and the floor is the identity above it.
+Uses `_ctsem_symeig` and `_ctsem_cholesky` throughout (no LAPACK); a rule of
+`n` nodes costs about `n` conditional Newton solves of a few steps, each a
+curvature of the unit, so `n` times the primal work of one unit.
+"""
+function _laplace_soft_rule_unit(laplace::CTSEMLaplaceObjective,
+    values::AbstractVector, U::Integer; nodes::Integer=5, ndirs::Integer=1,
+    tau::Real=0.0, recenter::Bool=true, newton_steps::Integer=0)
+    theta = collect(Float64, values)
+    _laplace_ensure_pool!(laplace)
+    Ls = _laplace_popchols(theta, laplace.spec)
+    aws = _laplace_workspace!(laplace, Float64, length(theta))
+    uhat = copy(laplace.modes[U])
+    d = length(uhat)
+    blocks = laplace.units.blocks[U]
+    gof(u) = _laplace_unit_objective_gradient(laplace, U, theta, Ls, u, aws)
+    Mof(u) = _laplace_block_dense(_laplace_unit_curvature(laplace, U, theta, Ls, u),
+        blocks, d)
+    d == 0 && return gof(uhat).value
+    E = _ctsem_symeig(Mof(uhat))
+    soft = sort(unique(vcat(collect(1:min(Int(ndirs), d)),
+        findall(<(tau), E.values))))
+    stiff = setdiff(1:d, soft)
+    ns, nh = length(soft), length(stiff)
+    Vs, Vh = E.vectors[:, soft], E.vectors[:, stiff]
+    lsoft = max.(E.values[soft], 1.0)
+    xs, ws = _gauss_hermite(nodes)
+
+    # log int exp(g(ubase + Vh z)) dz by Laplace at the conditional mode, with
+    # the conditional curvature floored as the production nodes' is.
+    nodefloor = _laplace_soft_node_curvature_floor
+    stiff_part = function (ubase::Vector{Float64})
+        local z, r, gz, Mz, F, ez, lam, uu
+        nh == 0 && return gof(ubase).value
+        z = zeros(nh)
+        if recenter && newton_steps > 0
+            lam = nodefloor.(E.values[stiff])
+            maximum(abs, ubase .- uhat) < 1e-12 &&
+                return gof(uhat).value - sum(log, lam; init=0.0) / 2
+            h0 = NaN
+            for k in 1:Int(newton_steps)
+                r = gof(ubase .+ Vh * z)
+                k == 1 && (h0 = r.value)
+                ez = _ctsem_symeig(transpose(Vh) * Mof(ubase .+ Vh * z) * Vh)
+                lam = nodefloor.(ez.values)
+                z .+= ez.vectors * ((transpose(ez.vectors) *
+                    (transpose(Vh) * r.gradient)) ./ lam)
+            end
+            # Steps that lose, against the node's own value, are taken back as
+            # the production nodes take them back.
+            return _laplace_soft_node_stepped(h0, gof(ubase .+ Vh * z).value) -
+                sum(log, lam; init=0.0) / 2
+        end
+        if recenter
+            for _ in 1:50
+                r = gof(ubase .+ Vh * z)
+                gz = transpose(Vh) * r.gradient
+                maximum(abs, gz) < laplace.inner_tol && break
+                Mz = transpose(Vh) * Mof(ubase .+ Vh * z) * Vh
+                F = _ctsem_cholesky(Matrix(_laplace_symmetrise(Mz)), nh)
+                issuccess(F) || break
+                step = F \ gz
+                z .+= step
+                # At roundoff in the step, as `_laplace_newton_unit_mode` stops.
+                maximum(abs, step) < laplace.inner_tol && break
+            end
+        end
+        uu = ubase .+ Vh * z
+        ez = _ctsem_symeig(transpose(Vh) * Mof(uu) * Vh)
+        lam = recenter ? nodefloor.(ez.values) : E.values[stiff]
+        return gof(uu).value - sum(log, lam; init=0.0) / 2
+    end
+    terms = Float64[]
+    for idx in Iterators.product(ntuple(_ -> 1:Int(nodes), ns)...)
+        x = Float64[xs[i] for i in idx]
+        v = stiff_part(uhat .+ Vs * (sqrt(2) .* x ./ sqrt.(lsoft)))
+        push!(terms, isfinite(v) ?
+            v + sum(log(ws[i]) + xs[i]^2 for i in idx; init=0.0) : -Inf)
+    end
+    peak = maximum(terms)
+    isfinite(peak) || return NaN
+    # Per soft direction sqrt(2/lambda~) from the change of variable against the
+    # sqrt(pi) the weights carry and the (2 pi)^(-1/2) of the density.
+    return peak + log(sum(exp.(terms .- peak))) - sum(log, lsoft; init=0.0) / 2 -
+        ns * log(pi) / 2
+end
+
+
+"""
+    _laplace_soft_weight(lambda, lo, hi)
+
+The C1 hand-off from the soft rule to the Laplace term: one below `lo`, zero
+above `hi`, and `1 - (3 s^2 - 2 s^3)` between, with `s = (lambda - lo)/(hi - lo)`.
+"""
+function _laplace_soft_weight(lambda::Real, lo::Real, hi::Real)
+    s = clamp((lambda - lo) / (hi - lo), 0.0, 1.0)
+    return 1 - (3 * s^2 - 2 * s^3)
+end
+
+"""
+    _laplace_soft_quadrature_unit_reference(laplace, values, U; lo=0.2, hi=0.7, nodes=3,
+                                  newton_steps=1)
+
+`T = T_lap + w(lambda_min) (T_soft - T_lap)` for one unit, value only, at the
+modes of the last `ctsem_laplace_evaluate` at `values` under the total floor.
+`T_lap` is the unfloored Laplace term: a unit with an eigenvalue to go on needs
+no floor, see `_laplace_soft_quadrature_term`.
+The Float64 reference for `_laplace_soft_quadrature_term`; see the section comment.
+
+The gate is exact and costs no likelihood sweep: `M - hi I` is block-factored
+(the same elimination as `M`'s own, no fill-in), and a unit it accepts returns
+`T_lap` untouched. Only a flagged unit places `lambda_min`, by the engine's
+own symmetric eigensolver at any width: a reference, so dense whatever it
+costs. Only a unit with `w > 0` evaluates the soft rule.
+
+Returns `(value, weight, lambda_min, flagged)`.
+"""
+function _laplace_soft_quadrature_unit_reference(laplace::CTSEMLaplaceObjective,
+    values::AbstractVector, U::Integer; lo::Real=0.2, hi::Real=0.7,
+    nodes::Integer=3, newton_steps::Integer=1)
+    theta = collect(Float64, values)
+    _laplace_ensure_pool!(laplace)
+    Ls = _laplace_popchols(theta, laplace.spec)
+    aws = _laplace_workspace!(laplace, Float64, length(theta))
+    u = laplace.modes[U]
+    blocks = laplace.units.blocks[U]
+    inner = _laplace_unit_objective_gradient(laplace, U, theta, Ls, u, aws)
+    isempty(u) && return (value=inner.value, weight=0.0, lambda_min=Inf, flagged=false)
+    M = _laplace_unit_curvature(laplace, U, theta, Ls, u)
+    ok, logdetM, _, _ = _laplace_block_factor(M, blocks)
+    ok || return (value=NaN, weight=0.0, lambda_min=NaN, flagged=false)
+    lap = inner.value - logdetM / 2
+    _laplace_exceeds_identity(M, blocks, hi) &&
+        return (value=lap, weight=0.0, lambda_min=Inf, flagged=false)
+    d = length(u)
+    lambda = _ctsem_symeig(_laplace_block_dense(M, blocks, d)).values[1]
+    w = _laplace_soft_weight(lambda, lo, hi)
+    w == 0 && return (value=lap, weight=0.0, lambda_min=lambda, flagged=true)
+    soft = _laplace_soft_rule_unit(laplace, theta, U; nodes=nodes,
+        ndirs=1, tau=0.0, recenter=true, newton_steps=newton_steps)
+    return (value=lap + w * (soft - lap), weight=w, lambda_min=lambda,
+        flagged=true)
+end
+
+################################################################################
+# Laplace's O(1/n) correction, per unit
+################################################################################
+
+"""
+    ctsem_laplace_expansion(laplace, values; h=0.01, gate=1.0)
+
+Each unit's integral by Laplace's expansion to O(1/n), and a bound on its
+error: the deterministic counterpart of the product rules above, at about
+`2q + 1` unit curvatures a unit of `q` effects
+(review/LAPLACE-correction-measure-2026-10-30.md).
+
+A unit's log integrand is `f(u) = g(u) - u'u/2`, `g` its members' log
+likelihood with any deviations the filter integrates integrated exactly
+(`_HYBRID_FULL`), as the product rules integrate it. At `f`'s own mode, with
+`M = -f''` and `u = mode + A z`, `A A' = M^-1`,
+
+    log int exp(g) phi = f(mode) - logdet(M)/2 + c + O(n^-2),
+    c = c4 + c3,  c4 = sum_ij b_iijj / 8,
+    c3 = sum_ijk a_ijk^2 / 12 + sum_k v_k^2 / 8,  v_k = sum_i a_iik,
+
+`a` and `b` the third and fourth derivatives of `f` in `z`. In whitened
+coordinates `W(z) = A' f''(mode + A z) A` is `-I` at `z = 0`; `a_..k` is its
+central difference along `e_k`, at `h`, and `sum_ij b_iijj` the second
+difference of its trace, so `2q + 1` exact curvatures give all of it (checked
+on Stirling's series and a non-separable 2-D integral,
+scripts/laplace-correction-2026-10/check_1d.R).
+
+Returned per unit: `term`, Laplace's term for `f` (`T`, which on the hybrid
+need not be the objective's, a joint approximation over effects and
+deviations); `correction`, `c`; `bound`, `|c4| + c3`; and `mineig`, the
+smallest eigenvalue of `M`, the prior's being 1. On 17 fixtures (2,486 units)
+every unit with `mineig >= 1` had `T + c` within `bound` of a converged
+product rule; below 1 the expansion failed on AnomAuth's units with three to
+five waves, where it can be several nats wrong, so a caller gates on it
+(`.ctLaplaceExpansionGate`). A unit below `gate` returns its term and
+eigenvalue without the `2q` curvatures of the correction, which grow as `q^2`
+sweeps and would be thrown away. A unit with no effect coordinates is its
+exact term, with no correction and no bound; one whose curvature at `f`'s mode
+does not factor, or that fails to evaluate, is NaN.
+"""
+function ctsem_laplace_expansion(laplace::CTSEMLaplaceObjective, values::AbstractVector;
+    h::Real=0.01, gate::Real=1.0)
+    theta = _laplace_extend(laplace, collect(Float64, values))
+    _laplace_check_indices(laplace, length(theta))
+    nunits = length(laplace.units.members)
+    term = fill(NaN, nunits)
+    correction = fill(NaN, nunits)
+    bound = fill(NaN, nunits)
+    mineig = fill(NaN, nunits)
+    Ls = _laplace_popchols(theta, laplace.spec)
+    nchunks = _ctsem_nchunks(nunits)
+    _laplace_ensure_pool!(laplace)
+    ranges = _ctsem_chunk_assignment(_laplace_unit_weights(laplace), nchunks)
+    _laplace_parallel(laplace, 1:nchunks) do c
+        _expansion_chunk!(laplace, theta, Ls, ranges[c], term, correction, bound,
+            mineig, Float64(h), Float64(gate))
+        return true
+    end
+    return (term=term, correction=correction, bound=bound, mineig=mineig)
+end
+
+"""One chunk of `ctsem_laplace_expansion`'s unit loop. A unit that cannot be
+expanded is left NaN, and the others go on: a numerical failure of one unit is
+a reason to integrate it some other way, not to lose the rest."""
+function _expansion_chunk!(laplace::CTSEMLaplaceObjective, theta::Vector{Float64},
+    Ls::Vector{Matrix{Float64}}, units, term::Vector{Float64},
+    correction::Vector{Float64}, bound::Vector{Float64}, mineig::Vector{Float64},
+    h::Float64, gate::Float64)
+    aws = _laplace_workspace!(laplace, Float64, length(theta))
+    for U in units
+        try
+            if isempty(laplace.units.blocks[U])
+                # No effect coordinates: the term is the members' exact integral
+                # over the deviations the filter integrates, as the product
+                # rules take it.
+                term[U] = Float64(_laplace_unit_term(laplace, U, theta, Ls, Float64[], aws))
+                correction[U] = 0.0
+                bound[U] = 0.0
+                mineig[U] = Inf
+                continue
+            end
+            r = _laplace_unit_expansion(laplace, U, theta, Ls, aws, h, gate)
+            term[U] = r.term
+            correction[U] = r.correction
+            bound[U] = r.bound
+            mineig[U] = r.mineig
+        catch err
+            _ctsem_must_propagate(err) && rethrow()
+        end
+    end
+    return nothing
+end
+
+"""`f` and its gradient at `u`: the members' log likelihood with the deviations
+the filter integrates integrated exactly, less `u'u/2`."""
+function _expansion_value_gradient(laplace::CTSEMLaplaceObjective, U::Integer,
+    theta::Vector{Float64}, Ls::Vector{Matrix{Float64}}, u::Vector{Float64}, aws)
+    r = _laplace_unit_loglik_gradient(laplace, U, theta, Ls, u, aws,
+        1:length(laplace.units.members[U]), nothing, _HYBRID_FULL)
+    return (value=Float64(r.value) - dot(u, u) / 2,
+        gradient=collect(Float64, r.gradient) .- u)
+end
+
+"""`M(u) = -f''(u)`, dense and symmetric, from the exact unit curvature."""
+function _expansion_curvature(laplace::CTSEMLaplaceObjective, U::Integer,
+    theta::Vector{Float64}, Ls::Vector{Matrix{Float64}}, u::Vector{Float64})
+    q = length(u)
+    M = _laplace_unit_curvature(laplace, U, theta, Ls, copy(u); mode=_HYBRID_FULL)
+    D = _laplace_block_dense(M, laplace.units.blocks[U], q)
+    return (D .+ transpose(D)) ./ 2
+end
+
+"""`A' M A`, by loops: `q` is one unit's effects."""
+function _expansion_whiten(A::Matrix{Float64}, M::Matrix{Float64})
+    q = size(A, 1)
+    B = zeros(q, q)
+    @inbounds for j in 1:q, p in 1:q
+        s = 0.0
+        for i in 1:q
+            s += M[p, i] * A[i, j]
+        end
+        B[p, j] = s
+    end
+    W = zeros(q, q)
+    @inbounds for j in 1:q, i in 1:q
+        s = 0.0
+        for p in 1:q
+            s += A[p, i] * B[p, j]
+        end
+        W[i, j] = s
+    end
+    return W
+end
+
+"""One unit's expansion (`ctsem_laplace_expansion`): `f`'s mode by Newton from
+the objective's, which on the hybrid is the joint mode over effects and
+deviations and so not `f`'s, then the correction from `2q + 1` curvatures."""
+function _laplace_unit_expansion(laplace::CTSEMLaplaceObjective, U::Integer,
+    theta::Vector{Float64}, Ls::Vector{Matrix{Float64}}, aws, h::Float64,
+    gate::Float64=1.0)
+    nan = (term=NaN, correction=NaN, bound=NaN, mineig=NaN)
+    _laplace_solve_unit_mode!(laplace, U, theta, Ls, aws)
+    u = collect(Float64, laplace.modes[U])
+    q = length(u)
+    cur = _expansion_value_gradient(laplace, U, theta, Ls, u, aws)
+    isfinite(cur.value) || return nan
+    M = _expansion_curvature(laplace, U, theta, Ls, u)
+    for _ in 1:max(laplace.inner_maxiter, 50)
+        F = _ctsem_cholesky(copy(M), q)
+        issuccess(F) || break
+        step = F \ cur.gradient
+        maximum(abs, step) < 1e-10 && break
+        # Below what the value resolves the gradient ranks the step, as in
+        # `_laplace_newton_unit_mode` (`_laplace_floor_step`).
+        if _laplace_floor_step(laplace, cur.gradient, step, cur.value)
+            trial_u = u .+ step
+            trial = _expansion_value_gradient(laplace, U, theta, Ls, trial_u, aws)
+            if isfinite(trial.value)
+                _laplace_floor_step_taken(cur.gradient, trial.gradient) || break
+                u = trial_u
+                cur = trial
+                M = _expansion_curvature(laplace, U, theta, Ls, u)
+                continue
+            end
+        end
+        scale = 1.0
+        accepted = false
+        for _ in 1:40
+            trial_u = u .+ scale .* step
+            trial = _expansion_value_gradient(laplace, U, theta, Ls, trial_u, aws)
+            if isfinite(trial.value) && trial.value >= cur.value - 1e-12
+                u = trial_u
+                cur = trial
+                accepted = true
+                break
+            end
+            scale /= 2
+        end
+        accepted || break
+        M = _expansion_curvature(laplace, U, theta, Ls, u)
+    end
+    lowest = minimum(_ctsem_symeig(M).values)
+    F = _ctsem_cholesky(copy(M), q)
+    issuccess(F) || return (term=NaN, correction=NaN, bound=NaN, mineig=lowest)
+    T = cur.value - logdet(F) / 2
+    lowest < gate && return (term=T, correction=NaN, bound=NaN, mineig=lowest)
+    A = _ctsem_cholesky_uinv(F)
+    a = zeros(q, q, q)
+    S4 = 0.0
+    for k in 1:q
+        dk = h .* A[:, k]
+        Wp = _expansion_whiten(A, _expansion_curvature(laplace, U, theta, Ls, u .+ dk))
+        Wm = _expansion_whiten(A, _expansion_curvature(laplace, U, theta, Ls, u .- dk))
+        # `W(z) = -A' M A`: the curvatures above are `M`, so the signs flip.
+        @inbounds for j in 1:q, i in 1:q
+            a[i, j, k] = -(Wp[i, j] - Wm[i, j]) / (2h)
+        end
+        S4 += -(tr(Wp) - 2q + tr(Wm)) / h^2
+    end
+    # A difference along `k` is symmetric in `i, j` only: average over the
+    # index permutations.
+    c3a = 0.0
+    v = zeros(q)
+    @inbounds for k in 1:q, j in 1:q, i in 1:q
+        s = (a[i, j, k] + a[i, k, j] + a[j, i, k] + a[j, k, i] + a[k, i, j] +
+            a[k, j, i]) / 6
+        c3a += s * s
+        i == j && (v[k] += s)
+    end
+    c4 = S4 / 8
+    c3 = c3a / 12 + sum(abs2, v) / 8
+    return (term=T, correction=c4 + c3, bound=abs(c4) + c3, mineig=lowest)
+end

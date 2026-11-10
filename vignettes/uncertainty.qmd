@@ -1,0 +1,532 @@
+---
+title: "Uncertainty in a Fitted ctsem Model"
+format:
+  html:
+    toc: true
+    code-fold: false
+    embed-resources: true
+    self-contained-math: true
+execute:
+  message: false
+  warning: false
+vignette: >
+  %\VignetteIndexEntry{Uncertainty in a Fitted ctsem Model}
+  %\VignetteEngine{quarto::html}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 7,
+  fig.height = 4.4,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+```{r libs}
+library(ctsem)
+library(ggplot2)
+set.seed(12)
+```
+
+Every `ctFit()` returns an estimate and a claim about how uncertain it is. Where
+that claim comes from depends on three choices, each of which changes what the
+resulting interval means:
+
+- **`optimize`**: sample the posterior (or likelihood) by MCMC, or find its
+  mode and approximate the curvature there.
+- **`priors`**: include ctsem's weakly informative priors on the raw parameter
+  scale, or leave them out.
+- **`uncertainty`**: for an optimized fit, which curvature-or-resampling
+  approximation to use around the mode.
+
+This vignette works through all three, on both backends (`backend = 'stan'`
+and `backend = 'julia'`), using one small model fit many different ways so the
+intervals can be compared directly rather than described in the abstract.
+
+## The two routes
+
+**Sampling** (`optimize = FALSE`) draws from the target density by MCMC --
+Stan's sampler for `backend = 'stan'`, the julia engine's own for
+`backend = 'julia'`: its No-U-Turn sampler for a model like the one here,
+with no random effects, and SAEM's kernel on the joint posterior of
+parameters and random effects when there are some. Uncertainty is then just the spread of the
+draws: no curvature is computed and no normal approximation is assumed. This
+is the most trustworthy route and the slowest one.
+
+**Optimizing** (`optimize = TRUE`, the default) finds the mode of the same
+target and reports a point estimate plus an approximation of the local
+curvature there. The approximation is cheap -- one fit instead of thousands of
+gradient evaluations -- but it is only as good as the normal approximation it
+rests on. It is a poor description of a posterior that is skewed, bounded, or
+multimodal, which variance-like parameters often are with few subjects.
+
+Both routes target the *same* density for a given setting of `priors`; they
+differ only in how they characterise it. The rest of this vignette compares
+them directly, then works through what sits between "one Hessian" and "full
+sampling," and then through what changes when priors are switched off.
+
+## A small model, fit several ways
+
+The model below is a single latent process observed with a fixed measurement
+scale, estimating a continuous-time intercept, drift, and diffusion. Ten
+subjects and eight time points keep every fit in this document fast, which
+also means several of the demonstrations below hit the small-sample problems
+this vignette is about -- deliberately, since a model too well identified to
+show the difference between uncertainty methods would not make the point.
+
+```{r generate-data}
+n_subjects <- 8
+tpoints <- 8
+
+gen_model <- ctModel(
+  type = "omx",
+  Tpoints = tpoints,
+  n.latent = 1,
+  n.manifest = 1,
+  LAMBDA = matrix(1),
+  T0MEANS = matrix(0),
+  T0VAR = matrix(0.6),
+  DRIFT = matrix(-0.35),
+  DIFFUSION = matrix(0.5),
+  CINT = matrix(0.15),
+  MANIFESTMEANS = matrix(0),
+  MANIFESTVAR = matrix(0.25)
+)
+
+dat <- data.frame(ctGenerate(gen_model, n = n_subjects, dtmean = 0.4,
+  logdtsd = 0.1))
+
+fit_model <- ctModel(
+  type = "ct",
+  Tpoints = tpoints,
+  n.latent = 1,
+  n.manifest = 1,
+  LAMBDA = matrix(1),
+  MANIFESTMEANS = matrix(0),
+  CINT = matrix("cint"),
+  DRIFT = matrix("drift"),
+  DIFFUSION = matrix("diffusion")
+)
+# A fixed-effects model: no individual differences to estimate on top of the
+# already small sample. ctModel() defaults T0MEANS and CINT to individually
+# varying, which is realistic for most applications but adds population
+# standard deviations and correlations this vignette does not need, and with
+# eight subjects those are barely identified on their own -- confounding
+# uncertainty about the individual-differences distribution with uncertainty
+# about the drift this vignette is actually comparing.
+fit_model$pars$indvarying <- FALSE
+```
+
+The two backends store an optimized fit's point estimate and posterior draws
+in different places (`fit$stanfit$rawest` / `fit$stanfit$rawposterior` for
+`backend = 'stan'`, `fit$estimate$raw` / `fit$estimate$rawposterior` for
+`backend = 'julia'`). `summary()` and `ctExtract()` read either transparently
+and report on the usual constrained parameter scale, so the rest of this
+vignette uses those rather than the raw slots directly.
+
+```{r popmeans-helper}
+drift_interval <- function(fit) {
+  draws <- ctExtract(fit)$pop_DRIFT[, 1, 1]
+  c(mean = mean(draws), quantile(draws, c(.025, .975)))
+}
+```
+
+### Sampling
+
+```{r sample-stan}
+stan_sample <- ctFit(
+  datalong = dat, model = fit_model, backend = "stan",
+  cores = 1, priors = TRUE, optimize = FALSE,
+  sampleControl = list(chains = 1, iter = 400), verbose = 0
+)
+```
+
+```{r sample-julia}
+julia_sample <- ctFit(
+  datalong = dat, model = fit_model, backend = "julia",
+  cores = 1, priors = TRUE, optimize = FALSE,
+  sampleControl = list(chains = 1, iter = 250), verbose = 0
+)
+```
+
+With a single short chain each, these are quick demonstrations rather than
+publication-ready samples -- raise `chains` and `iter` in `sampleControl` for
+real work. The drift interval from each:
+
+```{r sample-compare}
+rbind(stan = drift_interval(stan_sample), julia = drift_interval(julia_sample))
+```
+
+### Optimizing
+
+```{r optimize-stan}
+stan_map <- ctFit(
+  datalong = dat, model = fit_model, backend = "stan",
+  cores = 1, priors = TRUE, optimize = TRUE,
+  optimcontrol = list(stochastic = FALSE, carefulfit = FALSE, finishsamples = 200)
+)
+```
+
+```{r optimize-julia}
+julia_map <- ctFit(
+  datalong = dat, model = fit_model, backend = "julia",
+  cores = 1, priors = TRUE, optimize = TRUE,
+  optimcontrol = list(finishsamples = 200), verbose = 0
+)
+```
+
+```{r optimize-compare}
+rbind(stan = drift_interval(stan_map), julia = drift_interval(julia_map))
+```
+
+Each optimized fit above draws its `rawposterior` from a Hessian-based normal
+approximation by default (`uncertainty = "hessian"`) -- the closest
+optimized-fit analogue to the sampling intervals above, but still an
+approximation around a single point rather than a description of the whole
+density. The next section is about what else can go in that approximation's
+place.
+
+## The bits in between
+
+An optimized fit does not have to settle for a normal approximation at the
+optimum. `uncertainty` in `optimcontrol` (at fit time) or `method` in
+`ctFitUncertainty()` (after the fact, reusing the existing optimum; previously
+`ctOptimUncertainty()`, still available) selects among several:
+
+- `hessian`: finite-difference (stan) or exact forward-mode (julia) curvature
+  at the optimum, with normal draws. The cheapest, and the default: on
+  julia the interval check compares the normal against the log posterior's
+  gradients, as `checked` does, and says when the posterior departs from
+  it -- for building a model, whose intervals to report come from sampling
+  it.
+- `checked`: the `hessian` normal, checked against the log posterior's
+  gradients at 16 to 256 draws from it, and importance sampled in the
+  directions where its intervals would be wrong -- a skew, a variance that
+  scales other parameters' widths. Where sampling within the fit's own cost
+  cannot correct it, as on a curved ridge, the `hessian` normal is kept and
+  a warning names the parameters. With nothing found, exactly the `hessian`
+  normal. It samples those directions with the others held near the centre,
+  so where a population sd widens the effects it scales, its intervals can
+  remain too narrow.
+- `opg`: an information estimate from the variability of per-subject score
+  contributions, with no Hessian involved. Included as a diagnostic; it tends
+  to disagree with the others most exactly where the Hessian's curvature
+  information would have mattered.
+- `sandwich`: Hessian bread with score-covariance meat -- a robust covariance
+  more than a curvature approximation, useful as a misspecification check.
+- `bootstrap`: a one-step score bootstrap using the Hessian as bread. Much
+  cheaper than refitting, but score-based methods need enough independent
+  subject-level score rows to be stable; with few subjects, expect a warning
+  and a wider, noisier interval.
+- `fullbootstrap`: resample subjects and fully re-optimize for each resample.
+  The most literal bootstrap and the most expensive -- for `backend = 'julia'`
+  it is the one method not available, because it needs the model rebuilt per
+  resample rather than just re-evaluated at new data.
+- `is`: importance sampling using the Hessian as the proposal covariance,
+  with uncertainty read from the resulting weighted sample. It reweights
+  toward the objective the fit maximised: here that is the exact posterior,
+  since nothing is integrated out; with random effects it is the integrated
+  approximation (see below).
+
+Every method except `fullbootstrap` works on both backends, reusing the same
+underlying `ctOptimComputeUncertainty()` machinery either way -- the julia
+path supplies its own exact Hessian and per-subject scores to the same code
+rather than duplicating the numerics.
+
+```{r uncertainty-gallery}
+methods <- c("hessian", "checked", "opg", "sandwich", "bootstrap", "is")
+
+gallery <- function(base_fit, backend_label) {
+  do.call(rbind, lapply(methods, function(m) {
+    updated <- ctFitUncertainty(base_fit, method = m, finishsamples = 200, cores = 1)
+    data.frame(backend = backend_label, method = m, t(drift_interval(updated)))
+  }))
+}
+
+uncertainty_table <- rbind(gallery(stan_map, "stan"), gallery(julia_map, "julia"))
+uncertainty_table
+```
+
+```{r uncertainty-plot, fig.height=4}
+ggplot(uncertainty_table, aes(x = method, y = mean, ymin = X2.5., ymax = X97.5.,
+                               colour = backend)) +
+  geom_pointrange(position = position_dodge(width = 0.4)) +
+  theme_bw() +
+  labs(x = NULL, y = "drift, 95% interval")
+```
+
+With eight subjects the score-based methods (`opg`, `sandwich`, `bootstrap`)
+warn about too few independent score rows and show it: wider and less stable
+intervals than `hessian` or `checked`. That warning is informative rather
+than a bug in the demonstration -- it is the method telling you its assumption
+does not hold here. `fullbootstrap` is shown separately because it is
+stan-only and slower even at a small resample count:
+
+```{r fullbootstrap}
+stan_fullboot <- ctFitUncertainty(
+  stan_map, method = "fullbootstrap", finishsamples = 8, cores = 1,
+  control = list(bootstrapTol = 1e-3)
+)
+drift_interval(stan_fullboot)
+```
+
+### The state-explicit path has one route, not seven
+
+Everything above assumes `intoverstates = TRUE`, the default: a Kalman filter
+integrates the latent states out, and the fit's objective is the marginal
+likelihood (or posterior) over the parameters alone. Setting
+`intoverstates = FALSE` instead makes the states part of what is estimated --
+useful with non-Gaussian indicators, where `backend = 'julia'` can integrate
+the observation exactly rather than linearising it the way the filter does.
+
+Optimizing that model would find the *joint* mode of parameters and states
+together, which is not the marginal maximum likelihood and is not an estimate
+at all: with an innovation per observation the states re-optimise to absorb
+almost any change in the parameters, so the mode is degenerate, and its
+variance parameters are biased downward in the same way a random-effects
+model's variance is biased if the effects are treated as parameters to
+optimize rather than integrated out. `ctFit()` therefore refuses
+`optimize = TRUE` with `intoverstates = FALSE`; `optimcontrol$estonly = TRUE`
+is the explicit way to ask for the mode anyway. Every uncertainty method above
+except `hessian` scores the marginal likelihood, which such a fit did not
+maximise, so `ctFitUncertainty()` refuses them for it. `hessian` profiles
+the enormous state block out of the curvature
+(`ctsem_joint_hessian(..., profile = TRUE)` in the julia engine), and the
+profile can be close to flat -- on a model this small it is:
+
+```{r state-explicit-optimize}
+count_gen <- ctModel(
+  type = "ct", n.latent = 1, n.manifest = 1,
+  manifestNames = "c1", latentNames = "eta1", manifesttype = 3L,
+  LAMBDA = matrix(1), DRIFT = matrix(-0.5), DIFFUSION = matrix(0.7),
+  MANIFESTVAR = matrix(0), T0VAR = matrix(1), T0MEANS = matrix(0),
+  CINT = matrix(0), MANIFESTMEANS = matrix(1), Tpoints = 6
+)
+count_dat <- data.frame(ctGenerate(count_gen, n = 8, Tpoints = 6, backend = "julia"))
+
+count_fit_model <- ctModel(
+  type = "ct", n.latent = 1, n.manifest = 1,
+  manifestNames = "c1", latentNames = "eta1", manifesttype = 3L,
+  LAMBDA = matrix(1), MANIFESTVAR = matrix(0), T0MEANS = matrix(0), CINT = matrix(0),
+  MANIFESTMEANS = matrix("cmean"), Tpoints = 6
+)
+count_fit_model$pars$indvarying <- FALSE
+
+state_explicit_opt <- ctFit(
+  count_dat, count_fit_model, backend = "julia",
+  intoverstates = FALSE, optimize = TRUE, priors = TRUE, verbose = 0,
+  optimcontrol = list(estonly = TRUE)
+)
+is.null(state_explicit_opt$estimate$se)
+```
+
+`manifesttype = 3` is a Poisson-linked count indicator: eight subjects and six
+time points give the filter almost nothing to profile the state block down
+to, so the profiled Hessian returns no usable standard errors at all rather
+than merely wide ones. The documented way out is the same as the general
+sampling-versus-optimizing choice above, applied to the states as well as the
+parameters: fit with `optimize = FALSE` and let HMC sample the joint posterior
+of parameters and states together, with no Gaussian assumption about the
+states anywhere.
+
+```{r state-explicit-sample}
+state_explicit_samp <- ctFit(
+  count_dat, count_fit_model, backend = "julia",
+  intoverstates = FALSE, optimize = FALSE, priors = TRUE,
+  sampleControl = list(chains = 1, iter = 120), verbose = 0
+)
+state_explicit_samp$estimate$se
+dim(state_explicit_samp$estimate$states)
+```
+
+The sampled fit reports finite standard errors from the draws directly, and
+`estimate$states` carries the sampled trajectory alongside the parameters --
+the whole reason to make the states explicit rather than let the filter
+integrate them away.
+
+## With random effects
+
+The model so far has no individual differences, so every route above targets
+one density. Once parameters vary over subjects there is a choice about the
+random effects themselves, and it decides what an interval describes.
+
+- **Integrated out** -- an optimized fit, `intoverpop = TRUE` or the default
+  `'auto'`: exactly inside the filter where it can be (random effects that
+  shift a mean, Gaussian indicators), a Laplace approximation everywhere else. Every
+  `uncertainty` method above then describes *that* integrated objective. Where
+  the integration is approximate -- random effects on dynamics or variances,
+  non-Gaussian indicators -- they all inherit the approximation, `is`
+  included: it reweights toward the objective the fit maximised, not toward
+  the exact posterior. The Laplace fit's own correction (on by default) moves
+  the estimate toward the exact one, but its interval stays a normal
+  approximation at a mode, and a population standard deviation estimated from
+  few subjects is usually skewed.
+- **Sampled** -- `optimize = FALSE`, or `ctFitUncertainty(fit, 'sample')` on an
+  optimized fit: the parameters and every subject's random effects are drawn
+  together, from the exact joint posterior, with the fit (or SAEM, by
+  default) only placing the chains.
+
+Sampling does not have to mean waiting for a long run. Its stopping rule is an
+effective sample size and an R-hat, and lowering them asks for a quicker,
+rougher posterior with a stated precision: a reported 5% or 95% point carries
+a Monte Carlo error of about `1.96 * 2.1 / sqrt(ESS)` posterior standard
+deviations, the median `1.96 * 1.25 / sqrt(ESS)`, and chains whose means differ
+by `d` standard deviations show an R-hat of about `sqrt(1 + d^2)`.
+`minESS = 50, rhatTarget = 1.07` therefore aims at roughly half a posterior
+standard deviation at the centre. On the models it was compared on, runs of
+four chains and 100 to 200 draws each were already more accurate than the
+Laplace normal approximation, at two to three times the cost of the fit. For
+a run of under a minute or so, keep the chains in this session
+(`processes = FALSE`): a separate process per chain pays tens of seconds to
+start Julia, which only a longer run recovers.
+
+Here a drift that varies across 30 subjects -- a random effect inside the
+dynamics, so `'auto'` integrates it by Laplace -- is summarised three ways:
+
+```{r re-data}
+set.seed(3)
+# The same process, with each subject's drift drawn by ctGenerate: -exp(raw),
+# the raw value normal around log(0.35) with an sd of 0.5 (the sdscale field).
+re_gen <- ctModel(type = "ct", Tpoints = tpoints, n.latent = 1, n.manifest = 1,
+  LAMBDA = matrix(1), T0MEANS = matrix(0), T0VAR = matrix(0.6),
+  DRIFT = matrix("drift|-exp(param)|TRUE|0.5"), DIFFUSION = matrix(0.5),
+  CINT = matrix(0.15), MANIFESTMEANS = matrix(0), MANIFESTVAR = matrix(0.25))
+re_dat <- data.frame(ctGenerate(re_gen, n = 30, dtmean = 0.4, logdtsd = 0.1,
+  backend = "julia", values = c(drift = -0.35)))
+re_model <- fit_model
+re_model$pars$indvarying[re_model$pars$param %in% "drift"] <- TRUE
+```
+
+```{r re-fit}
+fit_time <- system.time(re_fit <- ctFit(re_dat, re_model, backend = "julia",
+  priors = TRUE, cores = 1, verbose = 0))[["elapsed"]]
+re_fit$args$resolved$intoverpop
+```
+
+```{r re-sample}
+quick_time <- system.time(re_quick <- ctFitUncertainty(re_fit, "sample",
+  cores = 1, control = list(chains = 4, warmup = 100, draws = 100, minESS = 50,
+    rhatTarget = 1.07, processes = FALSE)))[["elapsed"]]
+full_time <- system.time(re_full <- ctFitUncertainty(re_fit, "sample",
+  cores = 1, control = list(processes = FALSE)))[["elapsed"]]
+```
+
+```{r re-compare}
+drift_rows <- function(fit, label, secs) {
+  s <- summary(fit)
+  cols <- c("mean", "2.5%", "97.5%")
+  data.frame(route = label, seconds = round(secs),
+    quantity = c("population mean", "population sd"),
+    rbind(s$popmeans["drift", cols], s$popsd["drift", cols]),
+    check.names = FALSE, row.names = NULL)
+}
+rbind(drift_rows(re_fit, "Laplace + Hessian", fit_time),
+  drift_rows(re_quick, "short sample", fit_time + quick_time),
+  drift_rows(re_full, "default sample", fit_time + full_time))
+```
+
+Each subject's own data say little about its own drift here, and the Laplace
+fit, whose interval is the curvature at its mode, can give the population
+standard deviation no interval at all -- `summary()` reports `NA` and the fit
+says why. Both samples describe what the curvature could not: a wide, skewed
+posterior that runs down to near zero. The default sample is the reference;
+the short one is a draft of it, and says how rough a draft through its own
+diagnostics:
+
+```{r re-diagnostics}
+rbind(short = c(max_rhat = max(re_quick$sample$rhat), min_ess = min(re_quick$sample$ess)),
+  default = c(max_rhat = max(re_full$sample$rhat), min_ess = min(re_full$sample$ess)))
+```
+
+## With and without priors
+
+`priors = TRUE` adds ctsem's raw-scale priors to the objective; `priors =
+FALSE`, `ctFit()`'s default, leaves them out. (`'randomCorr'` puts the prior on
+random-effect correlations alone, which for a model with no random effects,
+like this one, is the same as `FALSE`.) Combined with `optimize`, that is four
+corners, and they mean four different things:
+
+|              | `priors = TRUE`                          | `priors = FALSE`                    |
+|--------------|-------------------------------------------|--------------------------------------|
+| `optimize = TRUE`  | MAP: posterior mode, curvature around it   | MLE: likelihood maximum, curvature around it |
+| `optimize = FALSE` | full posterior draws                       | likelihood-only draws -- see below   |
+
+The first three corners are unremarkable and already shown above (`stan_map`
+/ `julia_map` are MAP fits; an MLE fit is the same call with `priors = FALSE`;
+`stan_sample` / `julia_sample` are posterior draws). The fourth is the one
+users reach for without meaning to -- `priors = FALSE, optimize = FALSE` --
+and both backends warn about it rather than refusing it outright:
+
+```{r likelihood-only-sample}
+stan_lik_sample <- ctFit(
+  datalong = dat, model = fit_model, backend = "stan",
+  cores = 1, priors = FALSE, optimize = FALSE,
+  sampleControl = list(chains = 1, iter = 200), verbose = 0
+)
+range(stan_lik_sample$stanfit$rawposterior)
+```
+
+```{r likelihood-only-sample-julia}
+julia_lik_sample <- ctFit(
+  datalong = dat, model = fit_model, backend = "julia",
+  cores = 1, priors = FALSE, optimize = FALSE,
+  sampleControl = list(chains = 1, iter = 150), verbose = 0
+)
+range(julia_lik_sample$estimate$rawposterior)
+```
+
+Compare the raw-scale range here to the posterior sample earlier, which
+stayed within a couple of units of zero on the same raw scale. With no prior
+at all, the raw parameters have nothing constraining them outside what the
+likelihood itself identifies, and for a model and sample size this small that
+is not much. Run at these settings, the julia backend often names the
+mechanism directly, with a warning that some sampled parameter "reached the
+region where their transform is flat to machine precision... with no prior
+the posterior is improper there and the chains wander rather than mix" --
+suppressed from this rendering along with every other warning, but worth
+reading in full the first time it appears in an interactive session. The stan
+sampler shows the same problem less legibly: warm-up tends to take
+substantially longer with `priors = FALSE` than with `priors = TRUE` on this
+model, because the sampler is fighting geometry that a prior would have
+tamed, and the resulting draws are still not trustworthy afterward.
+
+None of this means `priors = FALSE` sampling is broken -- it is sampling
+exactly what was asked for, the raw likelihood, and for a well identified
+model with enough data it is a legitimate route to a frequentist-flavoured
+posterior. It means that removing the prior removes the thing keeping the raw
+scale bounded, and a small or weakly identified model will show you that
+immediately rather than converging to something that merely looks plausible.
+`priors = TRUE` is the safer default for sampling for exactly this reason,
+whatever `ctFit()`'s own default is for optimizing.
+
+## Summary
+
+- Sampling and optimizing target the same density for a given `priors`
+  setting; they differ in whether the answer is a set of draws or a point plus
+  a local approximation.
+- Around an optimum, `uncertainty` chooses which approximation: `hessian` is
+  the cheapest and a fit's default, `checked` corrects it where it is wrong,
+  `opg`/`sandwich`/`bootstrap` use per-subject scores and need enough subjects
+  to be stable, `fullbootstrap` (stan only) is the most literal and most
+  expensive, and `is` turns the same curvature into an importance-sampling
+  proposal.
+- With random effects, an optimized fit's uncertainty describes the
+  integrated objective, approximation included, whichever method is chosen;
+  `ctFitUncertainty(fit, 'sample')` samples the exact joint posterior, and a
+  lower `minESS` and higher `rhatTarget` make that a quick draft with a stated
+  precision rather than a long run.
+- `intoverstates = FALSE` is for sampling, which draws the states along with
+  the parameters. Optimizing it is refused unless `optimcontrol$estonly = TRUE`
+  asks for the joint mode, and that mode has only `hessian`, profiling the
+  state block out of the curvature, because everything else would score an
+  objective the fit did not maximise.
+- Priors change what the objective *is*, not just how confident the reported
+  uncertainty looks: MAP and MLE for optimizing, a real posterior or a
+  likelihood-only draw for sampling. The likelihood-only corner is the one to
+  be careful with -- it is supported, but a small or weakly identified model
+  will show you exactly why priors are the default recommendation for
+  sampling, by wandering.

@@ -1,0 +1,712 @@
+# Julia session management, and one whole fit from a model and a data frame.
+#
+# Everything else in the julia test files reaches for a fitted object, so all of
+# them share one setup path and none of them exercises it. That is how
+# `.ctJuliaSessionRunning()` came to answer "is a session running?" by *starting*
+# one -- `JuliaConnectoR::juliaEval()` starts a server rather than reporting on
+# it -- with two silent consequences:
+#
+#   * `ctJuliaSetup(threads = n, force = TRUE)` cleared the session, asked the
+#     question, saw the session its own question had just created, and warned
+#     that `threads` would have no effect. `force` could not work.
+#   * `ctFit(backend = 'julia', cores = n)` sets `JULIA_NUM_THREADS` only when no
+#     session is running, so it was never set and every fit ran on one thread
+#     whatever `cores` said.
+#
+# Both are asserted below, along with a plain model-and-data-to-fit check that
+# does not reuse a cached fixture.
+
+test_that("asking whether a session is running does not start one", {
+  skip_without_julia()
+  ctsem:::.ctJuliaClearSession()
+  # The regression: this must not be what brings a session into existence.
+  expect_false(ctsem:::.ctJuliaSessionRunning())
+  expect_false(ctsem:::.ctJuliaSessionRunning())
+})
+
+test_that("force restarts the session and threads take effect", {
+  skip_without_julia()
+  previous <- Sys.getenv("JULIA_NUM_THREADS", unset = NA)
+  on.exit({
+    if (is.na(previous)) Sys.unsetenv("JULIA_NUM_THREADS")
+    else Sys.setenv(JULIA_NUM_THREADS = previous)
+  }, add = TRUE)
+
+  # Two threads is enough to prove the setting is applied without asking the
+  # test machine for cores it may not have.
+  expect_no_warning(suppressMessages(ctJuliaSetup(threads = 2L, force = TRUE)))
+  expect_equal(Sys.getenv("JULIA_NUM_THREADS"), "2")
+  expect_equal(as.integer(JuliaConnectoR::juliaEval("Threads.nthreads()")), 2L)
+  expect_true(ctsem:::.ctJuliaSessionRunning())
+
+  # Asking for a different count *without* force cannot take effect, and saying
+  # so is the point of the warning -- it must fire here and only here.
+  expect_warning(suppressMessages(ctJuliaSetup(threads = 3L)), "already running")
+  expect_equal(as.integer(JuliaConnectoR::juliaEval("Threads.nthreads()")), 2L)
+})
+
+# The fits in this file are of `image_model()` (helper-julia.R), the shape the
+# engine's package image has compiled: what is under test is the session and
+# the worker path, not the model, and on any other shape each fit after one of
+# the restarts below paid its whole compile again -- 105 s for the two fits of
+# this first block alone on dev2, most of the file.
+test_that("a model and a data frame fit end to end", {
+  skip_without_julia()
+  dat <- image_data(nsub = 12L, nobs = 6L, seed = 27L)
+  model <- image_model()
+
+  for (route in c("laplace", "augmented")) {
+    fit <- suppressMessages(ctFit(dat, model, backend = "julia",
+      intoverpop = if (route == "laplace") "laplace" else TRUE, cores = 1,
+      optimcontrol = list(estonly = TRUE)))
+    expect_s3_class(fit, "ctJuliaFit")
+    expect_true(isTRUE(fit$optim$converged), label = route)
+    expect_false(isTRUE(fit$optim$stalled), label = route)
+    expect_true(is.finite(fit$estimate$loglik), label = route)
+    summ <- suppressWarnings(summary(fit))
+    expect_true(is.list(summ) || is.data.frame(summ), label = route)
+  }
+})
+
+# The engine's subject-chunk ceiling is session-global Julia state. Three call
+# sites wrote it and none put it back, so after a `cores=8` fit the session read
+# 8 and after a `cores=1` fit it read 1 -- and every later ctKalman(),
+# ctExtract() or ctLOO() inherited whichever fit came last. Performance-only,
+# but it makes a timing depend on history, which is what makes one impossible to
+# reproduce.
+test_that("a fit leaves the engine's chunk ceiling as it found it", {
+  skip_without_julia()
+  ceiling <- function() as.integer(JuliaConnectoR::juliaEval(
+    "ContinuousTimeSEM.ctsem_max_chunks().max_chunks"))
+  # Put it back on the way out. This test is about session state not leaking,
+  # and leaving a ceiling of 3 behind for every later test file would be a poor
+  # way to make that point -- it did, and it changed which chunk count the next
+  # file's fits ran at.
+  original <- ceiling()
+  on.exit(JuliaConnectoR::juliaEval(sprintf(
+    "ContinuousTimeSEM.ctsem_set_max_chunks!(%d)", original)), add = TRUE)
+  JuliaConnectoR::juliaEval("ContinuousTimeSEM.ctsem_set_max_chunks!(3)")
+  before <- ceiling()
+  expect_equal(before, 3L)
+
+  dat <- image_data(nsub = 8L, nobs = 5L, seed = 9L)
+  model <- image_model()
+  fit <- suppressWarnings(suppressMessages(ctFit(dat, model, backend = "julia",
+    cores = 2, optimcontrol = list(estonly = TRUE))))
+
+  expect_equal(ceiling(), before)
+  # And the tuner's answer is still recorded on the fit, which is what the
+  # uncertainty phase reads instead of `cores`.
+  expect_true(is.numeric(fit$optim$chunks) || is.integer(fit$optim$chunks))
+  expect_lte(as.integer(fit$optim$chunks), 2L)
+
+  # A diagnostic must not reconfigure the session either.
+  JuliaConnectoR::juliaEval("ContinuousTimeSEM.ctsem_set_max_chunks!(3)")
+  suppressWarnings(suppressMessages(try(ctExtract(fit, cores = 2), silent = TRUE)))
+  expect_equal(ceiling(), 3L)
+})
+
+# OpenBLAS keeps a pool of its own, which LinearAlgebra starts at half the
+# machine's hardware threads whatever Julia's thread count is, so the chunk
+# ceiling alone left a `cores = 1` fit free to run BLAS twelve wide. The engine
+# holds OpenBLAS to the ceiling, and a fit's restore of the ceiling puts it back.
+test_that("a fit at cores = 1 holds OpenBLAS to one thread, and puts it back", {
+  skip_without_julia()
+  state <- function() ctsem:::.ctJuliaGet(ctsem:::.ctJuliaEval(
+    "ContinuousTimeSEM.ctsem_max_chunks()"))
+  original <- state()$max_chunks
+  on.exit(ctsem:::.ctJuliaCall("ContinuousTimeSEM.ctsem_set_max_chunks!",
+    as.integer(original)), add = TRUE)
+  ctsem:::.ctJuliaCall("ContinuousTimeSEM.ctsem_set_max_chunks!", 2L)
+  before <- state()$blas_threads
+  skip_if(before < 2L,
+    "OpenBLAS started with one thread here, so holding it to one is not observable")
+
+  dat <- image_data(nsub = 8L, nobs = 5L, seed = 9L)
+  model <- image_model()
+  # Asked from inside the optimiser, through its callback, so what is read is
+  # the count the fit ran under rather than one set and reset around it.
+  during <- integer()
+  fit <- suppressWarnings(suppressMessages(ctFit(dat, model, backend = "julia",
+    cores = 1, optimcontrol = list(estonly = TRUE, callback = function(...) {
+      during <<- c(during, as.integer(ctsem:::.ctJuliaEval(
+        "ContinuousTimeSEM.LinearAlgebra.BLAS.get_num_threads()")))
+      NULL
+    }))))
+  expect_gt(length(during), 0L)
+  expect_true(all(during == 1L), label = paste(during, collapse = " "))
+  expect_equal(state()$max_chunks, 2L)
+  expect_equal(state()$blas_threads, before)
+})
+
+test_that("the bridge socket is tuned when the session starts", {
+  skip_without_julia()
+  # What this guards is the finding rather than the speed: JuliaConnectoR sends
+  # each message as a run of small writes, which on Linux costs a ~40 ms
+  # Nagle/delayed-ACK stall per message unless the socket says otherwise. The
+  # tuning is reached through JuliaConnectoR's private communicator object, so
+  # the thing most likely to break it is that package renaming something --
+  # which would be silent, because every failure path here is a tryCatch.
+  suppressMessages(ctJuliaSetup())
+  expect_false(is.null(ctsem:::.ctJuliaCommunicator()))
+
+  # 1 when the quickack task is running, 0 when only Nagle was disabled.
+  # TCP_QUICKACK is Linux-only, so 0 is the correct answer everywhere else.
+  state <- ctsem:::.ctJuliaTuneBridge()
+  expect_true(state %in% c(0L, 1L))
+  expect_equal(state, if (Sys.info()[["sysname"]] == "Linux") 1L else 0L)
+  expect_equal(as.logical(JuliaConnectoR::juliaEval(
+    "ContinuousTimeSEM.ctsem_bridge_tuned()")), state == 1L)
+
+  # Idempotent: a second call must not leave a second task re-arming the socket.
+  expect_equal(ctsem:::.ctJuliaTuneBridge(), state)
+
+  # And the option turns the whole thing off, for anyone who needs the socket
+  # left exactly as JuliaConnectoR opened it.
+  withr::with_options(list(ctsem.julia.tunebridge = FALSE), {
+    expect_true(is.na(ctsem:::.ctJuliaTuneBridge()))
+  })
+})
+
+# The warmed sampling worker pool (R/ctBackendWarmWorkers.R) had no test
+# coverage at all before this: .ctBackendWarmStop() was defined and never
+# called from anywhere in R/ or tests/, so nothing here proved the pool a
+# caller starts is ever actually released. `future::nbrOfWorkers()` is what
+# the pool itself is built on (a `multisession` plan), so it is what counts
+# the workers without needing to reach into `future`'s internals.
+test_that("starting and stopping the warmed pool leaves no workers behind", {
+  skip_without_julia()
+  skip_if_not_installed("future")
+
+  model <- suppressWarnings(ctModel(type = "ct", LAMBDA = diag(1),
+    DRIFT = matrix("drift", 1, 1), DIFFUSION = matrix("diffusion", 1, 1),
+    MANIFESTVAR = matrix("residual", 1, 1), MANIFESTMEANS = matrix(0, 1, 1),
+    T0VAR = matrix(1, 1, 1), T0MEANS = matrix(0, 1, 1)))
+  dat <- data.frame(id = rep(1:2, each = 3), time = rep(0:2, 2), Y1 = 0)
+  prepared <- suppressMessages(ctFit(dat, model, backend = "julia", fit = FALSE))
+
+  previous_plan <- future::plan()
+  on.exit(future::plan(previous_plan), add = TRUE)
+  future::plan(future::sequential)
+  expect_equal(future::nbrOfWorkers(), 1L)
+
+  handles <- ctsem:::.ctBackendWarmWorkers(prepared, workers = 2L)
+  skip_if(is.null(handles), "warming did not start on this machine")
+  expect_equal(future::nbrOfWorkers(), 2L)
+  expect_false(inherits(future::plan(), "sequential"))
+
+  # The exported release function, not the internal one directly: this is the
+  # documented way a caller gets the workers back.
+  suppressMessages(ctJuliaKill("workers"))
+  expect_equal(future::nbrOfWorkers(), 1L)
+  expect_true(inherits(future::plan(), "sequential"))
+})
+
+# A warmed worker on a different ctsem build samples a different model, and
+# used to say nothing: the pooled draws came back plausible, `sample$processes`
+# said TRUE, and the only symptom was that the draws sat 7.5e-05 from the
+# in-process ones where the documented figure is 6.2e-10. That reads as a
+# pooling fault and is not one.
+#
+# The fallback the sampling path relied on -- a future worker cannot load an
+# uninstalled tree, so `processes = TRUE` degrades to in-process -- does not
+# cover an installed ctsem that merely *differs*, which is the ordinary state
+# of affairs under `devtools::load_all()`.
+#
+# Unit rather than integration: the case needs two builds and a test cannot
+# arrange one. What is pinned here is the decision.
+test_that("a warmed worker on a different build is reported", {
+  warned <- function(results) {
+    seen <- character()
+    withCallingHandlers(
+      ctsem:::.ctBackendWarmCheckBuild(results),
+      warning = function(w) {
+        seen <<- c(seen, conditionMessage(w))
+        invokeRestart("muffleWarning")
+      })
+    seen
+  }
+  mine <- ctsem:::.ctBackendWarmFingerprint()
+  # The version and the engine's content hash, which is the part that
+  # distinguishes a tree from its installed sibling -- they normally share a
+  # version, so a version-only fingerprint would match when the builds differ.
+  expect_match(mine, "^[^/]+/.+$")
+
+  # Nothing collected, and workers on this build: silence.
+  expect_length(warned(list()), 0L)
+  expect_length(warned(list(list(ok = TRUE, fingerprint = mine),
+    list(ok = TRUE, fingerprint = mine))), 0L)
+
+  # A different build is named.
+  other <- warned(list(list(ok = TRUE, fingerprint = mine),
+    list(ok = TRUE, fingerprint = "3.11.1/deadbeefcafe")))
+  expect_length(other, 1L)
+  expect_match(other, "different ctsem build")
+  expect_match(other, "3.11.1/deadbeefcafe", fixed = TRUE)
+  expect_match(other, "processes = FALSE", fixed = TRUE)
+
+  # And a bare TRUE -- what a build predating this returns -- is a difference
+  # too, not a pass. This is the case the globally installed package produces,
+  # and taking it for agreement is what kept the problem invisible.
+  legacy <- warned(list(TRUE, list(ok = TRUE, fingerprint = mine)))
+  expect_length(legacy, 1L)
+  expect_match(legacy, "predating this check")
+})
+
+test_that("a pool that fails to warm any worker is not left half-started", {
+  skip_if_not_installed("future")
+  # No live Julia needed: `future::future()` itself is made to fail for every
+  # worker, so `future::plan(multisession)` is set (a real, if pointless, pool
+  # of background R processes) and then nothing warms in it -- the branch
+  # `on.exit(if (!ok) .ctBackendWarmStop(NULL))` exists for. Without it this
+  # would return NULL having left the multisession plan and the
+  # connections-misuse override in place for a pool that warmed nothing.
+  previous_plan <- future::plan()
+  on.exit(future::plan(previous_plan), add = TRUE)
+  future::plan(future::sequential)
+  previous_option <- getOption("future.connections.onMisuse")
+
+  testthat::local_mocked_bindings(future = function(...) stop("boom"), .package = "future")
+  fake <- structure(list(parameter_table = data.frame(parnumber = 1)), class = "ctJuliaModel")
+  handles <- ctsem:::.ctBackendWarmWorkers(fake, workers = 2L)
+
+  expect_null(handles)
+  expect_true(inherits(future::plan(), "sequential"))
+  expect_identical(getOption("future.connections.onMisuse"), previous_option)
+})
+
+# `cores` on the julia backend is capped by the Julia session's thread count,
+# and Julia fixes that count at process start. So a script that starts the
+# engine before its first fit -- which any benchmark harness does, to pay the
+# engine load once and outside the timing -- pins every later `cores = n` fit
+# to one subject chunk. That ran serially and said nothing, and it invalidated
+# two whole benchmark passes: the tell was that the gradient counts for
+# `cores = 1` and `cores = 4` came back identical to the digit.
+#
+# The gate is checked without a session first, since `.ctBackendResolveThreads()`
+# takes `threads` for exactly that, and then the whole thing is driven for real:
+# a session started at one thread, asked for two, must either get two or say so.
+test_that("a fit asking for more cores than the session has threads says so", {
+  cache <- ctsem:::.ct_julia_cache
+  original <- cache$threads_reported
+  on.exit(cache$threads_reported <- original, add = TRUE)
+  said <- function(cores, threads, report = TRUE) {
+    seen <- character()
+    withCallingHandlers(
+      ctsem:::.ctBackendResolveThreads(cores, threads = threads,
+        report = report),
+      message = function(m) {
+        seen <<- c(seen, conditionMessage(m)); invokeRestart("muffleMessage")
+      })
+    seen
+  }
+  fired <- function(...) {
+    cache$threads_reported <- NULL
+    any(grepl("^cores = ", said(...)))
+  }
+
+  # The case that cost the benchmark, and the line it now prints. It names both
+  # numbers, why the shortfall cannot be undone in place, and the exact call
+  # that undoes it.
+  cache$threads_reported <- NULL
+  line <- said(4L, 1L)
+  expect_length(line, 1L)
+  expect_equal(line, paste0(
+    "cores = 4 requested, 1 used: Julia's thread count is fixed at session ",
+    "start. ctJuliaSetup(threads = 4, force = TRUE) restarts it with 4.
+"))
+
+  # Nothing to say when the session can give what was asked for, when nothing
+  # was asked for, or when the count could not be established.
+  expect_false(fired(4L, 4L))
+  expect_false(fired(4L, 8L))
+  expect_false(fired(1L, 1L))
+  expect_false(fired(4L, NA_integer_))
+  # `report = FALSE` is `fit = FALSE`: a call that only builds a specification
+  # has no cores to fall short of, so it takes the thread count it can and says
+  # nothing about the one it cannot.
+  expect_false(fired(4L, 1L, report = FALSE))
+  # Two is the default `cores` and one is Julia's default thread count, so this
+  # is the pairing a user meets first. Halving the available parallelism is
+  # worth a line as much as quartering it is.
+  expect_true(fired(2L, 1L))
+
+  # Said once per pair, so a simulation study looping a hundred fits gets one
+  # line -- but a fit that asks for a different number is a different thing to
+  # say and is said.
+  expect_true(fired(8L, 1L))
+  expect_false(any(grepl("^cores = ", said(8L, 1L))))
+  expect_true(any(grepl("^cores = ", said(8L, 2L))))
+})
+
+# Every other call heard nothing: ctKalman() starting the session at two
+# threads, then ctFitUncertainty(fit, cores = 16), ran at two in silence. Such
+# a call is told where it sets its ceiling, by the lesser of what the region
+# would use and what the call asked for.
+test_that("a call other than a fit says so when the session is narrower than it asked", {
+  cache <- ctsem:::.ct_julia_cache
+  original <- cache$threads_reported
+  on.exit(cache$threads_reported <- original, add = TRUE)
+  said <- function(chunks, threads, requested) {
+    cache$threads_reported <- NULL
+    seen <- character()
+    withCallingHandlers(
+      ctsem:::.ctBackendReportShortfall(chunks, threads, requested),
+      message = function(m) {
+        seen <<- c(seen, conditionMessage(m)); invokeRestart("muffleMessage")
+      })
+    seen
+  }
+  expect_match(said(4L, 2L, 4L), "^cores = 4 requested, 2 used")
+  # Named by what the call asked for, not by the region's own ceiling.
+  expect_match(said(6L, 2L, 3L), "^cores = 3 requested, 2 used")
+  expect_length(said(4L, 4L, 4L), 0L)
+  # A region held below its call on purpose -- an inner fit at one core under
+  # a wider call -- is short of nothing.
+  expect_length(said(1L, 2L, 8L), 0L)
+  # Nor is a call that asked for nothing, or a count that could not be read.
+  expect_length(said(4L, 2L, NA_integer_), 0L)
+  expect_length(said(4L, NA_integer_, 4L), 0L)
+})
+
+test_that("a call other than a fit in a narrower running session says so", {
+  skip_without_julia()
+  cache <- ctsem:::.ct_julia_cache
+  original <- cache$threads_reported
+  on.exit(cache$threads_reported <- original, add = TRUE)
+  dat <- image_data(nsub = 6L, nobs = 5L, seed = 6L)
+  prepared <- suppressMessages(ctFit(dat, image_model(), backend = "julia",
+    fit = FALSE))
+  pars <- rep(0, ctsem:::.ctBackendNpar(prepared))
+  threads <- as.integer(ctsem:::.ctJuliaEval("Threads.nthreads()"))
+  cache$threads_reported <- NULL
+  expect_message(ctJuliaEvaluate(prepared, pars = pars, cores = threads + 1L),
+    paste0("cores = ", threads + 1L, " requested, ", threads, " used"),
+    fixed = TRUE)
+  expect_no_message(ctJuliaEvaluate(prepared, pars = pars, cores = threads))
+})
+
+test_that("a one-thread session asked for more cores either gets more or says so", {
+  skip_without_julia()
+  cache <- ctsem:::.ct_julia_cache
+  previous_env <- Sys.getenv("JULIA_NUM_THREADS", unset = NA)
+  previous_from_cores <- cache$threads_from_cores
+  previous_reported <- cache$threads_reported
+  nthreads <- function() as.integer(
+    JuliaConnectoR::juliaEval("Threads.nthreads()"))
+  on.exit({
+    cache$threads_from_cores <- previous_from_cores
+    cache$threads_reported <- previous_reported
+    if (is.na(previous_env)) Sys.unsetenv("JULIA_NUM_THREADS")
+    else Sys.setenv(JULIA_NUM_THREADS = previous_env)
+  }, add = TRUE)
+
+  dat <- image_data(nsub = 8L, nobs = 5L, seed = 11L)
+  model <- image_model()
+  # Every message, not the first one: `expect_message()` looks at one condition
+  # and a fit raises several, so the line under test would be missed by it.
+  messages <- function(expr) {
+    seen <- character()
+    withCallingHandlers(suppressWarnings(force(expr)),
+      message = function(m) {
+        seen <<- c(seen, conditionMessage(m)); invokeRestart("muffleMessage")
+      })
+    seen
+  }
+  onefit <- function() ctFit(dat, model, backend = "julia", cores = 2,
+    optimcontrol = list(estonly = TRUE))
+
+  # The harness's own opening move: start the engine, then fit.
+  suppressMessages(suppressWarnings(ctJuliaSetup(threads = 1L, force = TRUE)))
+  expect_equal(nthreads(), 1L)
+  cache$threads_reported <- NULL
+  seen <- messages(onefit())
+  expect_true(any(grepl("cores = 2 requested, 1 used", seen)),
+    label = paste(seen, collapse = " | "))
+  # And it really did run on one thread; the message is not decoration.
+  expect_equal(nthreads(), 1L)
+
+  # Opted in, the same call gets the threads instead of a line about them.
+  cache$threads_reported <- NULL
+  seen <- withr::with_options(list(ctsem.julia.restart = TRUE),
+    messages(onefit()))
+  expect_gte(nthreads(), 2L)
+  expect_true(any(grepl("Restarting the Julia session at 2 threads", seen)),
+    label = paste(seen, collapse = " | "))
+  expect_false(any(grepl("cores = 2 requested", seen)))
+})
+
+test_that("a control name the sampler does not read is refused, not ignored", {
+  # `control$minEss` on `list(minESS = 100)` is NULL, so the setting was
+  # accepted and ignored and the run said nothing -- reported from a real
+  # session as a sampler that would not stop at the effective size asked for.
+  expect_error(.ctBackendSampleCheckControl(list(minEss = 100)),
+    "minEss \\(did you mean minESS\\?\\)")
+  expect_error(.ctBackendSampleCheckControl(list(nonsense = 1)),
+    "does not read: nonsense")
+  # The suggestion is case-insensitive, because case is what goes wrong.
+  expect_error(.ctBackendSampleCheckControl(list(MaxDraws = 2)),
+    "did you mean maxDraws")
+  # An unnamed entry cannot be read either, and says so rather than being
+  # silently dropped by the `setdiff`.
+  expect_error(.ctBackendSampleCheckControl(list(5)), "must be named")
+
+  # Every name the sampler actually reads passes, and the list is the one the
+  # readers use -- a knob added to `.ctBackendSampleControl` and not to
+  # `.CT_SAMPLE_CONTROL_NAMES` fails here rather than in a user's script.
+  expect_null(.ctBackendSampleCheckControl(list(minESS = 100, warmup = 0L,
+    target_accept = 0.9, maxdepth = 12L, max_treedepth = 12L, maxdelta = 900,
+    adapt_delta = 0.9, init_scale = 1, adapt_metric = TRUE,
+    adapt_effects = FALSE, meanESS = 200, maxDraws = 4000L,
+    rhatTarget = 1.01, settleTol = 0, seed = 1L, processes = FALSE,
+    callback = function(...) NULL)))
+  expect_null(.ctBackendSampleCheckControl(list()))
+  expect_null(.ctBackendSampleCheckControl(NULL))
+})
+
+test_that("a worker pool left busy by an interrupted run is seen as stale", {
+  skip_if_not_installed("future")
+  # An interrupted sample leaves its chains running in the pool. R is single
+  # threaded, so a busy worker at the moment a fit starts warming can only be
+  # an orphan -- and `future::future()` waits for a free worker rather than
+  # failing, so warming would queue behind a chain nobody is collecting.
+  on.exit(try(future::plan(future::sequential), silent = TRUE), add = TRUE)
+
+  # Says nothing about a sequential plan: the caller replaces that anyway.
+  future::plan(future::sequential)
+  expect_false(.ctBackendWarmPoolStale(2L))
+
+  future::plan(future::multisession, workers = 2L)
+  expect_false(.ctBackendWarmPoolStale(2L))
+
+  orphan <- future::future({ Sys.sleep(30); TRUE }, seed = TRUE)
+  # The worker is taken up asynchronously, so this waits for the state rather
+  # than assuming it: an assertion here that raced would fail intermittently
+  # and be read as the detection not working.
+  for (attempt in 1:100) {
+    if (future::nbrOfFreeWorkers() < future::nbrOfWorkers()) break
+    Sys.sleep(0.1)
+  }
+  expect_lt(future::nbrOfFreeWorkers(), future::nbrOfWorkers())
+  expect_true(.ctBackendWarmPoolStale(2L))
+
+  # And the repair is a repair: releasing the sessions takes the orphan with
+  # them, and the pool built next is free.
+  .ctBackendWarmStop(NULL)
+  expect_s3_class(future::plan("list")[[1L]], "sequential")
+  future::plan(future::multisession, workers = 2L)
+  expect_false(.ctBackendWarmPoolStale(2L))
+  expect_equal(future::value(future::future({ 42L }, seed = TRUE)), 42L)
+})
+
+test_that("a progress line is delivered as a message, not written to a stream", {
+  # A console draws a message differently from text that merely arrives on the
+  # same stream -- in RStudio a shaded block against plain body text -- so what
+  # matters is that these are conditions, and a calling handler is the only
+  # proof of that.
+  sink <- .ctProgressSink(overwrite = TRUE)
+  caught <- character(0)
+  onstream <- capture.output(type = "message", withCallingHandlers({
+    sink("  optimise 1 iter | logpost -12.50", "update")
+    sink("  optimise 2 iter | logpost -12.40", "update")
+    sink("  optimise done in 1.2s", "done")
+  }, message = function(cnd) {
+    caught <<- c(caught, conditionMessage(cnd))
+    invokeRestart("muffleMessage")
+  }))
+  expect_length(caught, 3L)
+  expect_length(onstream, 0L)
+
+  # Each update opens with a carriage return and does not end the line, so the
+  # next one lands on top of it; the closing line ends itself.
+  expect_true(all(startsWith(caught, "\r")))
+  expect_false(endsWith(caught[1L], "\n"))
+  expect_true(endsWith(caught[3L], "\n"))
+
+  # Padded to the longest line so far, or a shorter update leaves the tail of a
+  # longer one behind it.
+  expect_equal(nchar(caught[3L]), nchar(caught[2L]) + 1L)  # +1 for the newline
+  expect_match(caught[2L], "logpost -12.40", fixed = TRUE)
+
+  # `break` only ends the line, and only when one is open.
+  sink2 <- .ctProgressSink(overwrite = TRUE)
+  broken <- character(0)
+  withCallingHandlers({
+    sink2("", "break")            # nothing open: nothing to end
+    sink2("  sampling 1/10", "update")
+    sink2("", "break")            # now there is
+  }, message = function(cnd) {
+    broken <<- c(broken, conditionMessage(cnd))
+    invokeRestart("muffleMessage")
+  })
+  expect_length(broken, 2L)
+  expect_equal(broken[2L], "\n")
+
+  # Without overwriting -- a log file, or a console where a carriage return
+  # moves nothing -- each update is its own line and carries no control
+  # characters at all.
+  plain <- .ctProgressSink(overwrite = FALSE)
+  lines <- character(0)
+  withCallingHandlers({
+    plain("  optimise 1 iter", "update")
+    plain("  optimise done in 1.2s", "done")
+  }, message = function(cnd) {
+    lines <<- c(lines, conditionMessage(cnd))
+    invokeRestart("muffleMessage")
+  })
+  expect_length(lines, 2L)
+  expect_false(any(grepl("\r", lines, fixed = TRUE)))
+  expect_true(all(endsWith(lines, "\n")))
+
+  # A failure in the display must never reach the fit: this is called from
+  # inside a running Julia call, where an error does not merely lose a line, it
+  # desynchronises the bridge.
+  # An environment cannot be coerced to a string, so this raises inside the
+  # sink -- and must not raise out of it.
+  expect_silent(.ctProgressSink(TRUE)(new.env(), "update"))
+})
+
+test_that("stan's stochastic optimizer reports through the same sink, on one line", {
+  # Each update was its own message() -- about a thousand per default stan
+  # fit in a log or a capturing front end. Through the sink they are one line
+  # updated in place, ended once; with nothing watching, only the verdict.
+  lpg <- function(x) {
+    v <- -sum((x - 1)^2)
+    attr(v, "gradient") <- -2 * (x - 1)
+    v
+  }
+  kinds <- character(0)
+  said <- character(0)
+  out <- withCallingHandlers(
+    sgd(c(0, 0), lpg, maxiter = 400, progress = function(text, kind)
+      kinds <<- c(kinds, kind)),
+    message = function(m) {
+      said <<- c(said, conditionMessage(m))
+      invokeRestart("muffleMessage")
+    })
+  expect_equal(out$par, c(1, 1), tolerance = 1e-2)
+  expect_true(any(kinds == "update"))
+  expect_identical(tail(kinds, 1L), "break")
+  expect_false(any(grepl("Progress est", said)))
+  said <- character(0)
+  withCallingHandlers(sgd(c(0, 0), lpg, maxiter = 400, progress = NULL),
+    message = function(m) {
+      said <<- c(said, conditionMessage(m))
+      invokeRestart("muffleMessage")
+    })
+  expect_length(said, 1L)
+  expect_match(said, "Converged")
+})
+
+test_that("the overwrite option overrides the detection in both directions", {
+  # It used to override only downwards, so a console the detection had given up
+  # on could not be told to overwrite after all -- which is the direction
+  # someone asks in, because the point of one rewritten line is that it stays
+  # one line.
+  withr::local_options(ctsem.progress.overwrite = NULL)
+  expect_equal(.ctProgressOverwrite(1), .ctProgressConsole())
+  withr::local_options(ctsem.progress.overwrite = TRUE)
+  expect_true(.ctProgressOverwrite(1))
+  expect_false(.ctProgressOverwrite(2))   # verbose 2 keeps the history
+  withr::local_options(ctsem.progress.overwrite = FALSE)
+  expect_false(.ctProgressOverwrite(1))
+})
+
+test_that("RStudio overwrites like any console", {
+  # It was given whole lines for a day (2026-09-28), which filled its console;
+  # the sink now flushes each update instead -- see `.ctProgressOverwrite()`.
+  # `RSTUDIO` is set on every R process RStudio starts; mocked here since this
+  # session is not one.
+  withr::local_envvar(RSTUDIO = "1")
+  withr::local_options(ctsem.progress.overwrite = NULL)
+  expect_equal(.ctProgressOverwrite(1), .ctProgressConsole())
+})
+
+# How wide a session starts, and the ceiling for a call that sets none, are
+# test-julia-interrupt.R's to cover: a session starts at the `cores` of the call
+# that starts it, at least `getOption("mc.cores", 2)`. Starting every session
+# at the machine's width was tried (2026-09-28) and reverted (2026-09-29),
+# because idle Julia threads spin whenever work is spawned -- see "How many
+# threads a session starts with" in R/ctJuliaBridge.R.
+
+# `.ctBackendWithMaxChunks()`/`.ctBackendSetMaxChunks()` is the ceiling every
+# engine call should run under; before this it wrapped the optimiser and the
+# uncertainty phase only. Mocked rather than measured live: neither
+# `ctJuliaEvaluate()` nor `ctIdentify()` reports back a chunk count the way a
+# fit does (`fit$optim$chunks`), so there is nothing external to read after
+# the call returns, and the property under test is which value reaches the
+# ceiling, not whether the ceiling changes anything about this small model's
+# answer.
+test_that("ctJuliaEvaluate() runs under the cores ceiling it is given", {
+  skip_without_julia()
+  recorded <- integer()
+  testthat::local_mocked_bindings(
+    .ctBackendSetMaxChunks = function(chunks) {
+      recorded <<- c(recorded, as.integer(chunks)); NA_integer_
+    },
+    .ctBackendRestoreMaxChunks = function(previous) invisible(NULL))
+  dat <- image_data(nsub = 6L, nobs = 5L, seed = 6L)
+  model <- image_model()
+  prepared <- suppressMessages(ctFit(dat, model, backend = "julia", fit = FALSE))
+  pars <- rep(0, ctsem:::.ctBackendNpar(prepared))
+  out <- ctJuliaEvaluate(prepared, pars = pars, cores = 3L)
+  expect_true(is.list(out))
+  expect_true(is.finite(out$value))
+  expect_true(3L %in% recorded)
+})
+
+test_that("ctIdentify() runs its engine calls under its own cores ceiling", {
+  skip_without_julia()
+  recorded <- integer()
+  testthat::local_mocked_bindings(
+    .ctBackendSetMaxChunks = function(chunks) {
+      recorded <<- c(recorded, as.integer(chunks)); NA_integer_
+    },
+    .ctBackendRestoreMaxChunks = function(previous) invisible(NULL))
+  dat <- image_data(nsub = 6L, nobs = 5L, seed = 7L)
+  model <- image_model()
+  out <- suppressWarnings(suppressMessages(ctIdentify(dat, model, nstart = 1L,
+    cores = 4L)))
+  expect_s3_class(out, "ctIdentify")
+  expect_true(4L %in% recorded)
+})
+
+test_that("sampleControl absorbs the deprecated iter, chains and control", {
+  r <- .ctSampleControlResolve
+
+  # The list is where these are read from now.
+  got <- r(list(iter = 400, chains = 3, minESS = 50))
+  expect_equal(got$iter, 400L)
+  expect_equal(got$chains, 3L)
+  expect_equal(got$control, list(minESS = 50))
+
+  # The arguments fill in only what the list does not say, and their defaults
+  # are unchanged when it says nothing.
+  got <- r(list(), iter = 111, chains = 7)
+  expect_equal(got$iter, 111L)
+  expect_equal(got$chains, 7L)
+  got <- r(list(iter = 222), iter = 111)
+  expect_equal(got$iter, 222L)
+
+  # The deprecated `control` sits under `sampleControl`: an entry in both is
+  # the new argument's, and the rest merge.
+  got <- r(list(warmup = 5), control = list(warmup = 99, seed = 7))
+  expect_equal(got$control$warmup, 5)
+  expect_equal(got$control$seed, 7)
+
+  # `iter` and `chains` are stripped from what goes on to the backends, which
+  # receive them as they always did rather than twice.
+  expect_false(any(c("iter", "chains") %in% names(got$control)))
+
+  # Said once per session, and only for an argument the caller actually wrote.
+  # `given` is the caller's `names(match.call())`, since a default cannot
+  # otherwise be told from a value that happens to equal it.
+  .ct_sample_deprecation$said <- NULL
+  expect_warning(r(list(), given = c("iter", "control"), iter = 500),
+    "sampleControl")
+  expect_silent(r(list(), given = c("iter", "control"), iter = 500))
+  .ct_sample_deprecation$said <- NULL
+  expect_silent(r(list(), given = character(0), iter = 500))
+
+  expect_error(r("nonsense"), "must be a list")
+})

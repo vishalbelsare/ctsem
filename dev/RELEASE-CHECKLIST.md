@@ -1,0 +1,128 @@
+# Release checklist
+
+Written 2026-09-03, from the things that actually went wrong during the review
+rather than from a generic list. Each item exists because skipping it cost time
+or shipped something wrong.
+
+## Before anything else
+
+**Push, and check what is already pushed.** `git rev-list --count
+origin/juliaFit..juliaFit`. During the review this drifted to twenty-two
+commits, and a stale remote makes every later question harder.
+
+## The build
+
+**Objects rebuild by themselves now; do not delete them.** Until 2026-09-03
+the makefile did not declare the generated headers as prerequisites of their
+objects, so a months-old object was silently relinked when a `.stan` file
+changed, and the working advice was to delete `src/stanExports_*.o` before
+installing. `configure` now emits an explicit rule per model, so make
+rebuilds exactly the models whose headers changed and nothing else. The
+deletion step is obsolete and should not be reinstated.
+
+If you ever change how `src/` is produced, re-prove this from NOTHING rather
+than from a tree that already has objects. The first version of that fix
+passed a targeted rebuild on a fully built tree and broke installation from
+scratch on every platform, because its rule became make's default goal: make
+built one object, said "Nothing to be done", exited zero, and the install
+failed only at the load step with no error anywhere in the log. A build fix
+verified on a tree that already has everything built is not verified.
+
+**Two things legitimately compile from scratch and are not faults.** `R CMD
+build` runs `* cleaning src` before making a tarball, so testing a real build
+costs a full recompile; keep that rare. And a fresh ship to dev1 excludes
+objects and libraries deliberately, because Windows objects will not link on
+Linux.
+
+**Install into a library directory that already exists.** `R CMD INSTALL -l
+../somewhere` fails immediately if the directory is absent, in a way that looks
+like it ran.
+
+## Shipped data
+
+**Regenerate `ctstantestfit` whenever the fit object's structure changes.** It
+stores `standata`, so a structural change makes anything feeding it back to stan
+fail. This happened when the `stateref` column was added: the shipped fit still
+carried a nine-column parameter setup array against code declaring ten, and
+`ctGenerateFromFit(ctstantestfit)` errored.
+
+**Do not regenerate `ctstantestdat` at the same time without meaning to.**
+`ctsem:::ctdataupdate()` rebuilds both. The data is produced under a fixed seed, but
+generation behaviour changes, so regenerating it moves values that many tests
+compare against. Refresh the fit alone unless the data change is the point.
+
+## Tests
+
+**`NOT_CRAN=true` or the julia tests silently skip** and a file reporting zero
+assertions looks identical to a file that passed. Check assertion counts, not
+just the absence of failures.
+
+**One guard per axis, and no test reads an environment variable.**
+`skip_without_julia()` means "this drives the julia backend" and asserts both
+that this is not CRAN and that Julia is reachable; `skip_on_cran()` alone means
+"too slow for CRAN"; `skip_on_32bit()` means the stan models will not build.
+All three work at the top of a file as well as inside `test_that()`, and both
+placements are reported with a reason -- which the `if (Sys.getenv("NOT_CRAN")
+== "true")` wrappers they replaced were not. An example uses
+`if (isTRUE(ctJuliaStatus()$available))`, the same question through public API.
+`grep -rn NOT_CRAN tests/` should find nothing but comments.
+
+**`testall()` is in `dev/testall.R`** -- `source("dev/testall.R")`, then
+`testall()`. It used to be inside `R/`, reachable only as `ctsem:::testall()`.
+
+**Do not trust a green run from `testall()` alone** for anything before
+September 2026: its workers loaded whichever ctsem was installed rather than the
+tree in hand, so it may have been testing something else entirely. Fixed now,
+but historical results from it prove less than they appear to.
+
+**Run the release tier.** Checks that cannot be made cheap -- a recovery that
+needs hundreds of subjects, a stan program compiled at test time -- skip
+unless `CTSEM_SLOW_TESTS=true` (`skip_unless_slow()`); `dev/test-areas.csv`
+lists the files under `release`, and `tt_area(<areas>, release = TRUE)` runs
+them with the gate set. CI runs them weekly, so a failure there is the first
+sign; confirm it before release rather than relying on the last weekly run.
+
+**Run the stan-julia parity suite deliberately.** It skips unless
+`CTSEM_JULIA_PROJECT` is set, so it does not run in an ordinary suite. It is the
+only mechanical check that the two backends agree, and several divergences this
+review found by hand would have been caught by it.
+
+**Run the julia engine suite on both platforms.** Its assertions have not
+historically been portable: one test passed on Windows and failed on Linux for
+months because a fixture sat where a transform's derivative had collapsed. Both
+platforms now give the same count, and keeping it that way needs both to be run.
+
+## CI
+
+**Four tiers, and only one of them is the CRAN check.** `fast-tests.yaml` runs
+on every push in the CRAN configuration -- NOT_CRAN unset, no Julia -- so every
+guard is exercised where it has to hold. `julia-tests.yaml` and
+`julia-engine.yaml` run what CRAN never will, with Julia installed and
+`NOT_CRAN=true`. `check-standard.yaml` is `--as-cran` on the full platform
+matrix and no longer runs on a development-branch push; it runs on master, on a
+pull request, weekly, and on demand.
+
+**A release needs the vignettes rendered again, then the manual run.** The
+julia vignettes ship pre-rendered (`vignettes/<name>.html` beside a
+`.html.asis` stub), so a check reads whatever was last rendered, not the tree:
+a changed default or output since then reaches no user. Render them all from
+an install of the release tree (`dev/render-vignettes-parallel.R`, see
+CLAUDE.md), then dispatch `check-standard.yaml` with "Build vignettes" checked,
+which routine runs skip.
+
+## Numbers and claims
+
+**A fit reporting `converged = FALSE` is a finding, not noise.** Until September
+2026 the saturation guard tested the magnitude of every raw parameter against a
+single constant, so ordinary fits on data with a large mean reported themselves
+as failures. It now tests whether a transform has stopped responding.
+
+**Benchmark on dev1, not locally, and name the machine on every number.**
+Contention alone has produced a 140% spread on identical work here.
+
+## NEWS
+
+Written last, in one deliberate pass, from the user's side. A bug introduced and
+fixed within the same unreleased cycle gets no entry. See the house rules in
+`CLAUDE.md`; the register is one line per change, no mechanism and no
+measurements.

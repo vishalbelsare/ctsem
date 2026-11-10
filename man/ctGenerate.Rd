@@ -6,53 +6,206 @@
 \usage{
 ctGenerate(
   ctmodelobj,
-  n.subjects = 100,
+  n = 100,
   burnin = 0,
   dtmean = 1,
   logdtsd = 0,
   dtmat = NA,
-  wide = FALSE
+  Tpoints = NULL,
+  wide = FALSE,
+  backend = c("auto", "r", "julia", "stan"),
+  intoverstates = "auto",
+  fromPriors = FALSE,
+  nsamples = 200,
+  datastruct = NA,
+  cores = getOption("mc.cores", 2L),
+  values = NULL,
+  n.subjects
 )
 }
 \arguments{
 \item{ctmodelobj}{ctsem model object from \code{\link{ctModel}}.}
 
-\item{n.subjects}{Number of subjects to output.}
+\item{n}{Number of subjects to output. For a model with grouping
+levels above the subject (\code{ctModel(id = c('subject', 'study'))}), one
+count per level in the same order, innermost first: \code{c(100, 10)} is
+100 subjects split evenly over 10 studies. A level not given has one group.}
 
 \item{burnin}{Number of initial time points to discard (to simulate stationary data)}
 
-\item{dtmean}{Positive numeric. Average time interval (delta T) to use.}
+\item{dtmean}{Positive numeric. Median time interval (delta T) to use.
+Intervals are drawn as \code{exp(rnorm(n, log(dtmean), logdtsd))}, so
+\code{dtmean} is the median rather than the mean whenever \code{logdtsd}
+is non-zero: the mean interval is \code{dtmean * exp(logdtsd^2/2)}, which
+at \code{logdtsd = 0.6} is about 20 percent longer than \code{dtmean}.}
 
-\item{logdtsd}{Numeric. Standard deviation for variability of the time interval.}
+\item{logdtsd}{Numeric. Standard deviation of the log time interval. Zero
+gives an equal-interval design.}
 
-\item{dtmat}{Either NA, or numeric matrix of n.subjects rows and Tpoints-1 columns, 
+\item{dtmat}{Either NA, or numeric matrix of n rows and Tpoints-1 columns, 
 containing positive numeric values for all time intervals between measurements. 
 If not NA, dtmean and logdtsd are ignored.}
 
+\item{Tpoints}{Optional number of time points to generate. If supplied, this overrides
+any \code{Tpoints} stored in \code{ctmodelobj}. If not supplied, \code{ctGenerate}
+uses \code{ctmodelobj$Tpoints} when available.}
+
 \item{wide}{Logical. Output in wide format?}
+
+\item{backend}{Which generator to use: \code{'r'}, \code{'julia'}, or
+\code{'auto'} (the default). \code{'julia'} generates from the model
+itself: each subject's parameters are drawn from the population at every
+level, its latent trajectory is simulated from the process, and each
+observation is drawn from its measurement model, so nonlinear dynamics,
+random effects on any parameter and binary, ordinal or count indicators are
+all generated exactly. It needs \code{ctmodelobj} to be a
+\code{ctModel(type='ct'/'dt')} object rather than the matrix-list form.
+\code{'r'} integrates a linear Gaussian system with a matrix exponential at
+the values the model states, with individual differences only through
+\code{TRAITVAR} and \code{MANIFESTTRAITVAR}, and fills free parameters
+with fixed defaults; it refuses a nonlinear model and has no measurement
+link. \code{'auto'} uses \code{'r'}, as \code{ctGenerate} always has,
+unless the model or the call needs \code{'julia'}: a nonlinear model, a
+non-Gaussian indicator, more than one count in \code{n}, or
+\code{values}. On a model that declares random effects or TI predictor
+effects, \code{'r'} says what it leaves out.}
+
+\item{intoverstates}{For \code{backend='julia'}: \code{'auto'} (the
+default, which is \code{FALSE}), \code{TRUE} or \code{FALSE}. A
+diagnostic handle rather than a modelling choice.
+
+\code{FALSE} samples the latent trajectory from the process and then each
+observation from its conditional distribution given the state at its row:
+a draw from the model. \code{TRUE} instead draws each row from the filter's
+one-step-ahead predictive, for the same subjects, which is the density a
+fit integrating over the states maximises. The two agree in distribution
+for linear dynamics with Gaussian indicators and differ otherwise, which is
+what makes the comparison useful.
+
+\code{backend='r'} already generates this way and ignores the argument.}
+
+\item{fromPriors}{Draw the parameters from the model's priors rather than
+using the values the model specifies, and return \code{nsamples} datasets
+instead of one. This is the prior predictive: what the model says the data
+could look like before it has seen any. It needs no fitted model and no
+data -- with no \code{datastruct}, a balanced design of \code{n}
+subjects at \code{Tpoints} occasions \code{dtmean} apart is used.}
+
+\item{nsamples}{With \code{fromPriors=TRUE}, how many datasets to draw.}
+
+\item{datastruct}{A long format data frame giving the design to generate
+for, in place of the balanced one \code{n}, \code{Tpoints} and
+\code{dtmean} build: the subject (and any group) ids and times, TD and TI
+predictor values, and which observations exist -- a manifest cell that is
+NA stays missing, any other value or a manifest column left out is
+generated. A predictor the model names and \code{datastruct} lacks is zero
+(TD) or drawn standard normal per subject (TI). The same data frame is
+returned with the generated values filled in. Needs \code{backend='julia'},
+or \code{fromPriors=TRUE}, where a fit passed as \code{ctmodelobj} brings
+its own.}
+
+\item{cores}{With \code{fromPriors=TRUE}, cpu cores to use.}
+
+\item{values}{For \code{backend='julia'}: the population values to
+generate from, named and scaled as \code{summary()} reports them, so a
+model written for fitting can generate data at chosen values. A named
+numeric vector gives free parameters' values on their natural scale, e.g.
+\code{c(mm = 2, drift = -0.3)}. A list gives \code{summary()}'s sections:
+\code{values} (the same), \code{popsd} (random-effect sds on the natural
+scale, named by parameter), \code{rawpopcorr} (correlations of the random
+effects, named \code{'a__b'}) and \code{tipreds} (linearised TI predictor
+effects, named \code{'tip_<predictor>_<parameter>'}), as in
+\code{list(values = c(mm = 2), popsd = c(mm = 0.5), tipreds =
+c(tip_TI1_mm = 1))}; with grouping levels, \code{popsd.<level>} and
+\code{rawpopcorr.<level>} name a level's. What is not given takes its
+prior's centre: raw zero for a mean, \code{sdscale} for a raw sd, zero for
+a correlation or a free effect. A value fixed in the model cannot also be
+given here.}
+
+\item{n.subjects}{Deprecated; use \code{n}.}
+}
+\value{
+From the R generator, a long format matrix with one row per subject
+  and time point, or wide format with \code{wide = TRUE}. From the julia
+  generator, the same long format, carrying the attributes described under
+  Generating values. With \code{fromPriors = TRUE}, a list: \code{Y}, an
+  \code{nsamples} by data rows by manifest variables array of generated
+  data, and \code{llrow}, the matching array of row log likelihoods.
 }
 \description{
 This function generates data according to the specified ctsem model object.
 }
 \details{
-Covariance related matrices are treated as Cholesky factors. 
+Covariance related matrices are treated as Cholesky factors.
 TRAITTDPREDCOV and TIPREDCOV matrices are not accounted for, at present. 
 The first 1:n.TDpred rows and columns of TDPREDVAR are used for generating
 tdpreds at each time point.
 }
-\examples{
-#generate data for 2 process model, each process measured by noisy indicator, 
-#stable individual differences in process levels.
+\section{Generating values}{
 
+With \code{backend='julia'} every value the model leaves free is fixed by
+the scale of its prior, and all of them are named in a message:
+\itemize{
+  \item a free parameter is at its prior's centre, raw zero, unless
+  \code{values} names it;
+  \item an individually varying parameter's population sd is its
+  \code{sdscale}, at every level it varies at, on the raw,
+  untransformed scale, unless \code{RAWPOPVAR} (\code{RAWPOPVAR_<level>})
+  states a number, and random effects are uncorrelated unless it states a
+  coordinate -- \code{\link{ctCov}} writes one from a covariance;
+  \item a time independent predictor is drawn standard normal per subject,
+  and an effect fixed in the model (\code{'mm||||TI1=0.5'}) shifts the raw
+  parameter by that much per unit of the predictor; an effect left free is
+  zero.
+}
+\code{fromPriors=TRUE} draws all of these from the priors instead.
+
+The julia generator also returns what it generated from, as attributes:
+\code{attr(, 'subjectpars')}, each subject's parameters on their natural
+scale with its id and groups; \code{attr(, 'grouppars')}, for a model with
+grouping levels, each group's parameters at each level -- its own effects
+and those above it, as a subject of average deviation within it would have;
+and \code{attr(, 'states')}, the latent
+states at every row by id and time (not with \code{intoverstates=TRUE},
+which draws observations from the filter rather than states).
+}
+
+\examples{
+#a 2 process model, each process measured by a noisy indicator, with stable
+#individual differences in process levels
 generatingModel<-ctModel(Tpoints=8,n.latent=2,n.TDpred=0,n.TIpred=0,n.manifest=2,
  MANIFESTVAR=diag(.1,2),
  LAMBDA=diag(1,2),
  DRIFT=matrix(c(-.2,-.05,-.1,-.1),nrow=2),
- TRAITVAR=matrix(c(.5,.2,0,.8),nrow=2),
  DIFFUSION=matrix(c(1,.2,0,4),2),
- CINT=matrix(c(1,0),nrow=2),
+ CINT=matrix(c('cint1, indvarying=TRUE, sdscale=0.05',
+   'cint2, indvarying=TRUE, sdscale=0.08'),nrow=2),
+ MANIFESTMEANS=matrix(0,ncol=1,nrow=2),
  T0MEANS=matrix(0,ncol=1,nrow=2),
  T0VAR=diag(1,2))
 
-data<-ctGenerate(generatingModel,n.subjects=15,burnin=10)
+#the R generator: every subject at the values the model states, with free
+#cells filled by fixed defaults and no individual differences
+data <- ctGenerate(generatingModel,n=15,burnin=10)
+
+\donttest{
+#the julia engine: each subject's CINT drawn from the population, with the
+#means stated on the natural scale and the sds given by sdscale on the raw
+#scale (CINT is 10 * raw, so 0.5 and 0.8)
+if (isTRUE(ctJuliaStatus()$available)) {
+  data <- ctGenerate(generatingModel,n=15,burnin=10,
+    backend='julia',values=c(cint1=1,cint2=0))
+}
+}
+
+#the prior predictive: what the model says data could look like before it
+#has seen any. No fit, and no data.
+\donttest{
+priorpred <- ctGenerate(generatingModel, fromPriors = TRUE, Tpoints = 6,
+  n = 10, nsamples = 20, cores = 2)
+str(priorpred$Y)
+# backend = 'auto' generates with julia where it is available. Julia keeps
+# running between calls, holding what it has compiled; this ends it.
+if (isTRUE(ctJuliaStatus()$available)) ctJuliaKill("session")
+}
 }

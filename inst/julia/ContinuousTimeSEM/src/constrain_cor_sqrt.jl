@@ -1,0 +1,316 @@
+using LinearAlgebra
+
+"""
+    _cor_sqrt_squash(x)
+
+Map an unconstrained off-diagonal coordinate into (-1, 1).
+
+This lives in the construction rather than in the model's parameter table, so
+that one model structure works under any covariance transform: 'rawcorr' needs
+its off-diagonal bounded, 'z' reads the same cell as an unbounded Fisher z, and
+'cholesky' as a factor entry. The expression is transform 3 with multiplier 2
+and offset -1, exactly as the parameter table applied it, so the composite
+raw -> correlation is unchanged and existing 'rawcorr' fits are bit-identical.
+"""
+@inline _cor_sqrt_squash(x) = 2 / (1 + exp(-x)) - 1
+
+"""Derivative of `_cor_sqrt_squash`, as `(1 - u^2)/2` in terms of its output."""
+@inline _cor_sqrt_squash_grad(u) = (1 - u * u) / 2
+
+"""
+    constraincorsqrt1(mat, epsilon=1e-5)
+
+Transform an unconstrained lower-triangular correlation square-root parameter
+matrix into a valid correlation Cholesky-like factor.
+
+The returned matrix has rows scaled so that `o * o'` is positive definite, with
+`epsilon` used as a small numerical margin.
+"""
+function constraincorsqrt1(mat::AbstractArray{T}, epsilon = 1e-5) where T
+    d = size(mat, 1)
+    o = zeros(T, d, d)
+    ss = zeros(T, d)
+    s = zeros(T, d)
+    
+    # Step 1: Compute sums of squares (ss) and sums (s) for each row
+    # TODO: Rewrite this for performance
+    for i in 1:d
+        for j in 1:d
+            if j > i
+                v = _cor_sqrt_squash(mat[j, i])
+                ss[i] += v^2
+                s[i] += v
+            elseif j < i
+                v = _cor_sqrt_squash(mat[i, j])
+                ss[i] += v^2
+                s[i] += v
+            end
+        end
+        s[i] += epsilon
+        ss[i] += epsilon
+    end
+    
+    # Step 2: Compute orthogonalized values for correlation matrix
+    # TODO: Rewrite this for performance
+    for i in 1:d
+        o[i, i] = 0
+        r1 = sqrt(ss[i])
+        r3 = abs(s[i]) / r1 - 1
+        r4 = sqrt(log1p(exp(2 * (abs(s[i]) - s[i] - 1) - 4)))
+        r = (r4 * r3 + 1) * r4 + 1
+        r = sqrt(ss[i] + r)
+        
+        for j in 1:d
+            if j > i
+                o[i, j] = _cor_sqrt_squash(mat[j, i]) / r
+            elseif j < i
+                o[i, j] = _cor_sqrt_squash(mat[i, j]) / r
+            end
+        end
+        o[i, i] = sqrt(1 - sum(o[i, :].^2) + epsilon)
+    end
+    
+    return o
+end
+
+"""
+    sdcovsqrt2cov(mat, choleskymats)
+
+Convert standard-deviation/correlation square-root parameters to a covariance.
+
+The diagonal of `mat` supplies standard deviations and the lower triangle the
+off-diagonal coordinates, read according to `choleskymats`: the row-normalised
+correlation square root (0 and -1), a factor (1), or Fisher z inside a matrix
+exponential (2).
+
+Allocating, for the reporting and summary paths; `sdcovsqrt2cov!` is the one
+the filter uses. This delegates to it rather than carrying a second
+implementation of the same map, which is how the two came apart: this function
+accepted `choleskymats` and ignored it, with the other two constructions
+commented out beside it, so a fit under covmattransform='z' or 'cholesky' was
+estimated with the requested construction and *reported* through the
+row-normalised one. On a four-effect model that left the reported T0cov 0.083
+from the one the model used, including a sign flip, and nothing was raised.
+"""
+function sdcovsqrt2cov(mat, choleskymats)
+    d = size(mat, 1)
+    d == 0 && return Symmetric(Matrix(mat), :L)
+    buffer = _make_square_buffer(eltype(mat), d)
+    sdcovsqrt2cov!(buffer, mat, choleskymats)
+    return Symmetric(copy(buffer.out), :L)
+end
+
+"""
+    sdcovsqrt2cov!(buffer, mat, choleskymats)
+
+In-place buffered version of `sdcovsqrt2cov`.
+
+The covariance is written to `buffer.out`; other fields of `buffer` are used as
+scratch storage. `choleskymats` selects the construction: 0 and -1 the
+row-normalised correlation square root, 1 a factor, 2 Fisher z inside a
+matrix exponential.
+"""
+function sdcovsqrt2cov!(buffer, mat, choleskymats)
+    return sdcovsqrt2cov!(buffer, mat, choleskymats, size(mat, 1))
+end
+
+# The buffer's dimension must be the matrix's. It is not a lower bound: the
+# construction cache stores and serves `buffer.out` whole against d*d slots, so
+# an oversized buffer throws on a miss and -- worse -- returns a scrambled block
+# on a hit.
+# Asked of `out` rather than of the buffer's type. Not every buffer here is a
+# `SquareBuffer` -- the expm tests hand over a NamedTuple with the same scratch
+# fields and no `dim` -- and this file is included before
+# workspace_buffers.jl, so a method dispatching on `SquareBuffer` cannot even
+# be defined (`UndefVarError: SquareBuffer not defined`). One integer load is
+# not a cost worth a specialisation next to an O(d^3) construction.
+@inline function _check_buffer_dim(buffer, __d::Int)
+    d = __d
+    n = size(buffer.out, 1)
+    n == d && return nothing
+    throw(DimensionMismatch(
+        "sdcovsqrt2cov! buffer is $(n)x$(n) for a $(d)x$(d) matrix"))
+end
+
+function sdcovsqrt2cov!(buffer, mat, choleskymats, dim::Int)
+    d = dim
+    _check_buffer_dim(buffer, dim)
+    T = eltype(buffer.out)
+    if _CTSEM_COV_CACHE[]
+        _COVCACHE_CALLS[] += 1
+        c = _covcache(T, dim, _effective_covmatcode(choleskymats))
+        hit = _covcache_lookup(c, mat, dim)
+        if hit != 0
+            copyto!(buffer.out, c.outs[hit])
+            return nothing
+        end
+        _COVCACHE_MISSES[] += 1
+        _sdcovsqrt2cov_uncached!(buffer, mat, choleskymats, dim)
+        _covcache_store!(c, mat, buffer.out, dim)
+        return nothing
+    end
+    return _sdcovsqrt2cov_uncached!(buffer, mat, choleskymats, dim)
+end
+
+"""
+    _effective_covmatcode(choleskymats)
+
+The construction code as an `Int`.
+
+Nothing overrides the argument any more -- `_CTSEM_COV_EXPM[]` used to, and
+removing it is why this is now only a conversion. It stays as a function
+because the forward pass, the reverse pass and the cache key must agree about
+which construction is in force, and one place to look is how that stays true.
+"""
+@inline _effective_covmatcode(choleskymats) = Int(choleskymats)
+
+function _sdcovsqrt2cov_uncached!(buffer, mat, choleskymats, dim::Int)
+    d = dim
+    # 2 is covmattransform='z', 1 is 'cholesky', 0 and -1 the correlation
+    # square root -- the same codes the stan path reads from
+    # `standata$choleskymats`, and the z implementations agree to 3e-16.
+    code = _effective_covmatcode(choleskymats)
+    if code == 2
+        return sdcovexpm2cov!(buffer, mat, dim)
+    elseif code >= 1
+        # Stan's `tcrossprod(mat)`: `mat` is the factor itself. Summed over the
+        # whole of 1:d rather than 1:min(i,j), which is what stan does, so a
+        # model with something above the diagonal gets one answer and not two.
+        T = eltype(buffer.out)
+        @inbounds for j in 1:d, i in 1:d
+            acc = zero(T)
+            for k in 1:d
+                acc += T(mat[i, k]) * T(mat[j, k])
+            end
+            buffer.out[i, j] = acc
+        end
+        return nothing
+    end
+    constraincorsqrt1_vec!(buffer, mat, 1e-5, dim)
+
+    @inbounds for j in 1:d, i in 1:d
+        buffer.intermediate[i, j] = mat[i, i] * buffer.out[i, j]
+    end
+
+    _mul_right_transpose!(buffer.out, buffer.intermediate, buffer.intermediate,
+        dim, dim, dim)
+    return nothing
+end
+
+"""
+    is_positive_definite(mat)
+
+Return whether all eigenvalues of `mat` are strictly positive.
+"""
+function is_positive_definite(mat::AbstractMatrix{<:AbstractFloat})
+    return all(eigvals(mat) .> 0)
+end
+
+# The loop transform, the vectorised one and the buffered one agree with each
+# other and with the R implementation. `test/test_constrain_cor_sqrt.jl`
+# asserts that; the printing harness that used to check it by eye here, and
+# the half-dozen abandoned vectorisation experiments it was written against,
+# have gone.
+
+"""
+    constraincorsqrt1_vec(sym_mat, epsilon=1e-5)
+
+Vectorized correlation square-root constraint for a symmetric matrix view.
+
+The input is treated as symmetric, the off-diagonal entries are scaled row-wise,
+and the diagonal is adjusted so rows have valid correlation-factor norms.
+"""
+function constraincorsqrt1_vec(sym_mat, epsilon = 1e-5)
+    # The squash applies off the diagonal only, and the row sums below subtract
+    # the diagonal's own contribution, so this copy keeps the diagonal as it was.
+    sq = _cor_sqrt_squash.(sym_mat)
+    for i in axes(sym_mat, 1)
+        sq[i, i] = sym_mat[i, i]
+    end
+    sym_mat = sq
+    d = collect(diag(sym_mat))
+    s = sum(sym_mat, dims=1)' .- d .+ epsilon
+    ss = sum(abs2, sym_mat, dims=1)' .- d.^2 .+ epsilon
+    tmp = @. sqrt(log1p(exp(2 * (abs(s) - s - 1) - 4)))
+    r = @. sqrt(ss + (tmp * (abs(s) / sqrt(ss) - 1) + 1) * tmp + 1)
+    o = sym_mat ./ r
+	p = o - diagm(diag(o))
+	dd = reshape(sqrt.(1 .- sum(abs2, p, dims = 2) .+ epsilon), :) 
+    return p + diagm(dd)
+end
+
+# buffer requires:
+# s = Vector{S}(undef, d)
+# ss = Vector{S}(undef, d)
+# r = Vector{S}(undef, d)
+# row_sq = Vector{S}(undef, d)
+# out = Matrix{S}(undef, d, d)
+
+"""
+    _sym_lower_get(mat, i, j)
+
+Return `mat[i, j]` from a matrix whose lower triangle stores symmetric entries.
+"""
+@inline function _sym_lower_get(mat::AbstractMatrix, i::Int, j::Int)
+    return i >= j ? mat[i, j] : mat[j, i]
+end
+
+"""
+    constraincorsqrt1_vec!(buffer, sym_mat, epsilon=1e-5)
+
+In-place buffered version of `constraincorsqrt1_vec`.
+
+The constrained square-root factor is written to `buffer.out`; the vectors in
+`buffer` hold intermediate row sums, scales, and row norms.
+"""
+function constraincorsqrt1_vec!(buffer, sym_mat, epsilon = 1e-5)
+    return constraincorsqrt1_vec!(buffer, sym_mat, epsilon, size(sym_mat, 1))
+end
+
+function constraincorsqrt1_vec!(buffer, sym_mat, epsilon, __d::Int)
+    d = __d
+    S = eltype(sym_mat)
+    e = convert(S, epsilon)
+
+    @inbounds for i in 1:d
+        si = e
+        ssi = e
+        for j in 1:d
+            if j != i
+                v = _cor_sqrt_squash(_sym_lower_get(sym_mat, i, j))
+                si += v
+                ssi += v * v
+            end
+        end
+        buffer.s[i] = si
+        buffer.ss[i] = ssi
+    end
+
+    @inbounds for i in 1:d
+        si = buffer.s[i]
+        ssi = buffer.ss[i]
+        abs_si = abs(si)
+        tmp = sqrt(log1p(exp(2 * (abs_si - si - one(S)) - 4)))
+        buffer.r[i] = sqrt(ssi + (tmp * (abs_si / sqrt(ssi) - one(S)) + one(S)) * tmp + one(S))
+    end
+
+    @inbounds for i in 1:d
+        inv_ri = inv(buffer.r[i])
+        sq = zero(S)
+        for j in 1:d
+            if j == i
+                buffer.out[i, j] = zero(S)
+            else
+                v = _cor_sqrt_squash(_sym_lower_get(sym_mat, i, j)) * inv_ri
+                buffer.out[i, j] = v
+                sq += v * v
+            end
+        end
+        buffer.row_sq[i] = sq
+    end
+
+    @inbounds for i in 1:d
+        buffer.out[i, i] = sqrt(one(S) - buffer.row_sq[i] + e)
+    end
+end
+

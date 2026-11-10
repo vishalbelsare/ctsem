@@ -1,0 +1,589 @@
+# Censored manifest variables: `manifesttype = 4`, Gaussian within known limits.
+#
+# Censored is the one non-Gaussian type with a measurement error of its own, so
+# it is the one whose standard deviation stays free and has to be differentiated.
+# That is what most of this file is about. Unlike test-julia-binary.R and
+# test-julia-ordinal.R, there is no closed-form single-observation check here,
+# at this level or in the engine's own suite -- no file under
+# inst/julia/ContinuousTimeSEM/test mentions count, censored, or the quadrature
+# functions that carry them (`_binary_moments`, `_binary_mode`,
+# `_ekf_binary_update!`) at all. What this file does check: that the standard
+# deviation reaches the engine, comes back correctly in the gradient, and that
+# everything the R side has to know about limits is checked rather than
+# assumed.
+
+.censored_data <- function(nsubjects = 40, nobs = 8, lower = 0, upper = 5,
+  seed = 7) {
+  set.seed(seed)
+  d <- do.call(rbind, lapply(seq_len(nsubjects), function(i) {
+    gen <- suppressMessages(ctModel(type = "ct", n.latent = 1, n.manifest = 1,
+      manifestNames = "eta", latentNames = "eta1", LAMBDA = matrix(1),
+      DRIFT = matrix(-0.4), DIFFUSION = matrix(0.6),
+      MANIFESTVAR = matrix(1e-6), T0VAR = matrix(1), T0MEANS = matrix(0),
+      CINT = matrix(0), MANIFESTMEANS = matrix(0), Tpoints = nobs))
+    one <- data.frame(ctGenerate(gen, n = 1, Tpoints = nobs,
+      backend = "r"))
+    one$id <- i
+    one
+  }))
+  latent <- 2.5 + d$eta + stats::rnorm(nrow(d), 0, 0.5)
+  d$y <- pmin(pmax(latent, lower), upper)
+  d$eta <- NULL
+  d
+}
+
+.censored_model <- function(lower = 0, upper = 5, sd = NULL) {
+  m <- suppressWarnings(suppressMessages(ctModel(type = "ct", n.latent = 1,
+    n.manifest = 1, manifestNames = "y", latentNames = "eta1",
+    manifesttype = 4L, censormin = lower, censormax = upper,
+    LAMBDA = matrix(1), MANIFESTMEANS = matrix("mm"), CINT = matrix(0),
+    T0MEANS = matrix(0),
+    MANIFESTVAR = matrix(if (is.null(sd)) "mvar" else sd))))
+  m$pars$indvarying <- FALSE
+  m
+}
+
+test_that("ctModel takes manifesttype 4 and its limits", {
+  m <- .censored_model()
+  expect_equal(unname(m$manifesttype), 4L)
+  expect_equal(unname(m$censormin), 0)
+  expect_equal(unname(m$censormax), 5)
+
+  build <- function(...) suppressWarnings(suppressMessages(ctModel(
+    type = "ct", n.latent = 1, n.manifest = 1, manifestNames = "y",
+    latentNames = "eta1", LAMBDA = matrix(1), ...)))
+  # Censored nowhere is a Gaussian variable, and saying so is more useful than
+  # fitting an identical model under a different name.
+  expect_error(build(manifesttype = 4L), "at least one")
+  expect_error(build(manifesttype = 4L, censormin = 5, censormax = 0),
+    "must be below")
+  # A limit left on a variable that is no longer censored must not apply.
+  plain <- build(manifesttype = 0L, censormin = 1, censormax = 2)
+  expect_equal(unname(plain$censormin), -Inf)
+  expect_equal(unname(plain$censormax), Inf)
+})
+
+test_that("a censored variable keeps its measurement standard deviation", {
+  skip_without_julia()
+  # Every other non-Gaussian type has its randomness supplied by the link, so
+  # ctFit fixes MANIFESTVAR for them. Censored is Gaussian within its limits and
+  # would have no scale at all if that happened here.
+  fit <- suppressWarnings(suppressMessages(ctFit(.censored_data(),
+    .censored_model(), backend = "julia", intoverpop = "augmented",
+    fit = FALSE)))
+  free <- fit$parameter_table[fit$parameter_table$matrix %in% "MANIFESTVAR", ]
+  expect_true(any(!is.na(free$parnumber)))
+})
+
+test_that("print names censored variables with their limits", {
+  described <- paste(utils::capture.output(print(.censored_model())),
+    collapse = " ")
+  expect_match(described, "y \\(censored, min 0, max 5\\)")
+  onesided <- paste(utils::capture.output(print(
+    .censored_model(lower = 0, upper = Inf))), collapse = " ")
+  expect_match(onesided, "no max")
+})
+
+test_that("censored data is checked against the declared limits", {
+  d <- .censored_data(nsubjects = 6, nobs = 4)
+  m <- .censored_model()
+
+  beyond <- d
+  beyond$y[3] <- -1
+  expect_error(suppressMessages(ctFit(beyond, m, backend = "julia",
+    fit = FALSE)), "below its censormin")
+
+  above <- d
+  above$y[3] <- 6
+  expect_error(suppressMessages(ctFit(above, m, backend = "julia",
+    fit = FALSE)), "above its censormax")
+
+  # Legal but worth saying: censoring that never applies, and censoring that
+  # applies to everything, are both models the user probably did not mean.
+  never <- d
+  never$y <- pmin(pmax(never$y, 0.5), 4.5)
+  expect_warning(suppressMessages(ctFit(never, m, backend = "julia",
+    fit = FALSE)), "no observations at either limit")
+})
+
+test_that("the objective cache distinguishes censoring from its absence", {
+  skip_without_julia()
+  # Censoring changes nothing in the parameter table, so a key that hashed the
+  # table and the data but not the measurement type handed a Gaussian model
+  # built after a censored one on the same data the censored objective, and
+  # returned its likelihood.
+  d <- .censored_data(nsubjects = 6, nobs = 5, lower = 1, upper = 4)
+  prep <- function(m) suppressWarnings(suppressMessages(ctFit(d, m,
+    backend = "julia", intoverpop = "augmented", fit = FALSE, cores = 1L)))
+  gaussian <- .censored_model(lower = 1, upper = 4)
+  gaussian$manifesttype[] <- 0L
+  gaussian$censormin[] <- -Inf
+  gaussian$censormax[] <- Inf
+  specs <- list(censored = prep(.censored_model(lower = 1, upper = 4)),
+    lower = prep(.censored_model(lower = 0.5, upper = 4)),
+    upper = prep(.censored_model(lower = 1, upper = 4.5)),
+    gaussian = prep(gaussian))
+  expect_identical(specs$censored$parameter_table, specs$gaussian$parameter_table)
+
+  keys <- vapply(specs, .ctJuliaObjectiveKey, character(1))
+  expect_equal(anyDuplicated(keys), 0L)
+  expect_identical(.ctJuliaObjectiveKey(prep(.censored_model(lower = 1, upper = 4))),
+    keys[["censored"]])
+
+  # And the symptom itself: evaluated in turn in one session, each is its own
+  # likelihood. Moving a limit no observation sits at leaves the likelihood
+  # where it was, so the data must have observations at both.
+  expect_true(any(d$y == 1) && any(d$y == 4))
+  npar <- max(specs$censored$parameter_table$parnumber, na.rm = TRUE)
+  at <- rep(0.1, npar)
+  values <- vapply(specs, function(s) ctJuliaEvaluate(s, at)$value, numeric(1))
+  expect_equal(anyDuplicated(values), 0L)
+})
+
+test_that("stan refuses censored rather than ignoring the censoring", {
+  expect_error(suppressMessages(ctFit(.censored_data(nsubjects = 5, nobs = 4),
+    .censored_model(), backend = "stan",
+    optimcontrol = list(estonly = TRUE))), "need backend=\"julia\"")
+})
+
+test_that("the adjoint matches forward mode with censoring present", {
+  skip_without_julia()
+  # The standard deviation's cotangent is the new path here: it is read from
+  # MANIFESTVAR's own diagonal and handed straight back there, rather than going
+  # through the covariance construction the Gaussian rows use.
+  handle <- suppressWarnings(suppressMessages(ctFit(.censored_data(),
+    .censored_model(), backend = "julia", intoverpop = "augmented",
+    fit = FALSE)))
+  npar <- max(handle$parameter_table$parnumber, na.rm = TRUE)
+  set.seed(2)
+  for (trial in 1:3) {
+    at <- stats::rnorm(npar, 0, 0.25)
+    adjoint <- as.numeric(ctJuliaEvaluate(handle, at, gradient = TRUE,
+      gradient_method = "adjoint")$gradient)
+    forward <- as.numeric(ctJuliaEvaluate(handle, at, gradient = TRUE,
+      gradient_method = "forward")$gradient)
+    expect_equal(adjoint, forward, tolerance = 1e-8)
+  }
+})
+
+test_that("the gradient is right when most observations are at a limit", {
+  skip_without_julia()
+  # The regression this pins. ForwardDiff breaks comparison ties on the
+  # partials, so an observation exactly at a limit compared against a limit
+  # carrying a derivative seed took the interior branch during differentiation
+  # while the forward pass took the censored one. The error grew with the number
+  # of censored observations: 1% at two of them, 263% at two hundred and
+  # eighty-nine.
+  d <- .censored_data(lower = 2.4, upper = 2.6)
+  m <- .censored_model(lower = 2.4, upper = 2.6)
+  atlimit <- sum(d$y <= 2.4 + 1e-8) + sum(d$y >= 2.6 - 1e-8)
+  expect_gt(atlimit, nrow(d) / 2)
+
+  handle <- suppressWarnings(suppressMessages(ctFit(d, m, backend = "julia",
+    intoverpop = "augmented", fit = FALSE)))
+  npar <- max(handle$parameter_table$parnumber, na.rm = TRUE)
+  set.seed(2)
+  at <- stats::rnorm(npar, 0, 0.25)
+  adjoint <- as.numeric(ctJuliaEvaluate(handle, at, gradient = TRUE)$gradient)
+  eps <- 1e-5
+  differenced <- vapply(seq_len(npar), function(i) {
+    up <- at; up[i] <- up[i] + eps
+    down <- at; down[i] <- down[i] - eps
+    (as.numeric(ctJuliaEvaluate(handle, up)$value) -
+        as.numeric(ctJuliaEvaluate(handle, down)$value)) / (2 * eps)
+  }, numeric(1))
+  expect_equal(adjoint, differenced, tolerance = 1e-5)
+})
+
+test_that("the exact Hessian of a censored model exists and is right", {
+  skip_without_julia()
+  # `ctsem_hessian` differentiates the adjoint gradient, and the censored
+  # measurement update inside it takes a jacobian of its own. Nested like that,
+  # ForwardDiff threw DualMismatchError on this model -- the inner tag ranked
+  # below the outer -- so every censored fit had no Hessian: no Newton finish,
+  # and nothing for the certification or the standard errors. Against central
+  # differences of the adjoint gradient, elementwise.
+  d <- .censored_data(lower = 2.4, upper = 2.6)
+  m <- .censored_model(lower = 2.4, upper = 2.6)
+  handle <- suppressWarnings(suppressMessages(ctFit(d, m, backend = "julia",
+    intoverpop = "augmented", fit = FALSE)))
+  npar <- max(handle$parameter_table$parnumber, na.rm = TRUE)
+  set.seed(2)
+  at <- stats::rnorm(npar, 0, 0.25)
+  hessian <- .ctBackendHessianAt(handle, at)
+  expect_false(is.null(hessian))
+  expect_true(all(is.finite(hessian)))
+  gradient <- function(x) as.numeric(ctJuliaEvaluate(handle, x, gradient = TRUE)$gradient)
+  eps <- 1e-5
+  differenced <- vapply(seq_len(npar), function(j) {
+    up <- at; up[j] <- up[j] + eps
+    down <- at; down[j] <- down[j] - eps
+    (gradient(up) - gradient(down)) / (2 * eps)
+  }, numeric(npar))
+  expect_equal(hessian, differenced, tolerance = 1e-5)
+})
+
+test_that("a censored indicator with no floor differentiates below -1", {
+  skip_without_julia()
+  # Without RESPONSE the response transform is the identity, but its power
+  # arrived as a dual one wherever the measurement was differentiated, so the
+  # general transform ran and `log1p` threw on every value at or below -1: no
+  # gradient, no scores, no Hessian, for a standardised indicator censored
+  # only at its maximum.
+  d <- .censored_data(nsubjects = 12, nobs = 6, lower = -Inf, upper = 3.5)
+  d$y <- d$y - 3
+  expect_gt(sum(d$y < -1), 5)
+  handle <- suppressWarnings(suppressMessages(ctFit(d,
+    .censored_model(lower = -Inf, upper = 0.5), backend = "julia",
+    intoverpop = "augmented", fit = FALSE, cores = 1L)))
+  npar <- max(handle$parameter_table$parnumber, na.rm = TRUE)
+  set.seed(3)
+  at <- stats::rnorm(npar, 0, 0.25)
+  gradient <- function(x) as.numeric(ctJuliaEvaluate(handle, x, gradient = TRUE)$gradient)
+  adjoint <- gradient(at)
+  eps <- 1e-5
+  differenced <- vapply(seq_len(npar), function(i) {
+    up <- at; up[i] <- up[i] + eps
+    down <- at; down[i] <- down[i] - eps
+    (as.numeric(ctJuliaEvaluate(handle, up)$value) -
+        as.numeric(ctJuliaEvaluate(handle, down)$value)) / (2 * eps)
+  }, numeric(1))
+  expect_equal(adjoint, differenced, tolerance = 1e-5)
+  # The per-subject scores ctIdentify and casewise leave-one-out read.
+  module <- .ctJuliaModule(handle$project)
+  scores <- as.matrix(.ctJuliaGet(module$ctsem_subject_gradients(
+    .ctJuliaObjective(handle, hybrid = TRUE), .ctJuliaVector(at),
+    prior = FALSE))$scores)
+  expect_equal(colSums(scores), adjoint, tolerance = 1e-8)
+  hessian <- .ctBackendHessianAt(handle, at)
+  expect_true(all(is.finite(hessian)))
+  expect_equal(hessian[, 1], (gradient(replace(at, 1, at[1] + eps)) -
+    gradient(replace(at, 1, at[1] - eps))) / (2 * eps), tolerance = 1e-5)
+
+  # With RESPONSE the transform is real, anchored at 0 without a floor and
+  # defined only above -1, so such data is refused by name.
+  scaled <- suppressWarnings(suppressMessages(ctModel(type = "ct",
+    n.latent = 1, n.manifest = 1, manifestNames = "y", latentNames = "eta1",
+    manifesttype = 4L, censormin = -Inf, censormax = 0.5,
+    RESPONSE = c(0.1, NA), LAMBDA = matrix(1), MANIFESTMEANS = matrix("mm"),
+    CINT = matrix(0), T0MEANS = matrix(0), MANIFESTVAR = matrix("mvar"))))
+  scaled$pars$indvarying <- FALSE
+  expect_identical(.ctResponseRows(scaled$pars), 1L)
+  expect_error(suppressWarnings(suppressMessages(ctFit(d, scaled,
+    backend = "julia", fit = FALSE))), "no censormin")
+})
+
+test_that("a censored model recovers what generated it", {
+  skip_without_julia()
+  fit <- suppressWarnings(suppressMessages(ctFit(.censored_data(nsubjects = 50,
+    nobs = 10), .censored_model(), backend = "julia",
+    intoverpop = "augmented", optimcontrol = list(estonly = TRUE))))
+  expect_true(isTRUE(fit$optim$converged))
+  # The Newton finish ran, which needs the exact Hessian above.
+  expect_gt(fit$optim$newton_steps, 0L)
+  means <- summary(fit)$popmeans
+  expect_equal(unname(means["drift_eta1", "mean"]), -0.4, tolerance = 0.35)
+  expect_equal(unname(means["mm", "mean"]), 2.5, tolerance = 0.3)
+  expect_equal(unname(means["mvar", "mean"]), 0.5, tolerance = 0.25)
+})
+
+test_that("ctGenerate respects the censoring limits", {
+  skip_without_julia()
+  gen <- suppressWarnings(suppressMessages(ctModel(type = "ct", n.latent = 1,
+    n.manifest = 1, manifestNames = "y", latentNames = "eta1",
+    manifesttype = 4L, censormin = 0, censormax = 3, LAMBDA = matrix(1),
+    DRIFT = matrix(-0.4), DIFFUSION = matrix(0.6), MANIFESTVAR = matrix(0.5),
+    T0VAR = matrix(1), T0MEANS = matrix(0), CINT = matrix(0),
+    MANIFESTMEANS = matrix(1.5), Tpoints = 6)))
+  set.seed(4)
+  d <- data.frame(ctGenerate(gen, n = 20, Tpoints = 6,
+    backend = "julia"))
+  values <- d$y[!is.na(d$y)]
+  expect_true(length(values) > 0)
+  expect_true(all(values >= 0 - 1e-8))
+  expect_true(all(values <= 3 + 1e-8))
+  # Some should land on the limits and some inside, or the limits are doing
+  # nothing and the test would pass on a generator that ignored them.
+  expect_gt(sum(values <= 1e-8 | values >= 3 - 1e-8), 0)
+  expect_gt(sum(values > 1e-8 & values < 3 - 1e-8), 0)
+})
+
+test_that("ctKalman reports a censored prediction on the response scale", {
+  skip_without_julia()
+  # The same correction the other non-Gaussian types get, and for a censored
+  # variable it is not simply the linear predictor: the mean of what the
+  # instrument can record is pulled away from the limits, so reporting the
+  # latent mean would put predictions outside the range the data can take.
+  d <- .censored_data(nsubjects = 30, nobs = 8, lower = 0, upper = 5)
+  fit <- suppressWarnings(suppressMessages(ctFit(d, .censored_model(),
+    backend = "julia", intoverpop = "augmented",
+    optimcontrol = list(estonly = TRUE))))
+  k <- suppressWarnings(suppressMessages(ctKalman(fit)))
+  predicted <- k$value[k$Element %in% "yprior"]
+  predicted <- predicted[is.finite(predicted)]
+  expect_gt(length(predicted), 0)
+  expect_true(all(predicted >= 0))
+  expect_true(all(predicted <= 5))
+  expect_equal(mean(predicted), mean(d$y), tolerance = 0.5)
+})
+
+test_that("censoring under Laplace: a limit nothing reaches is Gaussian, and the adjoint holds at a floor", {
+  skip_without_julia()
+  # Every test above runs on 'augmented'. Under Laplace a censored row's moments
+  # are differentiated twice more in the person's effects -- the inner mode's
+  # curvature, then its derivative in the parameters -- and with own intercept
+  # variances (popunique) a censored item also takes them out of the filter,
+  # since the hybrid needs every item Gaussian, so the same objective comes from
+  # the Laplace layer instead. Two items with person intercepts, a floor at 0.
+  set.seed(5)
+  d <- do.call(rbind, lapply(1:16, function(i) {
+    eta <- as.numeric(stats::filter(stats::rnorm(8, 0, 0.6), 0.6, method = "recursive"))
+    u <- stats::rnorm(2, 0, 0.6)
+    data.frame(id = i, time = cumsum(stats::rexp(8, 2)),
+      y1 = pmax(0.3 + u[1] + eta + stats::rnorm(8, 0, 0.4), 0),
+      y2 = pmax(0.1 + u[2] + 0.8 * eta + stats::rnorm(8, 0, 0.4), 0))
+  }))
+  expect_gt(mean(c(d$y1, d$y2) == 0), 0.25)
+  model <- function(type, lower = 0) {
+    m <- suppressWarnings(suppressMessages(ctModel(type = "ct", n.latent = 1,
+      n.manifest = 2, manifestNames = c("y1", "y2"), latentNames = "eta",
+      LAMBDA = matrix(c("1", "lam2"), 2), MANIFESTMEANS = matrix(c("mm1", "mm2"), 2),
+      MANIFESTVAR = matrix(c("mv1", "0", "0", "mv2"), 2), CINT = matrix(0),
+      T0MEANS = matrix(0), manifesttype = rep(type, 2),
+      censormin = if (type == 4L) rep(lower, 2),
+      censormax = if (type == 4L) rep(Inf, 2))))
+    m$pars$indvarying <- m$pars$matrix %in% "MANIFESTMEANS"
+    m
+  }
+  for (unique in c(FALSE, TRUE)) {
+    prep <- function(m) suppressWarnings(suppressMessages(if (unique)
+      ctFit(d, m, backend = "julia", intoverpop = "laplace", fit = FALSE,
+        cores = 1L, poprank = 1, popunique = c(id = "MANIFESTMEANS")) else
+      ctFit(d, m, backend = "julia", intoverpop = "laplace", fit = FALSE, cores = 1L)))
+    gaussian <- prep(model(0L))
+    remote <- prep(model(4L, -1e6))
+    floor <- prep(model(4L, 0))
+    if (unique) {
+      expect_false(is.null(gaussian$laplace$hybrid))
+      expect_null(floor$laplace$hybrid)
+    }
+    npar <- .ctBackendNpar(floor)
+    expect_identical(npar, .ctBackendNpar(gaussian))
+    set.seed(6)
+    at <- stats::rnorm(npar, 0, 0.2)
+    g <- ctJuliaEvaluate(gaussian, at, gradient = TRUE)
+    r <- ctJuliaEvaluate(remote, at, gradient = TRUE)
+    expect_equal(r$value, g$value, tolerance = 1e-9)
+    expect_equal(as.numeric(r$gradient), as.numeric(g$gradient), tolerance = 1e-6)
+    adjoint <- ctJuliaEvaluate(floor, at, gradient = TRUE, gradient_method = "adjoint")
+    forward <- ctJuliaEvaluate(floor, at, gradient = TRUE, gradient_method = "forward")
+    expect_equal(as.numeric(adjoint$gradient), as.numeric(forward$gradient), tolerance = 1e-8)
+    expect_gt(abs(adjoint$value - g$value), 1)
+  }
+})
+
+test_that("a categorical item's measurement is linearised where it reads the state", {
+  skip_without_julia()
+  # The categorical update took its direction from LAMBDA and its intercept
+  # from MANIFESTMEANS. Where the measurement reads the state those are not the
+  # linearisation: a link (`MANIFESTMEANS = 'exp(eta) * s1 + off1'`, LAMBDA 0)
+  # informed nothing, and under 'augmented' an item's random intercept, a
+  # carrier state MANIFESTMEANS reads, was never updated by the item. A
+  # censored item no observation is censored at is a Gaussian one, which the
+  # Gaussian update linearises through Jy: 237 and 7.1 nats apart before,
+  # equal after. One model with both: a link and augmented intercepts.
+  set.seed(21)
+  d <- do.call(rbind, lapply(1:16, function(i) {
+    eta <- as.numeric(stats::filter(stats::rnorm(8, 0, 0.6), 0.6, method = "recursive"))
+    u <- stats::rnorm(2, 0, 0.6)
+    data.frame(id = i, time = cumsum(stats::rexp(8, 2)),
+      y1 = pmax(0.3 + u[1] + 0.6 * exp(eta) + stats::rnorm(8, 0, 0.3), 0),
+      y2 = pmax(0.1 + u[2] + 0.4 * eta + 0.3 * exp(eta) + stats::rnorm(8, 0, 0.3), 0))
+  }))
+  model <- function(type, lower = 0) {
+    m <- suppressWarnings(suppressMessages(ctModel(type = "ct", n.latent = 1,
+      n.manifest = 2, manifestNames = c("y1", "y2"), latentNames = "eta",
+      LAMBDA = matrix(c("0", "0"), 2),
+      MANIFESTMEANS = matrix(c("eta * (1 - s1) + exp(eta) * s1 + off1",
+        "eta * (1 - s2) + exp(eta) * s2 + off2"), 2),
+      PARS = c("s1|inv_logit(param)", "s2|inv_logit(param)", "off1", "off2"),
+      MANIFESTVAR = matrix(if (type == 1L) "0" else c("mv1", "0", "0", "mv2"), 2, 2),
+      CINT = matrix(0), T0MEANS = matrix(0), manifesttype = rep(type, 2),
+      censormin = if (type == 4L) rep(lower, 2),
+      censormax = if (type == 4L) rep(Inf, 2))))
+    m$pars$indvarying <- m$pars$param %in% c("off1", "off2")
+    m
+  }
+  prep <- function(m, data = d) suppressWarnings(suppressMessages(ctFit(data, m,
+    backend = "julia", intoverpop = "augmented", fit = FALSE, cores = 1L)))
+  gaussian <- prep(model(0L))
+  remote <- prep(model(4L, -1e6))
+  floor <- prep(model(4L, 0))
+  npar <- .ctBackendNpar(gaussian)
+  set.seed(3)
+  at <- stats::rnorm(npar, 0, 0.3)
+  # The Gaussian update iterates a measurement that reads the state to the
+  # row's posterior mode (`_ekf_iterated_rows!`), and a categorical item is
+  # linearised once, at the prior: the comparison is of the two linearised
+  # where the EKF linearises them.
+  ctsem:::.ctJuliaEval("ContinuousTimeSEM.ctsem_set_relinearise!(false)")
+  on.exit(ctsem:::.ctJuliaEval("ContinuousTimeSEM.ctsem_set_relinearise!(true)"),
+    add = TRUE)
+  g <- ctJuliaEvaluate(gaussian, at, gradient = TRUE)
+  r <- ctJuliaEvaluate(remote, at, gradient = TRUE)
+  ctsem:::.ctJuliaEval("ContinuousTimeSEM.ctsem_set_relinearise!(true)")
+  # The Gaussian update ridges its covariances by 1e-10 and the scalar one
+  # does not, so the two agree to that, not to the last bit.
+  expect_equal(r$value, g$value, tolerance = 1e-9)
+  expect_equal(as.numeric(r$gradient), as.numeric(g$gradient), tolerance = 1e-6)
+  adjoint <- ctJuliaEvaluate(floor, at, gradient = TRUE, gradient_method = "adjoint")
+  forward <- ctJuliaEvaluate(floor, at, gradient = TRUE, gradient_method = "forward")
+  expect_equal(as.numeric(adjoint$gradient), as.numeric(forward$gradient), tolerance = 1e-8)
+  # The reverse pass is shared with the quadrature kinds, whose moments'
+  # Jacobian is written out by hand; a binary item on the same link.
+  b <- d
+  b$y1 <- as.numeric(b$y1 > 0.5)
+  b$y2 <- as.numeric(b$y2 > 0.4)
+  binary <- prep(model(1L), b)
+  at <- stats::rnorm(.ctBackendNpar(binary), 0, 0.3)
+  adjoint <- ctJuliaEvaluate(binary, at, gradient = TRUE, gradient_method = "adjoint")
+  forward <- ctJuliaEvaluate(binary, at, gradient = TRUE, gradient_method = "forward")
+  expect_equal(as.numeric(adjoint$gradient), as.numeric(forward$gradient), tolerance = 1e-8)
+})
+
+# A censored indicator's response scale (RESPONSE): each recorded value is the
+# interval of the latent response its category covers, through one transform
+# G(r) = L + ((1 + r - L)^p - 1)/p shared by every form of the item.
+
+.interval_G <- function(r, L, p) {
+  if (p == 1) return(r)
+  u <- log1p(r - L)
+  L + if (abs(p) < 1e-8) u else expm1(p * u) / p
+}
+
+test_that("ctModel takes RESPONSE for censored indicators only", {
+  build <- function(...) suppressWarnings(suppressMessages(ctModel(type = "ct",
+    n.latent = 1, n.manifest = 2, manifestNames = c("a", "b"), latentNames = "eta",
+    LAMBDA = matrix(1, 2, 1), ...)))
+  expect_error(build(RESPONSE = c(0.5, "p")), "censored indicators")
+  m <- build(manifesttype = c(4L, 0L), censormin = c(0, NA), RESPONSE = c(0.5, "p"))
+  r <- m$pars[m$pars$matrix %in% "RESPONSE", ]
+  expect_equal(sort(r$param[!is.na(r$param)]), "p")
+  expect_equal(r$value[r$row == 1 & r$col == 1], 0.5)
+  # The Gaussian row stays at the defaults, and may not be moved.
+  expect_equal(r$value[r$row == 2], c(0, 1))
+  expect_error(build(manifesttype = c(4L, 0L), censormin = c(0, NA),
+    RESPONSE = matrix(c(0.5, 0.5, "p", "p"), 2)), "censored indicators only")
+  expect_error(build(manifesttype = c(4L, 0L), censormin = c(0, NA),
+    RESPONSE = c(-1, 1)), "cannot be negative")
+  # All defaults is no matrix at all.
+  plain <- build(manifesttype = c(4L, 0L), censormin = c(0, NA), RESPONSE = c(0, 1))
+  expect_false(any(plain$pars$matrix %in% "RESPONSE"))
+  expect_match(paste(utils::capture.output(print(m)), collapse = " "),
+    "a \\(censored, min 0, no max, with RESPONSE\\)")
+})
+
+test_that("an interval's likelihood and moments are exact", {
+  skip_without_julia()
+  ctJuliaSetup()
+  .ctJuliaEval('
+    function _ctsem_test_interval(ηbar, s, y, th)
+      M = ContinuousTimeSEM
+      th = collect(Float64, th)
+      logZ, off, var = M._censored_moments(Float64(ηbar), Float64(s), Float64(y), th)
+      ν = collect(range(ηbar - 12s, ηbar + 12s, length = 40001))
+      dν = ν[2] - ν[1]
+      lw = [-(v - ηbar)^2 / (2s^2) - log(sqrt(2pi) * s) +
+        M._category_loglikelihood(v, Float64(y), th, 4) for v in ν]
+      mx = maximum(lw)
+      w = exp.(lw .- mx)
+      Z = sum(w) * dν
+      m = sum(w .* ν) * dν / Z
+      return [logZ, log(Z) + mx, off, m - ηbar, var, sum(w .* (ν .- m) .^ 2) * dν / Z]
+    end
+    _ctsem_test_interval_loglik(η, y, th) = ContinuousTimeSEM._category_loglikelihood(
+      Float64(η), Float64(y), collect(Float64, th), 4)')
+  L <- 0; U <- 10; sd <- 0.7
+  for (p in c(1, 0.5, 0)) for (h in c(10 / 12, 0)) for (y in c(0, 10 / 6, 5, 10)) {
+    th <- c(L, U, sd, h, p)
+    # The likelihood at a known predictor, against the normal probabilities
+    # computed here from G.
+    for (eta in c(-1, 2.5, 9)) {
+      ref <- if (y <= L) pnorm((.interval_G(L + h, L, p) - eta) / sd, log.p = TRUE) else
+        if (y >= U) pnorm((.interval_G(U - h, L, p) - eta) / sd, lower.tail = FALSE,
+          log.p = TRUE) else if (h > 0) {
+          a <- (.interval_G(y - h, L, p) - eta) / sd
+          b <- (.interval_G(y + h, L, p) - eta) / sd
+          if (a + b > 0) log(pnorm(-a) - pnorm(-b)) else log(pnorm(b) - pnorm(a))
+        } else dnorm(.interval_G(y, L, p), eta, sd, log = TRUE) + (p - 1) * log1p(y - L)
+      expect_equal(.ctJuliaCall("Main._ctsem_test_interval_loglik", eta, y, th), ref,
+        tolerance = 1e-10)
+    }
+    # The closed-form moments against integrating that likelihood over a
+    # Gaussian predictor.
+    r <- .ctJuliaCall("Main._ctsem_test_interval", 2, 1.3, y, th)
+    expect_equal(r[1], r[2], tolerance = 1e-8)
+    expect_equal(r[3], r[4], tolerance = 1e-7)
+    expect_equal(r[5], r[6], tolerance = 1e-6)
+  }
+})
+
+test_that("a response scale is exact in the filter, through the reverse pass and in generation", {
+  skip_without_julia()
+  set.seed(7)
+  rec <- function(z) pmin(pmax(round(z / (10 / 6)) * (10 / 6), 0), 10)
+  d <- do.call(rbind, lapply(1:14, function(i) {
+    eta <- as.numeric(stats::filter(stats::rnorm(8, 0, 0.6), 0.6, method = "recursive"))
+    u <- stats::rnorm(2, 0, 0.6)
+    data.frame(id = i, time = cumsum(stats::rexp(8, 2)), hw = 5 / 6,
+      y1 = rec(1 + u[1] + 1.5 * eta + stats::rnorm(8, 0, 0.5)),
+      y2 = rec(0.5 + u[2] + 1.2 * eta + stats::rnorm(8, 0, 0.5)))
+  }))
+  model <- function(response = NA, tipred = FALSE, varying = TRUE) {
+    m <- suppressWarnings(suppressMessages(ctModel(type = "ct", n.latent = 1,
+      n.manifest = 2, manifestNames = c("y1", "y2"), latentNames = "eta",
+      TIpredNames = if (tipred) "hw", LAMBDA = matrix(c("1", "lam2"), 2),
+      MANIFESTMEANS = matrix(c("mm1", "mm2"), 2),
+      MANIFESTVAR = matrix(c("mv1", "0", "0", "mv2"), 2), CINT = matrix(0),
+      T0MEANS = matrix(0), manifesttype = c(4L, 4L), censormin = c(0, 0),
+      censormax = c(10, 10), RESPONSE = response)))
+    if (tipred) m$pars[grepl("_effect$", names(m$pars))] <- FALSE
+    m$pars$indvarying <- varying & m$pars$matrix %in% "MANIFESTMEANS"
+    m
+  }
+  prep <- function(m, route) suppressWarnings(suppressMessages(ctFit(d, m,
+    backend = "julia", intoverpop = route, fit = FALSE, cores = 1L)))
+  # Half-width 0 and power 1, a free power at its raw zero: the censored item.
+  a <- prep(model(varying = FALSE), "none")
+  b <- prep(model(c(0, "pow"), varying = FALSE), "none")
+  ta <- as.data.frame(a$parameter_table)
+  tb <- as.data.frame(b$parameter_table)
+  na <- ta$param[match(seq_len(.ctBackendNpar(a)), ta$parnumber)]
+  nb <- tb$param[match(seq_len(.ctBackendNpar(b)), tb$parnumber)]
+  set.seed(9)
+  xa <- stats::setNames(stats::rnorm(length(na), 0, 0.3), na)
+  xb <- stats::setNames(ifelse(nb %in% na, xa[nb], 0), nb)
+  va <- ctJuliaEvaluate(a, xa, gradient = TRUE)
+  vb <- ctJuliaEvaluate(b, xb, gradient = TRUE)
+  expect_equal(vb$value, va$value, tolerance = 1e-12)
+  expect_equal(as.numeric(vb$gradient)[match(na, nb)], as.numeric(va$gradient),
+    tolerance = 1e-10)
+  # The half-width from a predictor and the power free: the reverse pass
+  # against forward mode, Laplace and augmented.
+  for (route in c("laplace", "augmented")) {
+    h <- prep(model(matrix(c("hw * 1", "hw * 1", "pow", "pow"), 2), tipred = TRUE), route)
+    at <- stats::rnorm(.ctBackendNpar(h), 0, 0.3)
+    adjoint <- ctJuliaEvaluate(h, at, gradient = TRUE, gradient_method = "adjoint")
+    forward <- ctJuliaEvaluate(h, at, gradient = TRUE, gradient_method = "forward")
+    expect_equal(as.numeric(adjoint$gradient), as.numeric(forward$gradient),
+      tolerance = 1e-8)
+  }
+  # Generation records onto the grid of the half-width, inside the limits.
+  gen <- suppressWarnings(suppressMessages(ctGenerate(model(c(5 / 6, 0.5),
+    varying = FALSE), n = 6, Tpoints = 10, backend = "julia")))
+  y <- unlist(as.data.frame(gen)[c("y1", "y2")])
+  y <- y[!is.na(y)]
+  expect_true(length(y) > 0)
+  expect_true(all(abs(y / (10 / 6) - round(y / (10 / 6))) < 1e-8))
+  expect_true(all(y >= 0 & y <= 10))
+})

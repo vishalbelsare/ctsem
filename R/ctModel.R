@@ -1,11 +1,14 @@
 #' Define a ctsem model
 #' 
 #' This function is used to specify a continuous time structural equation model, 
-#' which can then be fit to data with function \code{\link{ctStanFit}}.
+#' which can then be fit to data with function \code{\link{ctFit}}.
 #' 
-#' @param type character string. If 'omx' (default) configures model for maximum likelihood fitting with ctFit, using OpenMx. 
-#' If 'stanct' or 'standt' configures either continuous ('stanct') or discrete ('standt') time 
-#' model for Bayesian fitting with \code{\link{ctStanFit}}, using Stan.
+#' @param type character string. Use 'ct' (continuous time) or 'dt'
+#' (discrete time) for Stan-based fitting with \code{\link{ctFit}}.
+#' These return a modern ctsem model object whose \code{pars} data frame can
+#' also be edited through the pars-backed \code{matrices} view.
+#' For legacy workflows, 'omx' returns a matrix-list model object that can
+#' be edited directly and then converted via \code{\link{ctModelConvertOMX}}.
 #' 
 #' @param n.manifest Number of manifest indicators per individual at each measurement occasion / time point.  
 #' Manifest variables are included as the first element of the wide data matrix, with all the 1:n.manifest manifest variables 
@@ -20,11 +23,50 @@
 #' @param manifestNames n.manifest length vector of manifest variable names as they appear in the data structure, 
 #' without any _Tx time point suffix that may be present in wide data.  Defaults to Y1, Y2, etc.
 #' 
+#' @param manifesttype n.manifest length vector of manifest variable types. 0 (the
+#' default) is a continuous, Gaussian variable; 1 is binary, coded 0/1; 2 is
+#' ordinal, coded as consecutive integers from 1; 3 is a count, coded as
+#' non-negative integers and modelled as Poisson with a log link, so the latent
+#' process gives the log rate. A count keeps a free \code{MANIFESTVAR}
+#' diagonal, unlike a binary or ordinal variable: for a count that entry is a
+#' log-scale dispersion, making the observation Poisson-lognormal with variance
+#' \eqn{\mu + \mu^2(e^{\sigma^2}-1)} against the Poisson's \eqn{\mu}. Fix it
+#' to zero for the equidispersed Poisson. 4 is censored, a Gaussian variable
+#' observed only
+#' within \code{censormin} and \code{censormax}, with values at a limit
+#' contributing the probability of being there rather than a density.
+#' Non-Gaussian variables are supported by the julia backend only, and binary
+#' additionally by stan.
+#' @param censormin,censormax n.manifest length numeric vectors giving the lower
+#' and upper censoring limits of each \code{manifesttype = 4} variable, and
+#' ignored for the others. Defaults are \code{-Inf} and \code{Inf}; a variable
+#' censored on one side only leaves the other infinite. Unlike thresholds these
+#' are known constants rather than parameters -- a scale's floor and ceiling are
+#' properties of the instrument, and the data cannot inform them.
+#' @param ncategories n.manifest length integer vector, giving the number of
+#' categories of each ordinal manifest variable and ignored for the others.
+#' Required when any \code{manifesttype} is 2, because the model has to know how
+#' many thresholds to estimate before it sees any data -- \code{ctGenerate} needs
+#' it too.
+#' 
 #' @param latentNames n.latent length vector of latent variable names 
 #' (used for naming parameters, defaults to eta1, eta2, etc).
 #' 
 #' @param id character string denoting column name containing subject identification variables. 
 #' id data may be of any form, though will be coerced internally to an integer sequence rising from 1.
+#' May instead be a character vector naming a nested hierarchy, innermost first:
+#' \code{id = c('subject','study')} treats each subject as belonging to one
+#' study. A cell says where its parameter varies with the \code{indvarying}
+#' field (see \code{\link{ctPar}}): \code{TRUE} at every level, \code{FALSE}
+#' at none, or the names of the levels, so \code{'cint||study'} gives an
+#' intercept that varies between studies with subjects exchangeable within a
+#' study, and \code{'cint||subject,study'} (or \code{TRUE}) one that varies at
+#' both. \code{model$pars$indvarying} holds the same values, one per cell, and
+#' can be edited directly, with \code{TRUE} again meaning every level; a
+#' cell's \code{sdscale} applies at every level it varies at. Intercepts
+#' (\code{T0MEANS}, \code{MANIFESTMEANS}, \code{CINT}) left unspecified vary
+#' at every level. Levels above the subject require \code{backend='julia'}
+#' with \code{intoverpop='laplace'}, and the hierarchy must be strictly nested.
 #' @param time character string denoting column name containing timing data. Timing data must be numeric.
 #' 
 #' @param T0VAR lower triangular n.latent*n.latent cholesky matrix of latent process initial variance / covariance. 
@@ -40,14 +82,47 @@
 #' between manifests at each measurement occasion (i.e. measurement error / residual).  
 #' "auto" freely estimates variance parameters, 
 #' and fixes covariances between manifests to 0. "free" frees all values, including covariances.
-#' 
+#'
+#' @param ASYMPTOTES Matrix with one row per binary indicator, in manifest
+#' order, and two columns: the lower and upper asymptotes of its response
+#' probability, which is then lower + (upper - lower) times the logistic of
+#' the linear predictor. \code{NA} means no asymptote on that side, so the
+#' default -- all \code{NA} -- is the two parameter logistic, and the model
+#' has no ASYMPTOTES matrix at all. Name a lower cell to estimate a guessing
+#' probability (the three parameter model), an upper cell for a ceiling below
+#' one, or both (four parameter); a number between 0 and 1 fixes it, and one
+#' name shared across rows estimates one asymptote for those items. A length 2
+#' vector applies to every binary indicator, so \code{c('guess', NA)} is one
+#' guessing parameter for the whole test. Julia backend only.
+#'
+#' @param RESPONSE Matrix with one row per manifest variable and two columns,
+#' the response scale of a censored indicator (manifesttype 4); rows for other
+#' indicators must stay at their defaults. Column 1, \code{halfwidth}: the
+#' half-width of the interval each recorded value stands for -- a value \code{y}
+#' is the event that the latent response lies between the transformed
+#' \code{y - halfwidth} and \code{y + halfwidth}, and a value at
+#' \code{censormin} or \code{censormax} that it lies below or above half a step
+#' in from it. 0, the default, is a value recorded exactly. For a rating scale
+#' it is half the step between categories, so the bottom category of a 7-point
+#' item and a slider's 0 are each what they are; a step that differs by study
+#' is a time independent predictor in the cell. Column 2, \code{power}: the
+#' transform from the recorded scale to the latent response,
+#' \eqn{G(r) = L + ((1 + r - L)^p - 1)/p} with \eqn{L} the censormin (0 where
+#' there is none). 1, the default, is linear; below 1 the latent response
+#' moves less per recorded unit high on the scale, so the recorded value moves
+#' faster there; 0 is the log, whose inverse is the exponential link. One
+#' transform serves every form an item is asked in, so a name shared across
+#' items or studies estimates one curvature from all of them. \code{NA} keeps
+#' a default, and a length 2 vector fills every censored row, so
+#' \code{c(0.5, 'power')} is integer data with one estimated transform. Julia
+#' backend only.
+#'
 #' @param DRIFT n.latent*n.latent DRIFT matrix of continuous auto and cross effects, 
 #' relating the processes over time. 
 #' "auto" freely estimates all parameters.
 #' 
 #' @param CINT n.latent * 1 matrix of latent process intercepts, allowing for non 0 
 #' asymptotic levels of the latent processes. Generally only necessary for additional trends and more complex dynamics.
-#' "auto" fixes all parameters to 0.
 #' 
 #' @param DIFFUSION lower triangular n.latent*n.latent cholesky matrix of diffusion process 
 #' variance and covariance (latent error / dynamic innovation).
@@ -58,9 +133,23 @@
 #' 
 #' @param TIpredNames n.TIpred length vector of time independent predictor variable names,
 #' as they appear in the data structure.  Default names are TI1, TI2, etc.
+#' Or a formula whose terms are such names and smooth terms,
+#' \code{~ s(age, k = 8) + female}: a smooth is a penalised spline of a
+#' person-level covariate, with its smoothness estimated from the data
+#' (\code{backend = 'julia'}). It enters the model as \code{k - 1} predictor
+#' columns, \code{age_lin} (the linear trend) and \code{age_s1}, ..., which
+#' are built from the data when the model is fitted. A cell's \code{tipreds}
+#' field names the covariate (\code{'cint||||age'}) to give it the smooth;
+#' without one, under \code{tipredDefault = TRUE}, a smooth reaches every
+#' free parameter that varies between persons.
 #' 
-#' @param tipredDefault Logical. TRUE sets any parameters with unspecified time independent 
+#' @param tipredDefault Logical. TRUE sets any parameters with unspecified time independent
 #' predictor effects to have effects estimated, FALSE fixes the effect to zero unless individually specified.
+#' A cell's effects count as unspecified only when its \code{tipreds} field is
+#' left out: an empty one (\code{'mypar||||'}) states that the parameter has no
+#' predictor effects, which is the way to exclude a parameter under
+#' \code{tipredDefault = TRUE}. The setting is kept on the returned model as
+#' \code{$tipredDefault}.
 #' 
 #' @param n.TDpred Number of time dependent predictor variables in the dataset.  
 #' 
@@ -68,104 +157,157 @@
 #' as they appear in the data structure, without any _Tx time point suffix that may appear in wide data.  
 #' Default names are TD1, TD2, etc.
 #' 
-#' @param Tpoints For type='omx' only. Number of time points, or measurement occasions, in the data.  This will generally be the maximum 
-#' number of time points for a single individual, but may be one extra if sample relative time intervals are used, 
-#' see \code{\link{ctIntervalise}}. 
-#' 
-#' @param TRAITVAR For type='omx' only. Either NULL, if no trait / unobserved heterogeneity effect, 
-#' or lower triangular n.latent*n.latent cholesky matrix of trait variance / covariance across subjects.
-#' "auto" freely estimates all parameters.
-#' 
-#' @param T0TRAITEFFECT For type='omx' only. Either NULL, if no trait / individual heterogeneity effect, 
-#' or lower triangular n.latent*n.latent cholesky matrix of initial trait variance / covariance.
-#' "auto" freely estimates all parametrers, if the TRAITVAR matrix is specified.
-#' 
-#' @param MANIFESTTRAITVAR For type='omx' only. Either NULL (default) if no trait variance / individual heterogeneity in the level of
-#' the manifest indicators, otherwise a lower triangular n.manifest * n.manifest variance / covariance matrix. 
-#' Set to "auto" to include and free all parameters - but identification problems will arise if \code{TRAITVAR} is 
-#' also set.
-#' 
-#' @param TDPREDMEANS For type='omx' only. (n.TDpred * (Tpoints - 1)) rows * 1 column matrix of time dependent predictor means.
-#' If 'auto', the means are freely estimated.  Otherwise, 
-#' the means for the Tpoints observations of your first time dependent predictor 
-#' are followed by those of TDpred 2, and so on.
-#' 
 #' @param TDPREDEFFECT n.latent*n.TDpred matrix of effects from time dependent predictors to latent processes.
 #' Effects from 1:n.TDpred columns TDpredictors go to 1:n.latent rows of latent processes.
 #' "auto" freely estimates all parameters.
+#' @param TDPREDMEANS Legacy argument for time-dependent predictor means, mainly to
+#' support data generation workflows. Expected dimensions are
+#' (n.TDpred * Tpoints) rows and 1 column. "auto" creates a free-label matrix.
+#' @param TDPREDVAR Legacy argument for time-dependent predictor covariance
+#' structure, mainly to support data generation workflows. Expected dimensions are
+#' (n.TDpred * Tpoints) square. "auto" creates a free-label matrix.
 #' 
-#' @param T0TDPREDCOV For type='omx' only. n.latent rows * (Tpoints * n.TDpred) columns covariance matrix 
-#' between latents at T0 and time dependent predictors.
-#' Default of "auto" restricts covariance to 0, which is consistent with covariance to other time points. 
-#' To freely estimate parameters, specify either 'free', or the desired matrix.
+#' @param Tpoints Number of time points, or measurement occasions, in the data.  This will generally be the maximum 
+#' number of time points for a single individual, but may be one extra if sample relative time intervals are used, 
+#' see \code{\link{ctIntervalise}}. 
 #' 
-#' @param TDPREDVAR For type='omx' only. lower triangular (n.TDpred * Tpoints) rows 
-#' * (n.TDpred * Tpoints) columns variance / covariance
-#' cholesky matrix for time dependent predictors.
-#' "auto" (default) freely estimates all parameters.
-#' 
-#' @param TRAITTDPREDCOV For type='omx' only. n.latent rows * (n.TDpred*Tpoints) columns covariance matrix of 
-#' latent traits and time dependent predictors. Defaults to zeroes, 
-#' assuming predictors are independent of subjects baseline levels. When predictors depend on the subjects,
-#' this should instead be set to 'free' or manually specified.
-#' The Tpoints columns of the first preditor are followed by those of the second and so on.
-#' Covariances with the trait variance of latent process 1 are specified in row 1, process 2 in row 2, etc.
-#' "auto" (default) sets this matrix to zeroes, (if both traits and time dependent predictors exist, otherwise this matrix is set to NULL, and ignored in any case).
-#' 
-#' @param TDTIPREDCOV For type='omx' only. (n.TDpred * Tpoints) rows * n.TIpred columns covariance
-#' matrix between time dependent and time independent predictors.
-#' "auto" (default) freely estimates all parameters.
-#'  
-#' @param TIPREDMEANS For type='omx' only. n.TIpred * 1 matrix of time independent predictor means.
-#' If 'auto', the means are freely estimated.  
-#' 
-#' @param TIPREDEFFECT For type='omx' only. n.latent*n.TIpred effect matrix of time independent predictors on latent processes.
-#' "auto" freely estimates all parameters and generates starting values. TIPREDEFFECT parameters for type='stan' are estimated
-#' by default on all subject level parameters, to restrict this, 
-#' manually edit the model object after creation.
-#' 
-#' @param T0TIPREDEFFECT For type='omx' only.n.latent*n.TIpred effect matrix of time independent 
-#' predictors on latents at T0. "auto" freely estimates all parameters, though note that under the default 
-#' setting of \code{stationary} for ctFit, this matrix is ignored as the effects are determined based on
-#' the overall process parameters.
-#' 
-#' @param TIPREDVAR For type='omx' only.lower triangular n.TIpred * n.TIpred Cholesky decomposed covariance
-#' matrix for all time independent predictors.
-#' "auto" (default) freely estimates all parameters.
-#' 
-#' @param PARS for types 'stanct' and 'standt' only. May be of any structure, only needed to contain extra parameters for certain non-linear models.
-#' 
-#' @param startValues For type='omx' only. A named vector, where the names of each value must match a parameter in the specified model,
-#' and the value sets the starting value for that parameter during optimization.
-#' If not set, random starting values representing relatively stable processes with small effects and 
-#' covariances are generated by ctFit.  
-#' Better starting values may improve model fit speed and the chance of an appropriate model fit. 
-#' 
-#' @examples 
+#' @param PARS for types 'ct' and 'dt' only. May be of any structure, only needed to contain extra parameters for certain non-linear models.
+#' @param silent Suppress all output to console.
+#' @param driftScaled for type 'ct' only: which of "DIFFUSION" and "CINT" to
+#' parameterise by what they accrue over one time unit given the process's
+#' own drift diagonal, rather than by their instantaneous rates. A diffusion
+#' sd \code{s} becomes \code{s * sqrt(2 a / expm1(2 a))}, \code{s^2} the variance
+#' the process gains over one time unit from its own noise (its stationary
+#' variance where the drift is fast, the diffusion variance where it is
+#' slow); an intercept \code{u} becomes \code{u * a / expm1(a)}. The fit and
+#' its likelihood are the default parameterisation's; what changes is that
+#' these parameters no longer have to move with the drift diagonal where
+#' fast mean reversion and more noise look alike, so that uncertainty and
+#' sampling are better behaved there. Only the diffusion's diagonal is
+#' rescaled, so its correlations keep their continuous-time meaning. Each
+#' such parameter moves, name, transform, random effects and predictor
+#' effects with it, to a new cell of \code{PARS}, and its own cell becomes an
+#' expression of that cell and the drift diagonal. Not available with
+#' \code{covmattransform = 'cholesky'}.
+#'
+#' @details A matrix cell is one of four things, and which one is decided by
+#' what its text looks like:
+#'
+#' \itemize{
+#'   \item a \strong{number}, which fixes the cell;
+#'   \item a \strong{parameter name}, which frees it -- the same name in two
+#'     cells is one parameter, which is how an equality constraint is written;
+#'   \item a name \strong{with fields}, adding the transform, the levels of
+#'     \code{id} at which the parameter varies, the prior scaling of that
+#'     variation, and the time-independent predictors acting on the parameter;
+#'   \item an \strong{expression}, computed from the latent states, the time
+#'     dependent predictors and the \code{PARS} cells.
+#' }
+#'
+#' Fields may be given in either of two interchangeable ways: in a fixed order
+#' separated by \code{|} (\code{'mm||TRUE|0.5'}), or by name
+#' (\code{'mm, indvarying=TRUE, sdscale=0.5'}). With nested ids,
+#' \code{indvarying} may name levels instead, as in \code{'mm||study'} or
+#' \code{'mm, indvarying=c(subject, study)'}. A cell containing \code{|} is
+#' read the ordered way; otherwise a cell with a field of the form
+#' \code{name=value} is read the named way, and an unrecognised field name is
+#' an error rather than part of a parameter name.
+#' \code{\link{ctPar}} writes the ordered form from the same named
+#' arguments, for when a specification is built programmatically.
+#'
+#' Every name in an expression has to be declared: a latent state, a time
+#' dependent predictor, or a parameter given a \code{PARS} cell. Writing a
+#' fresh name inside an expression does not declare it, so
+#' \code{DRIFT = matrix('-exp(dr)*eta1')} needs
+#' \code{PARS = c('dr')} alongside it. To transform one parameter and nothing
+#' else the second field is shorter --
+#' \code{DRIFT = matrix('dr|-exp(param)')}. A cell may also read a time
+#' independent predictor by name, the subject's value of it -- a study's known
+#' response rounding as \code{MANIFESTVAR = 'rsd + mvar'}, say, with
+#' \code{PARS = c('mvar|1e-10 + 5 * log1p_exp(2 * param)')}; this is julia
+#' only. A subject's missing value of such a predictor is imputed or sampled
+#' as any other (\code{optimcontrol$tipredMissing}), and the cell reads that
+#' value.
+#' Population summaries evaluate the cell at a predictor value of zero, where
+#' they report predictor effects. A
+#' cell cannot reference a manifest variable or the time interval at all.
+#' Predictor \emph{effects} on a parameter are set with the \code{tipreds}
+#' field.
+#'
+#' Not every simple name in a cell is a parameter name. A latent state or
+#' time dependent predictor name is a \emph{reference} to it, and any number
+#' of matrices may reference the same one. A name declared in a \code{PARS}
+#' cell is likewise a reference wherever else it is written: the
+#' \code{PARS} cell holds the parameter and carries its transform, and the
+#' cells that name it are rewritten into references to that cell.
+#'
+#' Repeating a name that is \emph{not} one of those is the equality
+#' constraint, and those cells are one parameter -- one value, one random
+#' effect -- so one transform has to apply to all of them. Cells that would
+#' transform it differently are refused, and that includes cells whose
+#' \emph{defaults} differ: the \code{DRIFT} diagonal is bounded negative
+#' while its off-diagonals are not, so \code{DRIFT = matrix('a', 2, 2)} is
+#' not a way to tie the whole matrix to one parameter. To share a parameter
+#' across cells that would otherwise transform it differently, declare it in
+#' one \code{PARS} cell (\code{PARS = c('a')}) and then apply whatever
+#' transform each cell needs in an expression there --
+#' \code{DRIFT[1,1] = '-exp(a)'} and \code{DIFFUSION[1,1] = 'exp(a)'}. One
+#' parameter then serves cells that need different transforms, and each
+#' transform is stated where it applies. Giving the \code{PARS} cell the
+#' transform instead (\code{PARS = c('a|-exp(param)')}) and writing just the
+#' name in each cell works when one transform suits them all. Two \code{PARS}
+#' cells sharing one label are co-holders rather than references, so they must
+#' agree on the transform as any other repeated name must.
+#'
+#' A predictor effect belongs to the parameter rather than to the cell, so
+#' cells that are one parameter must state the same \code{tipreds}. Naming an
+#' effect (\code{'mypar||||age=shared'}) constrains every parameter given that
+#' name under that predictor to one coefficient, which costs one fewer free
+#' parameter and makes the two parameters' reported effects identical. Because
+#' one coefficient displaces each parameter's raw value equally, it means the
+#' same thing on the natural scale only where the transforms agree, so sharing
+#' a name between parameters transformed differently is refused. A name is
+#' scoped per predictor: the same label under two predictors is two
+#' coefficients. A number instead of a name (\code{'mypar||||age=0.5'}) fixes
+#' the effect: no coefficient is estimated, and each subject's raw value of the
+#' parameter is displaced by 0.5 times their \code{age}, before the transform.
+#' Fixed effects are fitted by \code{backend = 'julia'} and used by
+#' \code{ctGenerate}; the stan backend refuses them.
+#'
+#' A cell that is exactly a latent state or time dependent predictor name is
+#' taken as a reference to it rather than as a parameter of that name, and
+#' warns, because the two readings are different models. \code{'state[1]'}
+#' and \code{'tdpreds[rowi, 1]'} say the same thing without the ambiguity. In
+#' \code{PARS} it is an error rather than a warning: a bare name there reads
+#' as the declaration of a parameter, so write the reference as part of an
+#' expression (\code{'log1p(exp(eta1))'}) if a state-dependent \code{PARS}
+#' cell is what is wanted.
+#'
+#' @seealso \code{\link{ctPar}} for the fields a matrix cell can carry,
+#' \code{\link{ctFit}} for fitting the result.
+#'
+#' @examples
 #'  ### Frequentist example:
 #'  ### impulse and level change time dependent predictor 
 #'  ### example from Driver, Oud, Voelkle (2015)
 #'  data('ctExample2')
-#'  tdpredmodel <- ctModel(n.manifest = 2, n.latent = 3, n.TDpred = 1, 
+#'  tdpredmodel <- ctModel(type='omx', n.manifest = 2, n.latent = 3, n.TDpred = 1, 
 #'  Tpoints = 8, manifestNames = c('LeisureTime', 'Happiness'), 
 #'  TDpredNames = 'MoneyInt', 
 #'  latentNames = c('LeisureTime', 'Happiness', 'MoneyIntLatent'),
-#'  LAMBDA = matrix(c(1,0, 0,1, 0,0), ncol = 3), TRAITVAR = "auto")
+#'  LAMBDA = matrix(c(1,0, 0,1, 0,0), ncol = 3))
 #'
-#'  tdpredmodel$TRAITVAR[3, ] <- 0
-#'  tdpredmodel$TRAITVAR[, 3] <- 0
 #'  tdpredmodel$DIFFUSION[, 3] <- 0
 #'  tdpredmodel$DIFFUSION[3, ] <- 0
 #'  tdpredmodel$T0VAR[3, ] <- 0
 #'  tdpredmodel$T0VAR[, 3] <- 0
 #'  tdpredmodel$CINT[3] <- 0
 #'  tdpredmodel$T0MEANS[3] <- 0
-#'  tdpredmodel$TDPREDEFFECT[3, ] <- 1
 #'  tdpredmodel$DRIFT[3, ] <- 0
 #'  
 #'  
 #' ###Bayesian example:
-#' model<-ctModel(type='stanct',
+#' model<-ctModel(type='ct',
 #' n.latent=2, latentNames=c('eta1','eta2'),
 #' n.manifest=2, manifestNames=c('Y1','Y2'),
 #' n.TDpred=1, TDpredNames='TD1', 
@@ -173,54 +315,81 @@
 #' LAMBDA=diag(2))
 #'
 #' 
+#' @return For \code{type = 'ct'} or \code{'dt'}, a model of class
+#'   \code{ctStanModel}: \code{$pars} holds one row per matrix cell, and
+#'   \code{$matrices} the same cells as matrices, editable either way. For
+#'   \code{type = 'omx'}, a list of matrices of class \code{ctsemInit}, for
+#'   \code{\link{ctGenerate}} or \code{\link{ctModelConvertOMX}}.
 #' @export
 
-ctModel<-function(LAMBDA, type='omx',n.manifest = 'auto', n.latent='auto', Tpoints=NULL, 
-  manifestNames='auto', latentNames='auto', id='id',time='time',
-  T0VAR="auto", T0MEANS="auto", MANIFESTMEANS="auto", MANIFESTVAR="auto", 
-  DRIFT="auto", CINT="auto", DIFFUSION="auto",
-  n.TDpred='auto', TDpredNames='auto', 
+ctModel<-function(LAMBDA, type='ct',n.manifest = 'auto', n.latent='auto', Tpoints=NULL, 
+  manifestNames='auto', manifesttype=rep(0,nrow(LAMBDA)), ncategories=NULL,
+  censormin=NULL, censormax=NULL,
+  latentNames='auto', id='id',time='time', silent=FALSE,
+  T0VAR="auto", T0MEANS="auto", MANIFESTMEANS="auto", MANIFESTVAR="diag",
+  ASYMPTOTES=NA, RESPONSE=NA,
+  DRIFT="auto", CINT=0, DIFFUSION="auto",
+  n.TDpred='auto', TDpredNames='auto', TDPREDEFFECT="auto", TDPREDMEANS="auto", TDPREDVAR="auto",
   n.TIpred='auto', TIpredNames='auto', tipredDefault=TRUE,
-  TRAITVAR=NULL, T0TRAITEFFECT=NULL,
-  MANIFESTTRAITVAR=NULL,
-  TDPREDMEANS="auto", TDPREDEFFECT="auto", 
-  T0TDPREDCOV="auto", TDPREDVAR="auto",  
-  TRAITTDPREDCOV="auto", TDTIPREDCOV='auto',
-  TIPREDMEANS="auto", TIPREDEFFECT="auto", 
-  T0TIPREDEFFECT="auto", TIPREDVAR="auto", 
-  PARS=NULL,
-  startValues=NULL){
+  PARS=NULL, driftScaled=character()){
+  
+  # keep track of whether Tpoints was explicitly provided by user
+  TpointsProvided <- !is.null(Tpoints) && !is.na(Tpoints[1])
+
+  # A covariance given as ctCov(): the cells for the construction this model
+  # will use -- 'z' for ct and dt models, a Cholesky factor for the old omx
+  # form -- with the covariance remembered so the cells can be rewritten if
+  # covmattransform changes (.ctCovRefresh()).
+  covinput <- list()
+  for(nm in .ctCovSystemMatrices){
+    value <- get(nm)
+    if(inherits(value, 'ctCov')){
+      cov <- attr(value, 'covariance')
+      tf <- if(type %in% 'omx') 'cholesky' else 'z'
+      cells <- .ctCovCells(cov, tf, what = nm)
+      covinput[[nm]] <- list(cov = cov, cells = unname(cells), covmattransform = tf)
+      assign(nm, matrix(as.numeric(cells), nrow(cells), ncol(cells)))
+    }
+  }
   
   #get dimensions
   if(is.null(n.manifest) || is.null(n.latent) || all(n.manifest %in% 'auto') || all(n.latent %in% 'auto')){
     if(is.matrix(LAMBDA)){
-      message('System dimensions inferred from LAMBDA')
+      if(!silent) message('System dimensions inferred from LAMBDA')
       n.manifest <- nrow(LAMBDA)
       n.latent <- ncol(LAMBDA)
     } else {
       if(!all(manifestNames %in% 'auto') && !all(latentNames %in% 'auto')){
-        message('System dimensions inferred from manifestNames and latentNames')
+        if(!silent) message('System dimensions inferred from manifestNames and latentNames')
         n.manifest <- length(manifestNames)
         n.latent <- length(latentNames)
       } else stop('LAMBDA must either a matrix, n.manifest and n.latent must be specified, or manifestNames and latentNames must be specified!')
     }
   }
-
+  
   if(is.null(n.TDpred) || all(n.TDpred %in% 'auto')){
     if(is.matrix(TDPREDEFFECT)){
-      message('n.TDpred inferred from TDPREDEFFECT')
+      if(!silent) message('n.TDpred inferred from TDPREDEFFECT')
       n.TDpred <- ncol(TDPREDEFFECT)
-    } else {
-      if(!all(TDpredNames %in% 'auto')){
-        message('n.TDpred inferred  inferred from TDpredNames')
-        n.TDpred <- length(TDpredNames)
-      } else n.TDpred <- 0
-    } 
+    } else if(!all(TDpredNames %in% 'auto')){
+      if(!silent) message('n.TDpred inferred  inferred from TDpredNames')
+      n.TDpred <- length(TDpredNames)
+    } else n.TDpred <- 0
   }
   
+  # Smooth terms (R/ctTIpredSmooth.R): their basis columns are the predictors.
+  TIsmooths <- NULL
+  if(inherits(TIpredNames, 'formula')){
+    if(type %in% 'omx') stop("Smooth TI predictor terms need type = 'ct' or 'dt'.",
+      call. = FALSE)
+    parsed <- .ctTIpredParseFormula(TIpredNames)
+    TIpredNames <- parsed$names
+    TIsmooths <- parsed$smooths
+  }
+
   if(is.null(n.TIpred) || all(n.TIpred %in% 'auto')){
     if(!all(TIpredNames %in% 'auto')){
-      message('n.TIpred inferred  inferred from TIpredNames')
+      if(!silent) message('n.TIpred inferred  inferred from TIpredNames')
       n.TIpred <- length(TIpredNames)
     } else n.TIpred <- 0
   } 
@@ -228,7 +397,7 @@ ctModel<-function(LAMBDA, type='omx',n.manifest = 'auto', n.latent='auto', Tpoin
   
   
   #####FUNCTIONS
-
+  
   
   checkSymmetry<-function(x){  #this checks the symmetry of matrix x, if not symmetric it stops and outputs an error
     if(isSymmetric(x)==F){
@@ -236,19 +405,22 @@ ctModel<-function(LAMBDA, type='omx',n.manifest = 'auto', n.latent='auto', Tpoin
     }
   }
   
-
-  if(type=='omx') message('Type "omx" is still supported but requires ctsemOMX package installation. "stanct" or "standt" are recommended types.')
-  if(type=='omx' & is.null(Tpoints)) stop('Type "omx" requires Tpoints specified!')
   
-
+  if(!type %in% c('ct','dt','stanct','standt','omx')) stop('type must be either ct, dt, or omx!')
+  
+  msg_matrix <- function(mat, label = "") {
+    lines <- capture.output(print(mat))
+    header <- if (nzchar(label)) paste0(label, ":\n") else ""
+    message(header, paste(lines, collapse = "\n"))
+  }
+  
   
   
   ###### RUN SEQUENCE
   
-  if(type!='omx' && is.null(Tpoints)) Tpoints<-3
-  if(type=='omx' && is.null(Tpoints)) stop('Tpoints must be specified for type="omx"')
-  if(!(type %in% c('stanct','standt','omx'))) stop('type must be either omx, stanct, or standt
-    !')
+  if(is.null(Tpoints)) Tpoints<-3
+  # if(type=='omx' && is.null(Tpoints)) stop('Tpoints must be specified for type="omx"')
+
   
   #names
   if(all(manifestNames=='auto')) manifestNames=paste0('Y',1:n.manifest)
@@ -261,36 +433,37 @@ ctModel<-function(LAMBDA, type='omx',n.manifest = 'auto', n.latent='auto', Tpoin
   
   if(n.TDpred > 0){
     if(all(TDpredNames=='auto')) TDpredNames=paste0('TD',1:n.TDpred)
-  if(length(TDpredNames) != n.TDpred) stop(paste0(
-    "Length of TDpredNames (",length(TDpredNames),") does not equal n.TDpred(",n.TDpred,")!")) 
+    if(length(TDpredNames) != n.TDpred) stop(paste0(
+      "Length of TDpredNames (",length(TDpredNames),") does not equal n.TDpred(",n.TDpred,")!")) 
   } else {
     TDpredNames=c()
   }
   
   if(n.TIpred > 0){
-  if(all(TIpredNames=='auto')) TIpredNames=paste0('TI',1:n.TIpred)
-  if(length(TIpredNames) != n.TIpred) stop(paste0(
-    "Length of TIpredNames (",length(TIpredNames),') does not equal n.TIpred(',n.TIpred,')!')) 
+    if(all(TIpredNames=='auto')) TIpredNames=paste0('TI',1:n.TIpred)
+    if(length(TIpredNames) != n.TIpred) stop(paste0(
+      "Length of TIpredNames (",length(TIpredNames),') does not equal n.TIpred(',n.TIpred,')!')) 
   } else {
     TIpredNames=c()
   }
-
-  mats <- ctStanMatricesList()
+  
+  mats <- .ctMatricesList()
   for(m in names(mats$base)){
-    if(!is.null(get(m))){ #if the matrix is specified
-      val <- get(m)
-      if(!all(val %in% 'auto') && !is.matrix(val)){ #and not auto or a matrix
+    if(!exists(m, inherits = FALSE)) next
+    if(!is.null(get(m, inherits = FALSE))){ #if the matrix is specified
+      val <- get(m, inherits = FALSE)
+      if(!all(val %in% c('auto','diag')) && !is.matrix(val)){ #and not auto or a matrix
         if(m %in% 'PARS') mat <- matrix(PARS,ncol=1) else {
-        mat<-ctLabel(TDpredNames=TDpredNames,TIpredNames=TIpredNames, #set the basic structure
-          manifestNames=manifestNames,latentNames=latentNames,matrixname=m,n.latent=n.latent,
-          n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
+          mat<-ctLabel(TDpredNames=TDpredNames,TIpredNames=TIpredNames, #set the basic structure
+            manifestNames=manifestNames,latentNames=latentNames,matrixname=m,n.latent=n.latent,
+            n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
         }
         counter <- 0 #then start filling with vector
         if(length(val) != length(mat) && length(val) !=1) stop(paste0(m,' needs ',length(mat),' values for ',nrow(mat),' * ',ncol(mat),' matrix, but has ',length(val)))
         if(length(val)==1 && length(mat) > 1) {
-          message(m,' specified via single value -- filling ',nrow(mat),' * ',ncol(mat),' matrix:')
+          if(!silent) message(m,' specified via single value -- filling ',nrow(mat),' * ',ncol(mat),' matrix:')
           val <- rep(val,length(mat))
-        } else message(paste0(m,' vector spec input rowwise into ',nrow(mat),' * ',ncol(mat),' matrix:'))
+        } else if(!silent) message(paste0(m,' vector spec input rowwise into ',nrow(mat),' * ',ncol(mat),' matrix:'))
         for(ri in 1:nrow(mat)){
           for(ci in 1:ncol(mat)){
             counter <- counter + 1
@@ -298,14 +471,36 @@ ctModel<-function(LAMBDA, type='omx',n.manifest = 'auto', n.latent='auto', Tpoin
           }
         }
         
-        print(mat,right=TRUE)
+        if(!silent) msg_matrix(mat)#,right=TRUE)
         assign(m, mat)
       }
     }
   }
   
   
-#matrices
+  # An NA cell says nothing, and the four `[1]=="auto"` tests below compare
+  # against it, so a single NA in the first cell of one of those matrices came
+  # out as "missing value where TRUE/FALSE needed" -- naming neither the matrix
+  # nor the cell. Refuse it here, where both are still known. A cell is a
+  # number, a name, or an expression; there is no reading under which NA is one
+  # of those, and `0` is what an absent cell usually means.
+  for(m in c('T0MEANS','T0VAR','LAMBDA','DRIFT','DIFFUSION','MANIFESTVAR',
+    'MANIFESTMEANS','CINT','TDPREDEFFECT','PARS')){
+    mat <- get0(m, ifnotfound=NULL)
+    if(is.null(mat) || (length(mat)==1 && !is.na(mat[1]) && mat[1]=='auto')) next
+    # The text "NA" -- what a character conversion or a text field gives --
+    # is the same non-cell, and was read as neither a number nor a name.
+    bad <- which(is.na(mat) | trimws(as.character(mat)) %in% 'NA')
+    if(length(bad)){
+      idx <- if(is.matrix(mat)) paste0('[',(bad[1]-1) %% nrow(mat) + 1,',',
+        (bad[1]-1) %/% nrow(mat) + 1,']') else paste0('[',bad[1],']')
+      stop(m,idx,' is NA. A matrix cell must be a number, a parameter name, or ',
+        'an expression -- write 0 for a cell that is fixed to zero.',
+        call.=FALSE)
+    }
+  }
+
+  #matrices
   if(T0MEANS[1]=="auto") T0MEANS<-ctLabel(TDpredNames=TDpredNames,TIpredNames=TIpredNames,
     manifestNames=manifestNames,latentNames=latentNames,matrixname="T0MEANS",n.latent=n.latent,
     n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
@@ -324,11 +519,11 @@ ctModel<-function(LAMBDA, type='omx',n.manifest = 'auto', n.latent='auto', Tpoin
   
   if(nrow(T0VAR)!=n.latent | ncol(T0VAR)!=n.latent) stop("Dimensions of T0VAR matrix are not n.latent * n.latent")
   dimnames(T0VAR)=list(latentNames,latentNames)
-
   
   
   
-
+  
+  
   if(MANIFESTMEANS[1]=="auto") MANIFESTMEANS<- ctLabel(TDpredNames=TDpredNames,TIpredNames=TIpredNames,
     manifestNames=manifestNames,latentNames=latentNames,matrixname="MANIFESTMEANS",n.latent=n.latent,
     n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
@@ -338,219 +533,89 @@ ctModel<-function(LAMBDA, type='omx',n.manifest = 'auto', n.latent='auto', Tpoin
   
   
   
-  if(!is.na(MANIFESTVAR[1])){
-  if(all(MANIFESTVAR=="auto")) {
-    MANIFESTVAR<-ctLabel(TDpredNames=TDpredNames,TIpredNames=TIpredNames,
-    manifestNames=manifestNames,latentNames=latentNames,matrixname="MANIFESTVAR",n.latent=n.latent,
-    n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
-   MANIFESTVAR[row(MANIFESTVAR) != col(MANIFESTVAR)] <- 0
-  }
+
+    if(all(MANIFESTVAR %in% "auto")) {
+      MANIFESTVAR<-ctLabel(TDpredNames=TDpredNames,TIpredNames=TIpredNames,
+        manifestNames=manifestNames,latentNames=latentNames,matrixname="MANIFESTVAR",n.latent=n.latent,
+        n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
+    }
+    
+    if(all(MANIFESTVAR %in% 'diag')){
+      MANIFESTVAR<-ctLabel(TDpredNames=TDpredNames,TIpredNames=TIpredNames,
+        manifestNames=manifestNames,latentNames=latentNames,matrixname="MANIFESTVAR",n.latent=n.latent,
+        n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
+      MANIFESTVAR[row(MANIFESTVAR) != col(MANIFESTVAR)] <- 0
+    }
+    
+    if(nrow(MANIFESTVAR)!=n.manifest | ncol(MANIFESTVAR)!=n.manifest) stop("Dimensions of MANIFESTVAR matrix are not n.manifest * n.manifest")
   
-  if(all(MANIFESTVAR=="free")){
-    MANIFESTVAR<-ctLabel(TDpredNames=TDpredNames,TIpredNames=TIpredNames,
-      manifestNames=manifestNames,latentNames=latentNames,matrixname="MANIFESTVAR",n.latent=n.latent,
-      n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
-  }
-  
-  if(nrow(MANIFESTVAR)!=n.manifest | ncol(MANIFESTVAR)!=n.manifest) stop("Dimensions of MANIFESTVAR matrix are not n.manifest * n.manifest")
-  }
   dimnames(MANIFESTVAR)=list(manifestNames,manifestNames)
   
   
   
-  
-  if(DRIFT[1]=="auto") DRIFT<-ctLabel(TDpredNames=TDpredNames,TIpredNames=TIpredNames,manifestNames=manifestNames,latentNames=latentNames,matrixname="DRIFT",n.latent=n.latent,
+  if(all(DRIFT %in% "auto")) DRIFT<-ctLabel(TDpredNames=TDpredNames,TIpredNames=TIpredNames,manifestNames=manifestNames,latentNames=latentNames,matrixname="DRIFT",n.latent=n.latent,
     n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
+  if(all(DRIFT %in% 'diag')) {
+    DRIFT<-ctLabel(TDpredNames=TDpredNames,TIpredNames=TIpredNames,manifestNames=manifestNames,latentNames=latentNames,matrixname="DRIFT",n.latent=n.latent,
+      n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
+    DRIFT[row(DRIFT) != col(DRIFT)] <- 0
+  }
   if(nrow(DRIFT)!= n.latent | ncol(DRIFT)!= n.latent) stop("Dimensions of DRIFT matrix are not n.latent * n.latent")
   dimnames(DRIFT)=list(latentNames,latentNames)
   
   
   
   
-  if(CINT[1]=="auto") CINT<-matrix(0,nrow=n.latent,ncol=1)
+  if(CINT[1]=="auto") CINT<-ctLabel(TDpredNames=TDpredNames,TIpredNames=TIpredNames,manifestNames=manifestNames,latentNames=latentNames,matrixname="CINT",n.latent=n.latent,
+    n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
   if(ncol(CINT)!=1 | nrow(CINT)!=n.latent) stop("Dimensions of CINT are not n.latent * 1")
   rownames(CINT)=latentNames
   
   
   
   
-  if(DIFFUSION[1]=="auto") DIFFUSION<-ctLabel(TDpredNames=TDpredNames,TIpredNames=TIpredNames,manifestNames=manifestNames,latentNames=latentNames,matrixname="DIFFUSION",n.latent=n.latent,
+  if(all(DIFFUSION %in% "auto")) DIFFUSION<-ctLabel(TDpredNames=TDpredNames,TIpredNames=TIpredNames,manifestNames=manifestNames,latentNames=latentNames,matrixname="DIFFUSION",n.latent=n.latent,
     n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
+  if(all(DIFFUSION %in% 'diag')) {
+    DIFFUSION<-ctLabel(TDpredNames=TDpredNames,TIpredNames=TIpredNames,manifestNames=manifestNames,latentNames=latentNames,matrixname="DIFFUSION",n.latent=n.latent,
+      n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
+    DIFFUSION[row(DIFFUSION) != col(DIFFUSION)] <- 0
+  }
   if(nrow(DIFFUSION)!=n.latent | ncol(DIFFUSION) != n.latent) stop("Dimensions of DIFFUSION are not n.latent * n.latent")
   dimnames(DIFFUSION)=list(latentNames,latentNames)
   
-  
-  
-  
-  
-  if(!is.null(TRAITVAR)){
-    
-    if(all(TRAITVAR=="auto")) TRAITVAR<-ctLabel(TDpredNames=TDpredNames,
-    TIpredNames=TIpredNames,manifestNames=manifestNames,latentNames=latentNames,matrixname="TRAITVAR",
-    n.latent=n.latent,n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
-    
-  if(nrow(TRAITVAR)+ncol(TRAITVAR)!=n.latent*2) stop ("
-    Dimensions of TRAITVAR are not n.latent * n.latent")
-  dimnames(TRAITVAR)=list(latentNames,latentNames)
-  
-  if(is.null(T0TRAITEFFECT) || all(T0TRAITEFFECT == 'auto')) T0TRAITEFFECT<-
-    ctLabel(TDpredNames=TDpredNames,TIpredNames=TIpredNames,manifestNames=manifestNames,
-      latentNames=latentNames,matrixname="T0TRAITEFFECT",n.latent=n.latent,
-    n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
-  dimnames(T0TRAITEFFECT)=list(latentNames,latentNames)
-  
-  if(!is.null(T0TRAITEFFECT) && nrow(T0TRAITEFFECT)+ncol(T0TRAITEFFECT)!=n.latent*2) stop ("Dimensions of TRAITVAR are not n.latent * n.latent")
-  
-}
-  
-  
-  
-  
-  
-
-  
-  
-  if(!is.null(MANIFESTTRAITVAR)){
-    
-    if(MANIFESTTRAITVAR[1]=="auto") MANIFESTTRAITVAR<-ctLabel(TDpredNames=TDpredNames,TIpredNames=TIpredNames,manifestNames=manifestNames,latentNames=latentNames,matrixname="MANIFESTTRAITVAR",n.latent=n.latent,
-    n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
-    
-  if(nrow(MANIFESTTRAITVAR)+ncol(MANIFESTTRAITVAR)!=n.manifest*2) stop ("Dimensions of MANIFESTTRAITVAR are not n.manifest * n.manifest")
-#   if(is.null(MANIFESTTRAITVAR)) MANIFESTTRAITVAR <- matrix(0,nrow=n.manifest,ncol=n.manifest)
-  dimnames(MANIFESTTRAITVAR)=list(manifestNames,manifestNames)
-  }
-  
-  
-  
-  
-  #effect matrix of time dependent predictors (with time independent effect strength)
   if(n.TDpred > 0){
-  if(all(TDPREDEFFECT=="auto"))  {
-    
-    TDPREDEFFECT<-ctLabel(TDpredNames=TDpredNames,
-    TIpredNames=TIpredNames,manifestNames=manifestNames,latentNames=latentNames,matrixname="TDPREDEFFECT",n.latent=n.latent,
-    n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
-    
-  if(nrow(TDPREDEFFECT) != n.latent | ncol(TDPREDEFFECT) != n.TDpred) stop("Dimensions of TDPREDEFFECT are not n.latent * n.TDpred")
-  }
+    if(all(TDPREDEFFECT=="auto"))  {
+      TDPREDEFFECT<-ctLabel(TDpredNames=TDpredNames,
+        TIpredNames=TIpredNames,manifestNames=manifestNames,latentNames=latentNames,matrixname="TDPREDEFFECT",n.latent=n.latent,
+        n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
+    }
+    if(nrow(TDPREDEFFECT) != n.latent || ncol(TDPREDEFFECT) != n.TDpred) stop("Dimensions of TDPREDEFFECT are not n.latent * n.TDpred")
     dimnames(TDPREDEFFECT)=list(latentNames,TDpredNames)
-  
-  # means of TD predictors
-  if(all(TDPREDMEANS=="auto") & n.TDpred > 0) TDPREDMEANS <- ctLabel(TDpredNames=TDpredNames,
-    TIpredNames=TIpredNames,manifestNames=manifestNames,latentNames=latentNames,matrixname="TDPREDMEANS",n.latent=n.latent,
-    n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
-
-  if(nrow(TDPREDMEANS) != n.TDpred*(Tpoints) | ncol(TDPREDMEANS) != 1) stop(
-    "Dimensions of TDPREDMEANS are not (n.TDpred*Tpoints) rows * 1 column")
+    
+    if(all(TDPREDMEANS=="auto")) TDPREDMEANS <- ctLabel(TDpredNames=TDpredNames,
+      TIpredNames=TIpredNames,manifestNames=manifestNames,latentNames=latentNames,matrixname="TDPREDMEANS",n.latent=n.latent,
+      n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
+    if(all(TDPREDVAR=="auto")) TDPREDVAR <- ctLabel(TDpredNames=TDpredNames,
+      TIpredNames=TIpredNames,manifestNames=manifestNames,latentNames=latentNames,matrixname="TDPREDVAR",n.latent=n.latent,
+      n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
+    
+    if(nrow(TDPREDMEANS) != n.TDpred * Tpoints || ncol(TDPREDMEANS) != 1) stop("Dimensions of TDPREDMEANS are not (n.TDpred*Tpoints) * 1")
+    if(nrow(TDPREDVAR) != n.TDpred * Tpoints || ncol(TDPREDVAR) != n.TDpred * Tpoints) stop("Dimensions of TDPREDVAR are not (n.TDpred*Tpoints) * (n.TDpred*Tpoints)")
+  } else {
+    TDPREDEFFECT <- NULL
+    TDPREDMEANS <- NULL
+    TDPREDVAR <- NULL
   }
   
-  if(n.TDpred==0) {
-    TDPREDEFFECT<-NULL
-    TDPREDMEANS<-NULL
-  }
   
-  
-  # means of TI predictors
-  if(TIPREDMEANS[1]=="auto" & n.TIpred >0) TIPREDMEANS <- ctLabel(TDpredNames=TDpredNames,
-    TIpredNames=TIpredNames,manifestNames=manifestNames,latentNames=latentNames,matrixname="TIPREDMEANS",n.latent=n.latent,
-    n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
-  
-  if(n.TIpred==0) TIPREDMEANS<-NULL
-  
-  if(n.TIpred > 0) if(nrow(TIPREDMEANS) != n.TIpred | ncol(TIPREDMEANS) != 1) stop(
-    "Dimensions of TIPREDMEANS are not n.TIpred * 1")
-  
-  
-  
-  
-  if(all(T0TDPREDCOV=="free") && n.TDpred>0) T0TDPREDCOV<-ctLabel(TDpredNames=TDpredNames,TIpredNames=TIpredNames,manifestNames=manifestNames,latentNames=latentNames,matrixname="T0TDPREDCOV",n.latent=n.latent,
-    n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
-  if(all(T0TDPREDCOV=="auto") && n.TDpred>0) T0TDPREDCOV<-matrix(0,n.latent,n.TDpred*(Tpoints))
-  if(n.TDpred==0) T0TDPREDCOV<-NULL
-
-  if(n.TDpred>0) if(nrow(T0TDPREDCOV) != n.latent | ncol(T0TDPREDCOV) != n.TDpred*(Tpoints))  stop(
-    "Dimensions of T0TDPREDCOV are not n.latent * (n.TDpred*Tpoints)")
-  
-  
-  
-  
-  
-  if(all(TIPREDEFFECT=="auto") && n.TIpred>0) TIPREDEFFECT<-ctLabel(TDpredNames=TDpredNames,TIpredNames=TIpredNames,manifestNames=manifestNames,latentNames=latentNames,matrixname="TIPREDEFFECT",n.latent=n.latent,
-    n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
-  if(n.TIpred==0) TIPREDEFFECT<-NULL
-    if(n.TIpred>0) if(nrow(TIPREDEFFECT) != n.latent | ncol(TIPREDEFFECT) != n.TIpred) stop("Dimensions of TIPREDEFFECT are not n.latent * n.TIpred")
-
-  
-  
-  
-
-  if(all(T0TIPREDEFFECT=="auto") && n.TIpred > 0) T0TIPREDEFFECT <- ctLabel(TDpredNames=TDpredNames,
-    TIpredNames=TIpredNames,manifestNames=manifestNames,latentNames=latentNames,matrixname="T0TIPREDEFFECT",n.latent=n.latent,
-    n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
-  
-  if(n.TIpred==0) T0TIPREDEFFECT <- NULL
-  
-  if(n.TIpred>0) if(nrow(T0TIPREDEFFECT) != n.latent | ncol(T0TIPREDEFFECT) != n.TIpred) stop("Dimensions of T0TIPREDEFFECT are not n.latent * n.TIpred")
-
-  
-  
-  
-  
-  if(all(TIPREDVAR=="auto") && n.TIpred > 0)  TIPREDVAR <- ctLabel(TDpredNames=TDpredNames,
-    TIpredNames=TIpredNames,manifestNames=manifestNames,latentNames=latentNames,matrixname="TIPREDVAR",n.latent=n.latent,
-      n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints) 
-  
-  if(n.TIpred==0) TIPREDVAR <- NULL
-  
-    if(n.TIpred > 0) if(nrow(TIPREDVAR) != n.TIpred | ncol(TIPREDVAR) != n.TIpred) stop(
-      "Dimensions of TIPREDVAR are not n.TIpred * n.TIpred")
-  
-  
-  
-  
-  
-  if(all(TDPREDVAR=="auto") && n.TDpred >0)  TDPREDVAR <- ctLabel(TDpredNames=TDpredNames,
-    TIpredNames=TIpredNames,manifestNames=manifestNames,latentNames=latentNames,matrixname="TDPREDVAR",n.latent=n.latent,
-    n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)  
-  
-  if(n.TDpred==0) TDPREDVAR<-NULL
-  
-  if(n.TDpred > 0) if(nrow(TDPREDVAR) != n.TDpred*(Tpoints) | ncol(TDPREDVAR) != n.TDpred*(Tpoints)) stop(
-    "Dimensions of TDPREDVAR are not (n.TDpred*Tpoints) * (n.TDpred*Tpoints)")
-  
-  
-  
-  
-  if(all(TDTIPREDCOV=="free") & n.TDpred > 0 & n.TIpred > 0)  TDTIPREDCOV <- ctLabel(TDpredNames=TDpredNames,
-    TIpredNames=TIpredNames,manifestNames=manifestNames,latentNames=latentNames,matrixname="TDTIPREDCOV",n.latent=n.latent,
-    n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)
-  if(all(TDTIPREDCOV=="auto") & n.TDpred > 0 & n.TIpred > 0)  TDTIPREDCOV <- matrix(0,(n.TDpred*(Tpoints)), n.TIpred)
-  if(n.TDpred == 0 | n.TIpred == 0) TDTIPREDCOV<-NULL
-  if(n.TDpred > 0 & n.TIpred > 0) if(nrow(TDTIPREDCOV) != (n.TDpred*(Tpoints)) | ncol(TDTIPREDCOV) != n.TIpred) stop(
-    "Dimensions of TDTIPREDCOV are not (n.TDpred*Tpoints) * n.TIpred")
-  
-  
-  
-  
-  
-  # TDpredictor and trait covariances
-  if(n.TDpred > 0) { #then set covariance matrix for heterogeneity and predictors    
-    if(all(TRAITTDPREDCOV == "free")) TRAITTDPREDCOV<-ctLabel(TDpredNames=TDpredNames,
-      TIpredNames=TIpredNames,manifestNames=manifestNames,latentNames=latentNames,matrixname="TRAITTDPREDCOV",n.latent=n.latent,
-      n.manifest=n.manifest,n.TDpred=n.TDpred,n.TIpred=n.TIpred,Tpoints=Tpoints)  
-    if(all(TRAITTDPREDCOV == "auto")) TRAITTDPREDCOV<-matrix(0,n.latent, (n.TDpred*(Tpoints)))
-    if(nrow(TRAITTDPREDCOV) != n.latent | ncol(TRAITTDPREDCOV) != n.TDpred*(Tpoints)) stop(
-      "Dimensions of TRAITTDPREDCOV are not n.latent * (n.TDpred*Tpoints)")
-  }
- 
-  if(n.TDpred==0)  TRAITTDPREDCOV<-NULL #if no predictors, assume no covariance between heterogeneity and predictors
   
   
   
   ###model checks
   
   #lower triangular check
-  for(tempmatname in c('T0VAR','MANIFESTVAR','TRAITVAR','MANIFESTTRAITVAR','TDPREDVAR','DIFFUSION','TIPREDVAR')){
+  for(tempmatname in c('T0VAR','MANIFESTVAR','DIFFUSION')){
     assign('tempmat',get(tempmatname))
     if(is.null(tempmat)) next
     if(all(suppressWarnings(as.numeric(tempmat[upper.tri(tempmat)])) %in% 0)) next
@@ -560,47 +625,69 @@ ctModel<-function(LAMBDA, type='omx',n.manifest = 'auto', n.latent='auto', Tpoin
   # mvaroffdiag=MANIFESTVAR[!diag(1,nrow(MANIFESTVAR))]
   # if(nrow(MANIFESTVAR) > 1 && !all(mvaroffdiag %in% 0)) stop('MANIFESTVAR should be diagonal!')
   
- 
+  
   if(any(dim(LAMBDA)!=c(n.manifest,n.latent))) stop("Incorrect LAMBDA structure specified - check number or rows and columns")
   dimnames(LAMBDA)=list(manifestNames,latentNames)
   
   sapply(c(manifestNames,latentNames,TDpredNames,TIpredNames, time,id),function(x){
-  if(grepl('\\W',x)) stop(paste0(x,' contains symbols, variable names must be alphanumerics only please!'))
+    if(grepl('\\W',x)) stop(paste0(x,' contains symbols, variable names must be alphanumerics only please!'))
   })
   
   for(names in c('manifestNames','TIpredNames','TDpredNames','latentNames')){
     if(any(duplicated(get(names)))) stop(paste0('Duplicate names in ',names))
   }
   
-  
-  
+  # No advice to move the location into CINT. It was needed when the link was
+  # applied to the latent alone, so a manifest intercept could not shift a
+  # probability; it is not now -- `adjoint_binary.jl` forms the linear predictor
+  # as `mu + lambda'x` and passes that to the link, so MANIFESTMEANS does the
+  # job directly for binary, count and censored indicators. The one case where
+  # the advice was true is ordinal, and `.ctThresholdMatrix()` now settles that
+  # by construction rather than by asking the user to.
 
+  if(any(!manifesttype %in% 0:4)) stop('manifesttype must be 0 (continuous), 1 (binary), 2 (ordinal), 3 (count) or 4 (censored)')
+  censorlimits <- .ctCheckCensorLimits(censormin, censormax, manifesttype,
+    manifestNames)
+  censormin <- censorlimits$min
+  censormax <- censorlimits$max
+  THRESHOLDS <- NULL
+  ncategories <- .ctCheckNcategories(ncategories, manifesttype, manifestNames)
+  if(any(manifesttype %in% 2)){
+    # The first threshold is fixed at zero and the location lives in
+    # MANIFESTMEANS -- see `.ctThresholdMatrix()`. Nothing to warn about
+    # afterwards, because the pair can no longer both be free.
+    THRESHOLDS <- .ctThresholdMatrix(ncategories, manifesttype, manifestNames)
+  }
+  ASYMPTOTES <- .ctCheckAsymptoteMatrix(ASYMPTOTES, manifesttype,
+    manifestNames)
+  RESPONSE <- .ctCheckResponseMatrix(RESPONSE, manifesttype, manifestNames)
   
   
-  completemodel<-list(n.manifest,n.latent,n.TDpred,n.TIpred,Tpoints,LAMBDA,
-    manifestNames,latentNames,TDpredNames,TIpredNames,
-    T0VAR,T0MEANS,MANIFESTMEANS,MANIFESTVAR,DRIFT,CINT,DIFFUSION,
-    TRAITVAR,T0TRAITEFFECT,MANIFESTTRAITVAR,
-    TDPREDEFFECT, TDPREDMEANS, T0TDPREDCOV, TRAITTDPREDCOV,
-    TIPREDEFFECT, TIPREDMEANS, T0TIPREDEFFECT,
-    TIPREDVAR, TDPREDVAR,TDTIPREDCOV,  PARS, 
-    startValues,id,time)
-  
-  names(completemodel)<-c("n.manifest","n.latent","n.TDpred","n.TIpred","Tpoints","LAMBDA",
-    "manifestNames","latentNames","TDpredNames","TIpredNames",
-    "T0VAR","T0MEANS","MANIFESTMEANS","MANIFESTVAR","DRIFT","CINT","DIFFUSION",
-    "TRAITVAR",'T0TRAITEFFECT',"MANIFESTTRAITVAR",
-    'TDPREDEFFECT', 'TDPREDMEANS', 'T0TDPREDCOV', 'TRAITTDPREDCOV',
-    'TIPREDEFFECT', 'TIPREDMEANS', 'T0TIPREDEFFECT',
-    'TIPREDVAR', 'TDPREDVAR','TDTIPREDCOV',  'PARS',
-    "startValues","id","time")
-  
-
   
   
-  if(type=='omx') class(completemodel)<-"ctsemInit"
+  #rewrite last 2 pieces of code into a single element:
+  completemodel <- list(`n.manifest`=n.manifest, `n.latent`=n.latent, `n.TDpred`=n.TDpred, `n.TIpred`=n.TIpred, 
+    `Tpoints`=Tpoints, `LAMBDA`=LAMBDA, `manifestNames`=manifestNames, `latentNames`=latentNames, 
+    `TDpredNames`=TDpredNames, `TIpredNames`=TIpredNames, `T0VAR`=T0VAR, `T0MEANS`=T0MEANS, 
+    `MANIFESTMEANS`=MANIFESTMEANS, `MANIFESTVAR`=MANIFESTVAR, `DRIFT`=DRIFT, `CINT`=CINT, 
+    `DIFFUSION`=DIFFUSION, `TDPREDEFFECT`=TDPREDEFFECT, `TDPREDMEANS`=TDPREDMEANS, `TDPREDVAR`=TDPREDVAR, `PARS`=PARS, 
+     `id`=id, `time`=time, `manifesttype`=manifesttype,
+     `censormin`=censormin, `censormax`=censormax,
+     `ncategories`=ncategories,
+     `THRESHOLDS`=THRESHOLDS, `ASYMPTOTES`=ASYMPTOTES, `RESPONSE`=RESPONSE)
+  if(length(TIsmooths)) completemodel$TIsmooths <- TIsmooths
   
-  if(type=='stanct' | type=='standt') completemodel<-ctStanModel(completemodel,type=type,tipredDefault= tipredDefault)
+  
+  
+  
+  if(type %in% c('ct','dt','stanct','standt')) completemodel<-ctModelConvertOMX(completemodel,type=type,tipredDefault= tipredDefault)
+  if(length(driftScaled)) {
+    if(type %in% 'omx') stop("driftScaled needs type = 'ct'.", call. = FALSE)
+    completemodel <- .ctModelDriftScaled(completemodel, driftScaled)
+  }
+  if(type %in% c('omx')) class(completemodel)<-'ctsemInit'
+  if(TpointsProvided) completemodel$Tpoints <- Tpoints
+  if(length(covinput) && !type %in% 'omx') completemodel$covinput <- covinput
   
   return(completemodel)
 }

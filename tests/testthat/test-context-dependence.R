@@ -1,0 +1,521 @@
+library(ctsem)
+library(testthat)
+
+context('contextdependence')
+
+# The expression parser is the whole of the detection logic, so it is tested
+# directly rather than only through a fit: a fit is expensive and would hide
+# which half broke.
+
+test_that('expression indices are extracted in every written form', {
+  expect_equal(ctsem:::.ctExpressionIndices('2*state[3] + state[11]', 'state'), c(3L, 11L))
+  expect_equal(ctsem:::.ctExpressionIndices('a*tdpreds[rowi, 2]', 'tdpreds'), 2L)
+  expect_equal(ctsem:::.ctExpressionIndices('a*ctx.tdpreds[2]', 'tdpreds'), 2L)
+  expect_length(ctsem:::.ctExpressionIndices('plainparam', 'state'), 0)
+})
+
+test_that('a state reference is classified by whether it is a carrier', {
+  nlatent <- 2
+  expect_equal(ctsem:::.ctExpressionDependence('-log1p(exp(param))*state[2]', nlatent), 'state')
+  expect_equal(ctsem:::.ctExpressionDependence('param*state[5]', nlatent), 'carrier')
+  expect_equal(sort(ctsem:::.ctExpressionDependence('state[1]*state[7]', nlatent)),
+    c('carrier', 'state'))
+  expect_equal(ctsem:::.ctExpressionDependence('b*tdpreds[rowi, 1]', nlatent), 'tdpred')
+  expect_length(ctsem:::.ctExpressionDependence('drift11', nlatent), 0)
+  expect_length(ctsem:::.ctExpressionDependence(NA_character_, nlatent), 0)
+})
+
+test_that('dependence propagates through PARS references', {
+  fit <- structure(list(
+    standata = list(nlatent = 2L),
+    setup = list(matsetup = data.frame(
+      parname = c('PARS[1,1] * param', 'log1p(exp(state[1]))', 'd22', 'param*state[9]'),
+      row = c(1L, 1L, 2L, 1L), col = c(1L, 1L, 2L, 1L),
+      matrix = c(3L, 10L, 3L, 7L)))),
+    class = c('ctStanFit', 'ctFit'))
+
+  cells <- ctsem:::.ctFitContextDependentCells(fit)
+  expect_equal(nrow(cells), 3)
+  # DRIFT[1,1] references PARS[1,1], which references state[1]: transitive.
+  expect_true('state' %in% cells$kind[cells$matrix == 'DRIFT' & cells$row == 1])
+  expect_true('carrier' %in% cells$kind[cells$matrix == 'CINT'])
+})
+
+# `.ctContextCellTable()` scans the transform column by handing
+# `ctModelStatesAndPARS()` a shim whose `param` holds the transform text, so
+# every PARS cell without a transform reaches the PARS-expansion loop as "".
+# An empty label matched every row and collected every PARS cell into one
+# `parmatch`, and the vectorised `PARS[row,col]` replacement that followed
+# warned once per candidate row -- around fifty times per ctGenerate call on a
+# model with two PARS cells. A blank is not a parameter name.
+test_that('a blank PARS label is not treated as a parameter name', {
+  # The condition is a PARS cell with *no transform*, which is what arrives at
+  # the expansion loop as "". State-dependent PARS cells are the way to get
+  # one, and they have to be expressions: a PARS cell that is a bare latent
+  # name is refused (R/ctModelSpecCheck.R), because there a bare name reads as
+  # a declaration. `state[2]` would not do either -- it takes the simple-state
+  # path and so acquires a transform, which is exactly what this test needs
+  # absent.
+  model <- suppressMessages(ctModel(type = 'ct', n.latent = 2, n.manifest = 2,
+    manifestNames = c('Y1', 'Y2'), latentNames = c('D', 'A'), LAMBDA = diag(2),
+    CINT = matrix(0, 2, 1), MANIFESTMEANS = matrix(0, 2, 1),
+    MANIFESTVAR = diag(.2, 2), T0MEANS = matrix(0, 2, 1), T0VAR = diag(1, 2),
+    Tpoints = 8, PARS = matrix(c('log1p(exp(A))', 'log1p(exp(D))'), 2, 1),
+    DRIFT = matrix(c('-0.5 * (1 + 0.2 * PARS[1,1]) + 0.01 * PARS[2,1]', 0.1,
+      0, -0.3), 2, 2),
+    DIFFUSION = matrix(c(.3, 0, 0, .4), 2, 2)))
+
+  # The blank labels this test is about are still there to be mishandled.
+  parstf <- model$pars$transform[model$pars$matrix %in% 'PARS']
+  expect_true(any(is.na(parstf)))
+
+  expect_silent(cells <- ctsem:::.ctContextCellTable(model))
+  expect_true(ctsem:::ctModelIsNonlinear(model))
+
+  # And the rewrite a real label drives is untouched: `dr11` still resolves to
+  # the PARS cell that holds it.
+  named <- suppressMessages(ctModel(type = 'ct', n.latent = 2, n.manifest = 2,
+    manifestNames = c('Y1', 'Y2'), latentNames = c('D', 'A'), LAMBDA = diag(2),
+    CINT = matrix(0, 2, 1), MANIFESTMEANS = matrix(0, 2, 1),
+    MANIFESTVAR = diag(.2, 2), T0MEANS = matrix(0, 2, 1), T0VAR = diag(1, 2),
+    Tpoints = 8, PARS = c('dr11|-log1p_exp(param)'),
+    DRIFT = matrix(c('dr11 * (1 + 0.2 * A)', 'd21', 0, 'd22'), 2, 2),
+    DIFFUSION = matrix(c('df1', 0, 0, 'df2'), 2, 2)))
+  rewritten <- ctsem:::ctModelStatesAndPARS(named$pars,
+    statenames = named$latentNames, tdprednames = named$TDpredNames)
+  drift11 <- rewritten$param[rewritten$matrix == 'DRIFT' &
+      rewritten$row == 1 & rewritten$col == 1]
+  expect_equal(drift11, 'PARS[1,1] * (1 + 0.2 * state[2])')
+})
+
+# This is the regression that protects the augmented approach. A cell that
+# references a carrier state IS the individually varying parameter, and the
+# subject's last row is the fully informed estimate of it -- not an arbitrary
+# evaluation point. Nothing should warn about it, and nobody should later
+# "fix" it into being treated like dynamic state dependence.
+test_that('carrier state dependence is not a reporting problem', {
+  fit <- structure(list(
+    standata = list(nlatent = 2L),
+    setup = list(matsetup = data.frame(
+      parname = c('param*state[9]', 'd22'), row = c(1L, 2L), col = c(1L, 2L),
+      matrix = c(7L, 3L)))),
+    class = c('ctStanFit', 'ctFit'))
+
+  expect_equal(nrow(ctsem:::.ctFitContextDependentCells(fit)), 1)
+  expect_equal(nrow(ctsem:::.ctFitConditionalCells(fit)), 0)
+  expect_null(ctsem:::.ctContextNote(ctsem:::.ctFitConditionalCells(fit), 'anywhere'))
+})
+
+test_that('a linear model reports nothing at all', {
+  fit <- structure(list(
+    standata = list(nlatent = 2L),
+    setup = list(matsetup = data.frame(parname = c('d11', 'd22'), row = 1:2, col = 1:2,
+      matrix = c(3L, 3L)))),
+    class = c('ctStanFit', 'ctFit'))
+  expect_equal(nrow(ctsem:::.ctFitContextDependentCells(fit)), 0)
+})
+
+test_that('detection works from an unfitted model, in both spec syntaxes', {
+  nonlinear <- suppressMessages(ctModel(type = 'ct', n.latent = 2, n.manifest = 1,
+    manifestNames = 'Y1', latentNames = c('eta1', 'eta2'),
+    LAMBDA = matrix(c(1, 0), 1, 2),
+    DRIFT = matrix(c('-2*log1p(exp(-2*eta2))', 0, 0, -.00001), 2, 2),
+    DIFFUSION = matrix(c('diff', 0, 0, 0), 2, 2)))
+  cells <- ctsem:::.ctFitContextDependentCells(nonlinear)
+  expect_equal(cells$kind, 'state')
+  expect_equal(cells$matrix, 'DRIFT')
+  expect_true(ctModelIsNonlinear(nonlinear))
+
+  # TD predictor dependence is the same problem and must be caught the same way.
+  # `dr11` gets its PARS cell because a name inside an expression is not
+  # declared by being written there. Without it this model built and `dr11`
+  # was not a parameter at all.
+  tddependent <- suppressMessages(ctModel(type = 'ct', n.latent = 1, n.manifest = 1,
+    n.TDpred = 1, manifestNames = 'Y1', latentNames = 'eta1', TDpredNames = 'TD1',
+    LAMBDA = matrix(1, 1, 1), PARS = matrix('dr11', 1, 1),
+    DRIFT = matrix('-log1p(exp(dr11)) * (1+TD1)', 1, 1),
+    DIFFUSION = matrix('diff', 1, 1)))
+  expect_equal(ctsem:::.ctFitContextDependentCells(tddependent)$kind, 'tdpred')
+  expect_true(ctModelIsNonlinear(tddependent))
+
+  linear <- suppressMessages(ctModel(type = 'ct', n.latent = 2, n.manifest = 2,
+    LAMBDA = diag(2)))
+  expect_false(ctModelIsNonlinear(linear))
+})
+
+test_that('the shared note names the matrices and the evaluation point', {
+  cells <- data.frame(matrix = c('DRIFT', 'PARS'), row = 1L, col = 1L,
+    kind = 'state', stringsAsFactors = FALSE)
+  note <- ctsem:::.ctContextNote(cells, 'the T0MEANS state', 'Use state= for another.')
+  expect_match(note, 'DRIFT')
+  expect_match(note, 'the T0MEANS state')
+  expect_match(note, 'Use state= for another')
+})
+
+test_that('cells mixing a carrier and a dynamic reference are detected', {
+  mixed <- structure(list(
+    standata = list(nlatent = 2L),
+    setup = list(matsetup = data.frame(parname = c('state[9]*state[1]', 'd22'),
+      row = c(1L, 2L), col = c(1L, 2L), matrix = c(3L, 3L)))),
+    class = c('ctStanFit', 'ctFit'))
+  expect_equal(nrow(ctsem:::.ctContextConflatedCells(mixed)), 1)
+
+  carrier <- structure(list(
+    standata = list(nlatent = 2L),
+    setup = list(matsetup = data.frame(parname = 'param*state[9]', row = 1L, col = 1L,
+      matrix = 7L))),
+    class = c('ctStanFit', 'ctFit'))
+  expect_equal(nrow(ctsem:::.ctContextConflatedCells(carrier)), 0)
+})
+
+test_that('the message fires for dynamic and TD dependence and not otherwise', {
+  mk <- function(parname, matrix) structure(list(
+    standata = list(nlatent = 2L),
+    setup = list(matsetup = data.frame(parname = parname, row = 1L, col = 1L,
+      matrix = matrix))),
+    class = c('ctStanFit', 'ctFit'))
+
+  expect_message(ctsem:::.ctContextMessage(mk('log1p(exp(state[1]))', 3L),
+    ctsem:::.ctContextPopLabel), 'latent state')
+  expect_message(ctsem:::.ctContextMessage(mk('b*tdpreds[rowi, 1]', 3L),
+    ctsem:::.ctContextPopLabel), 'time dependent predictor')
+  expect_silent(ctsem:::.ctContextMessage(mk('param*state[9]', 7L),
+    ctsem:::.ctContextPopLabel))
+  expect_silent(ctsem:::.ctContextMessage(mk('d11', 3L), ctsem:::.ctContextPopLabel))
+})
+
+test_that('the remedy names the julia backend only for a julia fit', {
+  cells <- mk <- structure(list(
+    standata = list(nlatent = 2L),
+    setup = list(matsetup = data.frame(parname = 'log1p(exp(state[1]))', row = 1L,
+      col = 1L, matrix = 3L))),
+    class = c('ctStanFit', 'ctFit'))
+  expect_match(ctsem:::.ctContextRemedy(mk), "backend='julia'")
+  class(mk) <- c('ctJuliaFit', 'ctFit')
+  expect_match(ctsem:::.ctContextRemedy(mk), 'state=')
+})
+
+# The bundled fit is linear, but its individually varying CINT parameters are
+# carried as latent states -- so its DRIFT/CINT expressions do contain
+# `state[k]`. A detector that looked only for that string would warn about
+# every ordinary random-effects model in the package.
+test_that('a linear random-effects fit is not reported as nonlinear', {
+  skip_if_not(exists('ctstantestfit'))
+  cells <- ctsem:::.ctFitContextDependentCells(ctstantestfit)
+  expect_true(all(cells$kind == 'carrier'))
+  expect_false(ctModelIsNonlinear(ctstantestfit))
+  expect_equal(nrow(ctsem:::.ctFitConditionalCells(ctstantestfit)), 0)
+  expect_null(summary(ctstantestfit, priorcheck = FALSE)$parmatNote)
+})
+
+# Previously a hard stop(), which meant ctDiscretePars(standardise=TRUE) aborted
+# on ctsem's own bundled example fit -- a linear model -- whenever a posterior
+# draw happened to be non-stationary. For a model whose DRIFT depends on the
+# state it aborts far more often, and blames the model rather than the point the
+# model was linearised at.
+test_that('a non-stationary standardisation returns NaN rather than aborting', {
+  pars <- list(
+    DRIFT = array(c(.5, 0, 0, .5), dim = c(1, 2, 2)),
+    DIFFUSIONcov = array(diag(2), dim = c(1, 2, 2)),
+    asymDIFFUSIONcov = array(c(-1, 0, 0, -1), dim = c(1, 2, 2)))
+  expect_message(
+    out <- ctsem:::ctDiscreteParsDrift(pars, times = 1, impulseType = 'unit',
+      standardise = TRUE, quiet = FALSE),
+    'no stationary variance')
+  expect_true(all(is.nan(out)))
+})
+
+test_that('ctDiscretePars refuses state= for a stan fit, with a reason', {
+  skip_if_not(exists('ctstantestfit'))
+  expect_error(ctDiscretePars(ctstantestfit, times = 1, state = 'mean'),
+    "backend='julia'")
+})
+
+# ctExtract() forwarded state= to the engine on julia and swallowed it through
+# `...` on stan, so the same call returned matrices at two different points and
+# neither said which. This is the stan half; the julia half is in
+# test-nonlinear-reporting-julia.R, where a state dependent fit exists.
+test_that('ctExtract refuses state= for a stan fit and names the point it used', {
+  skip_if_not(exists('ctstantestfit'))
+  expect_error(ctExtract(ctstantestfit, state = 'mean'), "backend='julia'")
+  expect_error(ctExtract(ctstantestfit, state = c(0, 0)), "backend='julia'")
+
+  # The default is not refused, and it is labelled in the words every other
+  # reporting function uses for that point.
+  e <- suppressWarnings(suppressMessages(ctExtract(ctstantestfit)))
+  expect_identical(attr(e, 'evaluatedAt'), ctsem:::.ctContextPopLabel)
+  expect_identical(attr(suppressWarnings(suppressMessages(
+    ctExtract(ctstantestfit, state = 'T0MEANS'))), 'evaluatedAt'),
+    ctsem:::.ctContextPopLabel)
+
+  # It records; it must not message, because summary() and ctSummaryMatrices()
+  # call it and say the sentence once themselves.
+  expect_no_message(suppressWarnings(ctExtract(ctstantestfit)))
+})
+
+# Phase portrait, on the linear side where no engine is needed and the answers
+# are all in closed form.
+test_that('the phase portrait field and fixed point agree with each other', {
+  skip_if_not(exists('ctstantestfit'))
+  portrait <- ctPhasePortrait(ctstantestfit, gridsize = 7, plot = FALSE)
+  expect_true(all(is.finite(portrait$field$dx)))
+  expect_true(all(is.finite(portrait$field$dy)))
+
+  # The marked fixed point must be where the drawn field actually vanishes --
+  # not merely near it. Reading asymCINT from the summary does not satisfy
+  # this, because the summary collapses each matrix over draws separately.
+  field <- ctsem:::.ctFieldFunction(ctstantestfit)
+  point <- as.numeric(unlist(portrait$fixedpoint))
+  expect_lt(max(abs(field(point))), 1e-8)
+
+  # A linear model's nullclines are straight, so each is a single piece.
+  expect_equal(length(unique(portrait$nullclines$piece)), 2)
+})
+
+test_that('the phase portrait refuses a nonlinear stan fit', {
+  skip_if_not(exists('ctstantestfit'))
+  fit <- ctstantestfit
+  setup <- fit$setup$matsetup
+  cell <- setup$matrix == 3 & setup$row == 1 & setup$col == 1
+  fit$setup$matsetup$parname[cell] <- 'log1p(exp(state[1]))'
+  expect_true(ctModelIsNonlinear(fit))
+  expect_error(ctPhasePortrait(fit, gridsize = 3), "backend='julia'")
+})
+
+test_that('the phase portrait validates its latents argument', {
+  skip_if_not(exists('ctstantestfit'))
+  expect_error(ctPhasePortrait(ctstantestfit, latents = 1), 'exactly two')
+  expect_error(ctPhasePortrait(ctstantestfit, latents = c('nope', 'eta2')),
+    'exactly two')
+})
+
+
+# Every interpretation of "a one unit change in process c" is dtDRIFT %*% C for
+# a different companion matrix C. These are pure linear algebra and need no
+# fit, which is the point: the whole family can be pinned in a couple of
+# seconds rather than by refitting models.
+test_that('each companion matrix is what it claims to be', {
+  drift <- matrix(c(-.4, .15, .05, -.3), 2, 2)
+  diffusion <- matrix(c(1, 1.6, 1.6, 16), 2, 2)   # innovation sds 1 and 4
+  stationary <- matrix(solve(kronecker(diag(2), drift) + kronecker(drift, diag(2)),
+    -as.vector(diffusion)), 2, 2)
+  companion <- function(type) ctsem:::.ctCompanionMatrix(type, diffusion,
+    stationary, 2)
+
+  # unit: nothing else moves. .ctCompanionMatrix() takes a resolved name, so
+  # the old spellings are .ctCompanionType()'s business and not tested here.
+  expect_equal(companion('unit'), diag(2))
+  # 'observed': the conditional expectation under the STATE covariance.
+  expect_equal(companion('observed'),
+    stationary %*% diag(1 / diag(stationary)))
+  # shock: the conditional expectation under the INNOVATION covariance.
+  expect_equal(companion('shock'), diffusion %*% diag(1 / diag(diffusion)))
+  # These are different questions and must give different answers whenever the
+  # state and innovation correlations differ.
+  expect_false(isTRUE(all.equal(companion('observed'), companion('shock'))))
+
+  # Every one has a unit diagonal -- "process c moves by one unit" -- and is
+  # asymmetric, because E[x_2|x_1=1] and E[x_1|x_2=1] are different numbers
+  # unless the variances match. A correlation matrix is symmetric and so can
+  # never be any of these.
+  for (type in c('observed', 'shock')) {
+    expect_equal(diag(companion(type)), c(1, 1))
+    expect_false(isTRUE(all.equal(companion(type), t(companion(type)))))
+  }
+
+  # orthogonal: the Cholesky factor, so the implied shock covariance recovers
+  # the diffusion correlation.
+  orthogonal <- companion('orthogonal')
+  scale <- diag(diag(chol(diffusion))^2)
+  expect_equal(cov2cor(orthogonal %*% scale %*% t(orthogonal)),
+    cov2cor(diffusion), tolerance = 1e-8)
+
+  expect_error(ctsem:::.ctCompanionMatrix('nonsense', diffusion, stationary, 2))
+})
+
+test_that('the historical logical argument still selects the right two', {
+  expect_equal(ctsem:::.ctCompanionType(FALSE), 'unit')
+  expect_equal(ctsem:::.ctCompanionType(TRUE), 'observed')
+  expect_equal(ctsem:::.ctCompanionType('shock'), 'shock')
+  # And the pre-4.0.0 names, which a saved object and a deprecated
+  # observational= both still arrive with.
+  expect_equal(ctsem:::.ctCompanionType('experimental'), 'unit')
+  expect_equal(ctsem:::.ctCompanionType('observational'), 'observed')
+})
+
+test_that('observational= is accepted, deprecated, and refused alongside impulseType', {
+  utils::data('ctstantestfit', package = 'ctsem', envir = environment())
+  expect_warning(out <- suppressMessages(ctDiscretePars(ctstantestfit,
+    times = c(0, 1), nsamples = 3, observational = TRUE)),
+    "impulseType='observed'")
+  expect_equal(attributes(out)$impulseType, 'observed')
+  expect_error(ctDiscretePars(ctstantestfit, times = 1, observational = TRUE,
+    impulseType = 'shock'), 'only one of')
+
+  # ctNetwork shares the argument and therefore shares the deprecation.
+  m <- ctModel(type = 'ct', n.latent = 2, n.manifest = 2,
+    manifestNames = c('y1', 'y2'), latentNames = c('a', 'b'), LAMBDA = diag(2),
+    DRIFT = matrix(c(-1, 0, .5, -2), 2, 2, byrow = TRUE),
+    DIFFUSION = matrix(c(1, 0, .3, 1), 2, 2, byrow = TRUE))
+  expect_warning(net <- ctNetwork(m, dt = 1, quiet = TRUE, observational = TRUE),
+    "impulseType='observed'")
+  expect_equal(attributes(net)$impulseType, 'observed')
+})
+
+test_that('ctDiscreteParsDrift applies the companion matrix it was asked for', {
+  drift <- matrix(c(-.4, .15, .05, -.3), 2, 2)
+  diffusion <- matrix(c(1, 1.6, 1.6, 16), 2, 2)
+  stationary <- matrix(solve(kronecker(diag(2), drift) + kronecker(drift, diag(2)),
+    -as.vector(diffusion)), 2, 2)
+  pars <- list(DRIFT = array(drift, dim = c(1, 2, 2)),
+    DIFFUSIONcov = array(diffusion, dim = c(1, 2, 2)),
+    asymDIFFUSIONcov = array(stationary, dim = c(1, 2, 2)))
+  scales <- diag(sqrt(diag(stationary)))
+  transition <- as.matrix(Matrix::expm(drift * 1.5))
+
+  for (type in ctsem:::.ctCompanionTypes) {
+    got <- ctsem:::ctDiscreteParsDrift(pars, times = 1.5, impulseType = type,
+      standardise = FALSE, quiet = TRUE)
+    expect_equal(got[1, 1, 1, , ],
+      transition %*% ctsem:::.ctCompanionMatrix(type, diffusion, stationary, 2),
+      ignore_attr = TRUE)
+  }
+
+  # Standardising composes on top: S^-1 (dtA C) S. For 'observed' that is
+  # the standardised simple regression, S^-1 dtA S R.
+  std <- ctsem:::ctDiscreteParsDrift(pars, times = 1.5, impulseType = 'observed',
+    standardise = TRUE, quiet = TRUE)
+  expect_equal(std[1, 1, 1, , ],
+    solve(scales) %*% transition %*% scales %*% cov2cor(stationary),
+    ignore_attr = TRUE)
+})
+
+test_that('a process with no diffusion gets no companions rather than NaN', {
+  pars <- list(DRIFT = array(matrix(c(-.4, .1, 0, -.3), 2, 2), dim = c(1, 2, 2)),
+    DIFFUSIONcov = array(matrix(c(1, 0, 0, 0), 2, 2), dim = c(1, 2, 2)),
+    asymDIFFUSIONcov = array(matrix(c(1, .5, .5, 4), 2, 2), dim = c(1, 2, 2)))
+  out <- ctsem:::ctDiscreteParsDrift(pars, times = 1, impulseType = 'shock',
+    standardise = FALSE, quiet = TRUE)
+  expect_true(all(is.finite(out)))
+})
+
+# impulseType='observed' + standardise is the model implied cross-correlation
+# Cor(x_r(t+u), x_c(t)) -- the counterpart to what ctACF computes from data.
+# Verified against a simulated series separately; pinned here algebraically so
+# it runs in milliseconds.
+test_that('observed impulses and standardise give the cross-correlation', {
+  drift <- matrix(c(-.4, .15, .05, -.3), 2, 2)
+  diffusion <- matrix(c(1, 1.6, 1.6, 16), 2, 2)
+  stationary <- matrix(solve(kronecker(diag(2), drift) + kronecker(drift, diag(2)),
+    -as.vector(diffusion)), 2, 2)
+  pars <- list(DRIFT = array(drift, dim = c(1, 2, 2)),
+    DIFFUSIONcov = array(diffusion, dim = c(1, 2, 2)),
+    asymDIFFUSIONcov = array(stationary, dim = c(1, 2, 2)))
+
+  for (lag in c(0, 1.5, 4)) {
+    got <- ctsem:::ctDiscreteParsDrift(pars, times = lag, impulseType = 'observed',
+      standardise = TRUE, quiet = TRUE)[1, 1, 1, , ]
+    # Cor(x_r(t+u), x_c(t)) = [dtA %*% Sigma]_rc / (sd_r sd_c)
+    sdv <- sqrt(diag(stationary))
+    expected <- (as.matrix(Matrix::expm(drift * lag)) %*% stationary) /
+      outer(sdv, sdv)
+    expect_equal(got, expected, ignore_attr = TRUE)
+  }
+
+  # At lag zero that is just the latent correlation matrix.
+  at0 <- ctsem:::ctDiscreteParsDrift(pars, times = 0, impulseType = 'observed',
+    standardise = TRUE, quiet = TRUE)[1, 1, 1, , ]
+  expect_equal(at0, cov2cor(stationary), ignore_attr = TRUE)
+})
+# ctDiscretePars(standardise=) ------------------------------------------------
+#
+# standardise=TRUE is the default from 4.0.0, so what it divides by is now
+# load bearing for anyone who calls the function at all. The continuous time
+# algebra is pinned above; this is the discrete time counterpart, which uses a
+# different stationary variance (X = A X A' + Q rather than the continuous
+# Lyapunov solution) and would be silently wrong if the same solve were used
+# for both.
+test_that('a discrete time model standardises by the discrete stationary variance', {
+  A <- matrix(c(.6, .15, .1, .4), 2, 2)
+  Q <- matrix(c(1, .3, .3, 4), 2, 2)
+  # vec(A X A') = (A kron A) vec(X), so X = (I - A kron A)^-1 vec(Q).
+  stationary <- matrix(solve(diag(4) - kronecker(A, A), as.vector(Q)), 2, 2)
+  expect_equal(stationary, A %*% stationary %*% t(A) + Q)
+
+  pars <- list(DRIFT = array(A, dim = c(1, 2, 2)),
+    DIFFUSIONcov = array(Q, dim = c(1, 2, 2)),
+    asymDIFFUSIONcov = array(stationary, dim = c(1, 2, 2)))
+  scales <- diag(sqrt(diag(stationary)))
+
+  for (step in c(0, 1, 3)) {
+    powered <- diag(2)
+    for (i in seq_len(step)) powered <- powered %*% A
+    got <- ctsem:::ctDiscreteParsDrift(pars, times = step, impulseType = 'unit',
+      standardise = TRUE, discreteInput = TRUE, quiet = TRUE)[1, 1, 1, , ]
+    expect_equal(got, solve(scales) %*% powered %*% scales, ignore_attr = TRUE)
+  }
+
+  # And 'observed' + standardise is the cross-correlation function here too,
+  # equal to the latent correlation matrix at lag zero.
+  at0 <- ctsem:::ctDiscreteParsDrift(pars, times = 0, impulseType = 'observed',
+    standardise = TRUE, discreteInput = TRUE, quiet = TRUE)[1, 1, 1, , ]
+  expect_equal(at0, stats::cov2cor(stationary), ignore_attr = TRUE)
+  at2 <- ctsem:::ctDiscreteParsDrift(pars, times = 2, impulseType = 'observed',
+    standardise = TRUE, discreteInput = TRUE, quiet = TRUE)[1, 1, 1, , ]
+  sdv <- sqrt(diag(stationary))
+  expect_equal(at2, (A %*% A %*% stationary) / outer(sdv, sdv), ignore_attr = TRUE)
+})
+
+test_that('the scale and the impulse are recorded, and the title states them', {
+  utils::data('ctstantestfit', package = 'ctsem', envir = environment())
+  # Same draws either way, so the two are comparable element by element.
+  set.seed(1)
+  std <- suppressMessages(ctDiscretePars(ctstantestfit, times = c(0, 1),
+    nsamples = 5, standardise = TRUE))
+  set.seed(1)
+  raw <- suppressMessages(ctDiscretePars(ctstantestfit, times = c(0, 1),
+    nsamples = 5))
+
+  expect_true(attributes(std)$standardise)
+  # Unstandardised is still the default, so the plain call is the raw one.
+  expect_false(attributes(raw)$standardise)
+  expect_equal(attributes(raw)$impulseType, 'unit')
+
+  # A zero interval is the identity on either scale: S^-1 I S = I.
+  expect_equal(unname(drop(std[1, 1, 1, , ])), unname(drop(raw[1, 1, 1, , ])),
+    tolerance = 1e-10)
+  # And at a nonzero interval the default is not the raw transition, so the
+  # argument is actually reaching the computation.
+  expect_false(isTRUE(all.equal(std[, , 2, , ], raw[, , 2, , ])))
+
+  # The scale in the title, the impulse in the subtitle.
+  titled <- ctDiscreteParsPlot(std, indices = 'AR')
+  expect_match(titled$labels$subtitle, 'impulse of 1 SD to one process')
+  expect_match(titled$labels$title, 'standardised')
+  untitled <- ctDiscreteParsPlot(raw, indices = 'AR')
+  expect_match(untitled$labels$subtitle, 'impulse of 1 to one process')
+  expect_match(untitled$labels$title, 'unstandardised')
+})
+
+test_that('standardising a context dependent system says the scale is local', {
+  stub <- function(parname, matrix) structure(list(
+    standata = list(nlatent = 2L),
+    setup = list(matsetup = data.frame(parname = c(parname, 'd22'),
+      row = 1:2, col = 1:2, matrix = c(matrix, 3L)))),
+    class = c('ctStanFit', 'ctFit'))
+
+  # DRIFT feeds asymDIFFUSIONcov, so the divisor is a linearisation too.
+  note <- ctsem:::.ctContextStandardiseNote(stub('param*state[1]', 3L), 'the mean')
+  expect_match(note, 'DRIFT')
+  expect_match(note, 'the mean')
+  expect_match(note, 'standardise=FALSE')
+
+  # LAMBDA does not: the latent stationary variance does not depend on it, so
+  # saying the standardisation is compromised there would be false.
+  expect_null(ctsem:::.ctContextStandardiseNote(stub('param*state[1]', 2L)))
+
+  # A carrier reference is an individual difference, not a context.
+  expect_null(ctsem:::.ctContextStandardiseNote(stub('param*state[9]', 3L)))
+  # And a linear model says nothing.
+  expect_null(ctsem:::.ctContextStandardiseNote(stub('d11', 3L)))
+})

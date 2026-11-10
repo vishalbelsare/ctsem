@@ -1,0 +1,543 @@
+# How much of a Laplace fit is the approximation.
+#
+# `intoverpop='laplace'` replaces each subject's integral over its random
+# effects by a single Gaussian fitted at the mode. That is exact when the
+# varying parameters have identity transforms and enter the state mean
+# linearly, and it is not exact otherwise -- most visibly for a random effect on
+# DRIFT, whose transform is `-log1p_exp`.
+#
+# The error matters because it is not constant. It grows with the population
+# scale, so it tilts the profile in that direction and the maximum moves down.
+# On a simulated 40-subject, 24-wave model with a random DRIFT, the Laplace
+# profile peaks at a population sd of 0.67 where a nine-node adaptive
+# Gauss-Hermite rule peaks at 0.89, against a generating 1.00 -- two thirds of
+# the shortfall belongs to the approximation rather than to the data.
+#
+# The same quadrature that measures the error also corrects it, and to first
+# order it does so without refitting: at the Laplace estimate the Laplace
+# gradient is zero, so the quadrature objective's gradient there is the
+# derivative of the *gap* between them, and one Newton step against the
+# curvature already computed for the standard errors gives the shift. That
+# costs `2 * npar` quadrature evaluations; a full refit against the quadrature
+# objective costs the same per gradient and many gradients.
+
+#' Measure, and optionally correct, the Laplace approximation error in a fit
+#'
+#' Recomputes a \code{backend='julia'}, \code{intoverpop='laplace'} fit's log
+#' marginal likelihood by adaptive Gauss-Hermite quadrature over the same
+#' random-effect integral the Laplace approximation approximates, and reports
+#' how far the estimate would move if that integral were taken exactly.
+#'
+#' The quadrature is adaptive in the usual sense: it is centred at each
+#' subject's inner mode and scaled by the inverse of the inner curvature there,
+#' both of which the fit has already computed. The curvature's eigenvalues are
+#' clipped from below at one, the prior's own curvature, before scaling: where
+#' the likelihood has gone convex in the random effects an unclipped rule puts
+#' its nodes far outside the prior and misses the mass it is meant to measure
+#' (1.8 nats too high on average on near-singular units in simulation, 0.06
+#' clipped). Where every eigenvalue is at least one nothing changes.
+#'
+#' The gap is quadrature minus the fit's own Laplace term, the quantity the fit
+#' maximised. With \code{nodes = 1} that gap is zero wherever the curvature is
+#' at least the prior's, which is what makes the comparison meaningful -- the
+#' two are integrating the same thing by different rules. On a unit with an
+#' eigenvalue below one it is not zero even at one node: the one-point clipped
+#' rule is the eigenwise-floored term, below the fit's.
+#'
+#' The correction is a single Newton step, \code{delta = solve(-hessian,
+#' gradient of (quadrature - laplace))}, evaluated at the estimate. Read it
+#' against the standard errors: \code{delta / se} well below one says the
+#' approximation is not what limits the answer, and near or above one says the
+#' point estimate is approximation-limited and the interval will not cover
+#' whatever width it has.
+#'
+#' A fit can be refined, with its units' random effects integrated by
+#' quadrature, when it is fitted
+#' (\code{ctFit(intoverpop = 'quadrature')}) or after
+#' (\code{ctFitUncertainty(fit, intoverpop = 'quadrature')}); by default it
+#' only runs the random-effects check, which warns where integrating would
+#' move an estimate. On a corrected fit this check is made at the corrected estimate,
+#' which is not a Laplace optimum: the correction reported is then the
+#' \emph{further} Newton step on the quadrature objective from there, with the
+#' Laplace gradient included, and \code{at} on the result is
+#' \code{'corrected'}. A small further step says the correction got there; a
+#' large one says it did not. On any other fit it is the first step.
+#'
+#' Nested groupings are handled. A group's integral does not factor over its
+#' members, but it does factor \emph{conditionally} -- given the group effect
+#' the members are independent -- so the rule recurses over the same block tree
+#' the fit already builds, at a cost linear in the number of groups at each
+#' level rather than exponential in the number of members.
+#'
+#' @param fit A \code{ctJuliaFit} fitted with \code{intoverpop='laplace'}.
+#' @param nodes Quadrature nodes per random effect. Cost is
+#'   \code{nodes^k} process log likelihoods per block, where \code{k} is that
+#'   level's number of random effects; 5 is enough to locate the maximum in the
+#'   cases tested, 9 to settle the value.
+#' @param correction Compute the first-order correction to the estimate. Costs
+#'   \code{2 * npar} quadrature evaluations, and needs the fit's Hessian, so it
+#'   is skipped when uncertainty was not computed.
+#' @param step Finite-difference step for the gap gradient, on the raw scale.
+#' @param refine Continue the fit on the quadrature objective rather than
+#'   correcting linearly: the refined fit \code{intoverpop =
+#'   'quadrature'} runs at fit time (see \code{\link{ctFit}}), from this fit's
+#'   estimate, with the quadrature rules placed at every point. Its gradient
+#'   is exact, so it costs a quadrature gradient per step rather than the
+#'   \code{2 * npar} quadrature evaluations per gradient the finite-difference
+#'   refinement this replaced cost, and it reports the point it reaches in
+#'   \code{refined}.
+#' @param maxiter Iteration cap for the climb of \code{refine}.
+#' @param cores Engine threads for the quadrature.
+#' @param verbose Integer; 1 or more prints progress.
+#'
+#' @return A list with \code{gap} (quadrature minus Laplace log marginal at the
+#'   estimate), \code{gap_per_subject}, \code{nodes}, and, when
+#'   \code{correction} is \code{TRUE}, a \code{parameters} data frame with one
+#'   row per raw parameter giving \code{estimate}, \code{delta},
+#'   \code{corrected}, \code{se} and \code{delta_se}. With \code{refine} it also
+#'   carries \code{refined}. \code{at} says whether the estimate checked was the
+#'   Laplace optimum (\code{'laplace'}) or already quadrature-corrected
+#'   (\code{'corrected'}).
+#'
+#'   \code{dropped_directions} counts the directions of the information matrix
+#'   the correction does not step along, whose correction is reported as zero
+#'   rather than as the arbitrarily large step an unguarded solve would
+#'   produce: exactly the directions \code{fit$identifiability} names, those
+#'   whose curvature is negligible or not positive and those the likelihood was
+#'   measured flat along. On a model where the Laplace approximation is
+#'   already exact the gap gradient is floating-point noise, and dividing that
+#'   by a near-singular curvature is how a meaningless correction gets a
+#'   plausible-looking number.
+#'
+#' @seealso \code{\link{ctFitUncertainty}} with \code{method = 'sample'}
+#'   and \code{intoverpop = 'none'} removes the approximation
+#'   instead of measuring it, by sampling the joint posterior; much slower,
+#'   and the right answer when \code{delta_se} says a linear correction is not
+#'   credible.
+#'
+#' @examples
+#' \dontrun{
+#' data <- ctstantestdat
+#' model <- ctModel(type = 'ct', manifestNames = 'Y1', latentNames = 'eta1',
+#'   LAMBDA = matrix(1))
+#' model$pars$indvarying <- model$pars$matrix %in% 'MANIFESTMEANS'
+#' fit <- ctFit(data, model, backend = 'julia', intoverpop = 'laplace')
+#'
+#' check <- ctLaplaceCheck(fit)
+#' check                     # gap, and the largest corrections in standard errors
+#' check$parameters          # the full per-parameter table
+#' }
+#' @export
+ctLaplaceCheck <- function(fit, nodes = 5L, correction = TRUE, step = 1e-3,
+  refine = FALSE, maxiter = 50L, cores = getOption("mc.cores", 2L), verbose = 0L) {
+
+  if (!inherits(fit, "ctJuliaFit")) {
+    stop("ctLaplaceCheck applies to backend='julia' fits.", call. = FALSE)
+  }
+  if (is.null(fit$model_spec$laplace)) {
+    stop("ctLaplaceCheck applies to fits made with intoverpop='laplace'. ",
+      "The augmented route carries the random effects in the state and has no ",
+      "separate integral to check.", call. = FALSE)
+  }
+  est <- as.numeric(fit$estimate$raw)
+  module <- .ctJuliaModule(fit$model_spec$project)
+  # The objective the fit maximised: the quadrature integrates the deviations
+  # its filter integrates exactly at every node, and spans only the rest.
+  objective <- .ctJuliaObjective(fit, hybrid = TRUE)
+  # Restored on exit: this is a diagnostic, and it has no business changing how
+  # fast everything else in the session runs afterwards.
+  if (!is.null(cores)) {
+    previous <- .ctBackendSetMaxChunks(max(1L, cores))
+    on.exit(.ctBackendRestoreMaxChunks(previous), add = TRUE)
+  }
+
+  nsubjects <- length(fit$model_spec$subject_starts)
+
+  # Where `ctOptimUncertainty()` leaves it. A `fit$stanfit$uncertainty$hessian`
+  # fallback used to sit here "so this reads either without the caller knowing
+  # which" -- but the caller is known: this function refuses anything that is
+  # not a ctJuliaFit thirty lines above, and nothing ever puts a `$stanfit` on
+  # one, so the fallback could not fire.
+  hessian <- fit$uncertainty$hessian
+  if (isTRUE(correction) && is.null(hessian)) {
+    warning("No Hessian on the fit, so the correction cannot be formed. ",
+      "Run ctFitUncertainty(fit) first, or use correction=FALSE.",
+      call. = FALSE)
+  }
+  do_correction <- isTRUE(correction) && !is.null(hessian)
+
+  # Say what it will cost before starting. The quadrature recurses over the
+  # levels, so one evaluation is a subject filter pass per node of every
+  # level's grid above it: nsubjects * nodes^(sum of each level's random
+  # effects). A nested model multiplies the exponents, and the correction
+  # repeats the whole thing 2 * npar times -- a two-level model of 48
+  # subjects with 4 + 3 effects and 33 parameters ran for hours, silently.
+  ks <- vapply(fit$model_spec$laplace$levels, function(l)
+    max(0L, as.integer(l$nrandom)), 1L)
+  passes <- nsubjects * as.numeric(nodes)^sum(ks)
+  total <- passes * if (do_correction) 2 * length(est) + 1 else 1
+  if (total > 1e6) message("ctLaplaceCheck: about ", signif(total, 2),
+    " subject filter passes (", nodes, " nodes per random effect",
+    if (do_correction) paste0(", ", 2 * length(est) + 1,
+      " quadrature evaluations for the correction") else "", "). ",
+    if (do_correction) "correction=FALSE or " else "", "fewer nodes is quicker.")
+
+  # A fit the default correction already moved is not at a Laplace optimum, so
+  # the gap gradient alone is not the quadrature objective's gradient there:
+  # the Laplace gradient is added, and `delta` is a further step from the
+  # corrected point rather than the step the fit has already taken. The metric
+  # is still the fit's Hessian, which is at the Laplace optimum.
+  corrected <- .ctLaplaceIsCorrected(fit)
+
+  if (do_correction) {
+    # `ctsem_laplace_correction` makes this same quadrature and Laplace
+    # evaluation itself and returns both, along with their difference -- so
+    # take `quadrature`, `laplace` and `gap` from its result rather than
+    # evaluating both a second time. The `correction=FALSE` path below still
+    # needs to make these two calls itself.
+    if (verbose > 0) message("Gap gradient (", 2 * length(est), " quadrature evaluations)")
+    result <- .ctJuliaGet(module$ctsem_laplace_correction(
+      objective, .ctJuliaNumericVector(est),
+      .ctJuliaPut(as.matrix(hessian)),
+      nodes = as.integer(nodes), step = as.numeric(step),
+      laplace_gradient = corrected))
+    quadrature <- as.numeric(result$quadrature)
+    laplacevalue <- as.numeric(result$laplace)
+    gap <- as.numeric(result$gap)
+    # The step on the directions the fit identifies, with the fit's own
+    # identifiability rules, so that `dropped_directions` and `nweak` count
+    # the same directions. See `.ctLaplaceIdentifiedStep()`.
+    identified <- .ctLaplaceIdentifiedStep(hessian,
+      as.numeric(result$gap_gradient),
+      screen = fit$uncertainty$details$flatdirections)
+  } else {
+    if (verbose > 0) message("Quadrature at the estimate (", nodes, " nodes)")
+    quadrature <- .ctBackendJuliaValue(module$ctsem_laplace_quadrature(
+      objective, .ctJuliaNumericVector(est), nodes = as.integer(nodes))$value)
+    laplacevalue <- .ctBackendJuliaValue(module$ctsem_laplace_evaluate(
+      objective, .ctJuliaNumericVector(est), gradient = FALSE)$value)
+    gap <- quadrature - laplacevalue
+  }
+
+  # `$verdict` is the same shape the curvature certification and
+  # `ctParticleLik()` report, so "how good is this approximation" has one answer
+  # shape whichever reference it was asked against. The fields beside it are
+  # unchanged; see R/ctFitGap.R.
+  verdict <- .ctFitGap("quadrature", gap = gap, nsubjects = nsubjects,
+    remedy = paste0("A gap that matters means the Laplace approximation is ",
+      "limiting the fit rather than the data; ctFitUncertainty(fit, intoverpop = ",
+      "'quadrature') refines the estimates with the units integrated by quadrature, ",
+      "and ctFitUncertainty(fit, 'sample', intoverpop = 'none') samples the ",
+      "posterior without the approximation, for intervals to report."))
+  out <- list(verdict = verdict,
+    gap = gap, quadrature = quadrature, laplace = laplacevalue,
+    gap_per_subject = gap / max(1L, nsubjects),
+    nodes = as.integer(nodes), nsubjects = nsubjects,
+    at = if (corrected) "corrected" else "laplace")
+  class(out) <- "ctLaplaceCheck"
+
+  if (!do_correction) return(out)
+  covariance <- fit$estimate$cov
+  se <- sqrt(abs(diag(as.matrix(covariance))))
+  delta <- identified$delta
+  out$parameters <- data.frame(
+    parameter = .ctBackendRawParameterNames(fit, length(est)),
+    estimate = est, delta = delta, corrected = est + delta,
+    se = se, delta_se = ifelse(se > 0, delta / se, NA_real_),
+    stringsAsFactors = FALSE)
+  out$corrected <- est + delta
+  out$gap_gradient <- as.numeric(result$gap_gradient)
+  # How many directions the information matrix did not identify well enough to
+  # correct along. Reported rather than silently absorbed: a dropped direction
+  # means "no estimable correction here", which is a different statement from
+  # "the correction is zero", and the difference matters to anyone reading the
+  # table to decide whether the estimate is approximation-limited.
+  out$dropped_directions <- identified$dropped
+
+  if (refine) {
+    if (verbose > 0) message("Continuing on the quadrature objective")
+    control <- .ctLaplaceContinueDefaults
+    control$nodes <- as.integer(nodes)
+    control$maxiter <- as.integer(maxiter)
+    cont <- do.call(module$ctsem_laplace_continuation,
+      c(list(objective, .ctJuliaNumericVector(est)),
+        .ctLaplaceContinuationArgs(control, force = fit$laplace$jump$units)))
+    # The refined fit's own climb, its rules placed at every evaluation
+    # (`.ctLaplacePlacedClimb()`), and its log likelihood as the fit reports
+    # it, every unit by quadrature.
+    placed <- module$ctsem_laplace_placed(cont)
+    res <- .ctLaplacePlacedClimb(module, placed, est, .ctBackendGapTolerance(fit),
+      control, verbose = verbose)
+    out$refined <- as.numeric(res$minimizer)
+    out$refined_converged <- isTRUE(res$converged)
+    out$refined_status <- if (out$refined_converged) "converged" else "stopped"
+    out$refined_loglik <- sum(as.numeric(.ctJuliaGet(
+      module$ctsem_laplace_placed_quadrature(placed,
+        .ctJuliaNumericVector(out$refined)))$unit_loglik))
+    out$parameters$refined <- out$refined
+  }
+  out
+}
+
+# The first-order correction's step on the directions the fit identifies.
+#
+# The engine solves `-H \ gap` along every direction the information matrix
+# does not drop at `sqrt(eps)` of its largest eigenvalue. The identifiability
+# report drops more -- a direction whose curvature is not positive, and one the
+# likelihood was measured flat along even though its curvature has not decayed
+# -- and the two counts were compared by a test that failed as soon as the
+# report learned to ask the likelihood. So the step is taken here, on the
+# complement of the directions `.ctBackendIdentifiability()` names from the
+# same Hessian and the same flat-direction screen, and `dropped` is their
+# number: `nweak` by construction.
+.ctLaplaceIdentifiedStep <- function(hessian, gradient, screen = NULL,
+  rtol = 1e-8) {
+  hessian <- as.matrix(hessian)
+  n <- nrow(hessian)
+  report <- .ctBackendIdentifiability(hessian, screen = screen, rtol = rtol,
+    vectors = TRUE)
+  information <- -(hessian + t(hessian)) / 2
+  projector <- diag(n)
+  if (length(report$directions)) {
+    flat <- do.call(cbind, lapply(report$directions, `[[`, "vector"))
+    decomposition <- qr(flat)
+    q <- qr.Q(decomposition)[, seq_len(decomposition$rank), drop = FALSE]
+    projector <- projector - q %*% t(q)
+  }
+  kept <- projector %*% information %*% projector
+  e <- eigen((kept + t(kept)) / 2, symmetric = TRUE)
+  scale <- max(abs(e$values))
+  keep <- if (is.finite(scale) && scale > 0) e$values > rtol * scale else
+    rep(FALSE, n)
+  v <- e$vectors[, keep, drop = FALSE]
+  delta <- if (any(keep)) as.numeric(v %*% ((t(v) %*% (projector %*% gradient)) /
+    e$values[keep])) else rep(0, n)
+  list(delta = delta, dropped = as.integer(n - sum(keep)),
+    nweak = as.integer(report$nweak))
+}
+
+#' @export
+print.ctLaplaceCheck <- function(x, ...) {
+  cat("Laplace approximation check,", x$nodes, "quadrature nodes per effect\n")
+  if (identical(x$at, "corrected")) {
+    cat("  at the fit's quadrature-corrected estimate; corrections are further ",
+      "steps from it\n", sep = "")
+  }
+  cat("  log marginal: laplace", format(x$laplace, digits = 8),
+    " quadrature", format(x$quadrature, digits = 8), "\n")
+  # Through the shared formatter, so this comparison reads the same as the
+  # curvature certification's and ctParticleLik()'s. One question -- how far is
+  # the reported answer from a better one -- asked against three references and,
+  # until now, answered in three shapes. See R/ctFitGap.R.
+  if (!is.null(x$verdict)) print(x$verdict) else
+    cat("  gap:", format(x$gap, digits = 4), "log units over", x$nsubjects,
+      "subjects (", format(x$gap_per_subject, digits = 3), "each )\n")
+  if (!is.null(x$parameters)) {
+    worst <- x$parameters[order(-abs(x$parameters$delta_se)), ]
+    cat("  largest first-order corrections, in standard errors:\n")
+    print(utils::head(worst[, c("parameter", "estimate", "corrected", "se",
+      "delta_se")], 6), row.names = FALSE, digits = 3)
+    if (isTRUE(x$dropped_directions > 0L)) {
+      cat("  ", x$dropped_directions, " direction(s) of the information matrix ",
+        "were too weakly
+  identified to correct along, and are reported as zero.
+",
+        sep = "")
+    }
+    if (max(abs(worst$delta_se), na.rm = TRUE) > 0.5) {
+      cat("  A correction near or above one standard error means the point ",
+        "estimate is\n  limited by the approximation, not by the data.\n", sep = "")
+    }
+  }
+  invisible(x)
+}
+
+# A name for every element of the raw (unconstrained) parameter vector.
+#
+# These names are what a user is shown when something has to point at one raw
+# coordinate: the identifiability warning and `fit$identifiability`,
+# `ctIdentify()`, the Laplace correction table, `ctReport()`'s profile
+# component, the column names of `fit$estimate$rawposterior`. So the whole
+# vector has to be namable, not most of it: a positional `raw[17]` in that
+# list says nothing about which part of the model is involved, which is the
+# one thing the reader needs.
+#
+# `.ctJuliaCheckLayout()` (R/ctJuliaBackend.R) enumerates the blocks the raw
+# vector is made of, and they tile `1:npar`. Every block therefore has a name
+# here, spelled to match what the same quantity is called elsewhere:
+#
+#   model parameters              the cell's own name         drift_eta2_eta1
+#   population scales             popsd_<parameter>           popsd_drift_eta1
+#   population correlations       rawcor_<par>__<par>         rawcor_a__b
+#   TI-predictor coefficients     rawtipredeffect_<par>_<ti>  as stan's
+#                                                             ctFitgetparnamesfromraw()
+#   sampled TI-predictor values   tipredvalue_<ti>_<subject>
+#
+# Two of those need the spec rather than the parameter table. The augmented
+# route (`intoverpop='augmented'`) keeps its population scales and correlations
+# *in* the table, under internal cell names (`julia_popcov_3_3`), so they are
+# relabelled from `random_effects` to the same `popsd_`/`rawcor_` spelling the
+# Laplace route uses -- one conceptual parameter, one name, whichever route
+# produced it. TI-predictor coefficients and sampled TI-predictor values are
+# not matrix cells at all and appear only on the spec.
+#
+# A leftover `raw[i]` is therefore a block nobody named rather than a name, and
+# is reported as such: see `.ctBackendReportUnnamedParameters()` below.
+.ctBackendRawParameterNames <- function(fit, npar) {
+  names <- paste0("raw[", seq_len(npar), "]")
+  spec <- fit$model_spec
+  table <- spec$parameter_table
+  if (!is.null(table) && nrow(table)) {
+    table <- as.data.frame(table, stringsAsFactors = FALSE)
+    own <- .ctBackendOwnRows(table[!is.na(table$parnumber) & table$parnumber > 0, , drop = FALSE])
+    number <- as.integer(own$parnumber)
+    label <- .ctBackendParamLabel(own$param, number)
+    keep <- number <= npar
+    names[number[keep]] <- label[keep]
+  }
+
+  # The augmented route's population scales and correlations, which the loop
+  # above just labelled with their internal cell names.
+  effects <- spec$random_effects
+  if (!is.null(effects) && length(effects) && nrow(effects)) {
+    index <- as.integer(effects$parameter)
+    label <- ifelse(effects$type %in% "correlation",
+      paste0("rawcor_", as.character(effects$param)),
+      paste0("popsd_", as.character(effects$param)))
+    keep <- !is.na(index) & index >= 1L & index <= npar & !is.na(effects$param)
+    names[index[keep]] <- label[keep]
+  }
+
+  laplace <- spec$laplace
+  if (!is.null(laplace)) {
+    for (level in laplace$levels) {
+      varying <- as.character(level$param)
+      suffix <- if (length(laplace$levels) > 1L) paste0(".", level$name) else ""
+      sd_index <- as.integer(level$sd_index)
+      if (length(sd_index) && length(varying) == length(sd_index)) {
+        # Zero is a stated value with no raw position.
+        free <- sd_index > 0L
+        names[sd_index[free]] <- paste0("popsd_", varying[free], suffix)
+      }
+      # A reduced level has loadings instead, and they are neither a spread
+      # nor a correlation: `poploading_<parameter>_<dimension>`. Naming them
+      # `popsd_` because they sit where the scales used to would be the kind
+      # of plausible mislabelling that survives review.
+      load_index <- as.integer(level$load_index)
+      if (length(load_index) && length(varying)) {
+        # The triangle, or the level's blocks (`.ctJuliaLoadingEntries()`).
+        entries <- .ctJuliaLoadingEntries(level)
+        names[load_index] <- paste0("poploading_", varying[entries$row],
+          "_dim", entries$col, suffix)
+      }
+      # Own variances (`popunique`): an sd, but only the effect's own part of
+      # it, so not `popsd_`.
+      unique_index <- as.integer(level$unique_index)
+      if (length(unique_index) == length(varying)) {
+        own <- unique_index > 0L
+        names[unique_index[own]] <- paste0("popunique_", varying[own], suffix)
+      }
+      cor_index <- as.integer(level$cor_index)
+      if (length(cor_index) && length(varying) > 1L) {
+        pairs <- which(lower.tri(matrix(0, length(varying), length(varying))),
+          arr.ind = TRUE)
+        pairs <- pairs[order(pairs[, "col"], pairs[, "row"]), , drop = FALSE]
+        n <- min(nrow(pairs), length(cor_index))
+        # Two underscores between the pair, as `summary()`'s `rawpopcorr`
+        # column names use: parameter names contain single underscores
+        # themselves (`drift_eta2_eta1`), so a single one does not say where
+        # the first name stops.
+        free <- which(cor_index[seq_len(n)] > 0L)
+        names[cor_index[free]] <- paste0("rawcor_",
+          varying[pairs[free, "row"]], "__", varying[pairs[free, "col"]],
+          suffix)
+      }
+    }
+  }
+
+  # TI-predictor coefficients, named after the parameter they act on and the
+  # predictor they carry -- the same pair, in the same order, that the stan
+  # path's `ctFitgetparnamesfromraw()` spells `rawtipredeffect_<par>_<ti>`.
+  # Named last of the three parameter blocks because the target parameter's own
+  # name has to be resolved first.
+  tipred_names <- spec$TIpredNames
+  if (is.null(tipred_names)) tipred_names <- spec$model$TIpredNames
+  ti_effects <- spec$ti_effects
+  if (!is.null(ti_effects) && length(ti_effects) && nrow(ti_effects)) {
+    index <- as.integer(ti_effects$coefficient)
+    target <- as.integer(ti_effects$parameter)
+    predictor <- .ctBackendPredictorLabel(tipred_names, ti_effects$predictor)
+    # A target may be a stated population mean (R/ctFixedPopMeans.R), past
+    # the free parameters and named by its parameter.
+    targets <- c(names, as.character(spec$anchors$param))
+    keep <- !is.na(index) & index >= 1L & index <= npar &
+      !is.na(target) & target >= 1L & target <= length(targets)
+    names[index[keep]] <- paste0("rawtipredeffect_", targets[target[keep]], "_",
+      predictor[keep])
+  }
+
+  # Sampled values for missing TI-predictor cells: one parameter per cell, so
+  # the name says which subject's which predictor. The subject label is the
+  # user's own id where the spec still carries the data (`ti_missing$subject`
+  # indexes subjects in first-appearance order, as `.ctJuliaTIDataAllowMissing()` builds
+  # them), and the position otherwise.
+  ti_missing <- spec$ti_missing
+  if (!is.null(ti_missing) && length(ti_missing) && nrow(ti_missing)) {
+    index <- as.integer(ti_missing$parameter)
+    predictor <- .ctBackendPredictorLabel(tipred_names, ti_missing$predictor)
+    subject <- .ctBackendSubjectLabel(fit, ti_missing$subject)
+    keep <- !is.na(index) & index >= 1L & index <= npar
+    names[index[keep]] <- paste0("tipredvalue_", predictor[keep], "_",
+      subject[keep])
+  }
+
+  .ctBackendReportUnnamedParameters(names, spec)
+  names
+}
+
+# A predictor's own name, or its position when the spec carries no name for it.
+.ctBackendPredictorLabel <- function(tipred_names, predictor) {
+  predictor <- as.integer(predictor)
+  label <- if (is.null(tipred_names)) rep(NA_character_, length(predictor)) else
+    as.character(tipred_names)[predictor]
+  ifelse(is.na(label) | !nzchar(label), paste0("TI", predictor), label)
+}
+
+# The subject id a raw-vector index belongs to, as the user wrote it.
+#
+# `.ctFitIdMap()` (R/ctBackendKalman.R) is the position-to-original-id mapping
+# every other user-facing report speaks through, so the name here says the same
+# id the rest of the output does. It needs the long data frame, which a fit
+# carries on its spec and a *prepared* spec does not -- `ctFit()` overwrites
+# the top-level `$data` of what it returns with the prepared standata -- so the
+# position is the fallback, spelled so it cannot be mistaken for an id.
+.ctBackendSubjectLabel <- function(fit, subject) {
+  subject <- as.integer(subject)
+  map <- try(.ctFitIdMap(fit), silent = TRUE)
+  label <- if (inherits(map, "try-error") || !is.data.frame(map) || !nrow(map)) {
+    rep(NA_character_, length(subject))
+  } else as.character(map$original)[match(subject, map$new)]
+  ifelse(is.na(label), paste0("subject", subject), label)
+}
+
+# Say so when a raw index had no name to give.
+#
+# `raw[17]` is a defensible last resort, but it is not a name, and shipping it
+# inside a list of names reads as one. The blocks above cover every block
+# `.ctJuliaCheckLayout()` knows about, so a gap here means the raw vector grew
+# a block that nobody taught this function to name -- a developer's problem,
+# and one that otherwise reaches a user as an unreadable identifiability
+# warning. Reported only when the spec is complete enough to have been
+# namable: a fit restored without its parameter table has no gap, it has no
+# spec.
+.ctBackendReportUnnamedParameters <- function(names, spec) {
+  table <- spec$parameter_table
+  if (is.null(table) || !nrow(table)) return(invisible(NULL))
+  unnamed <- which(startsWith(names, "raw["))
+  if (!length(unnamed)) return(invisible(NULL))
+  warning("Raw parameter ", paste(unnamed, collapse = ", "),
+    " could not be named, and is reported by position. This is a gap in ",
+    "ctsem's parameter naming rather than a problem with the model; please ",
+    "report it.", call. = FALSE)
+  invisible(NULL)
+}

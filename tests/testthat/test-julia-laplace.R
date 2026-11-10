@@ -1,0 +1,1551 @@
+# intoverpop='laplace': subject-level parameter random effects integrated out
+# per subject rather than by augmenting the latent state.
+#
+# The engine's own suite (inst/julia/.../test/test_laplace.jl) proves the
+# approximation itself -- exactness for a Gaussian integrand against a
+# closed-form reference, and that the outer gradient is the gradient of the
+# value returned. This file proves the R side: that the metadata describing the
+# random effects to the engine is right, that the two routes agree where theory
+# says they must, and that the ways of asking for something unsupported all
+# fail rather than quietly doing something else.
+
+# A linear model whose only random effect is an identity-transformed
+# MANIFESTMEANS. The transform matters: a random effect entering the state mean
+# linearly makes the integrand exactly Gaussian in z, so Laplace is exact and
+# the two routes are describing the same model rather than two similar ones.
+#
+# T0VAR is *fixed*, and that is not incidental. A free T0VAR and a random
+# MANIFESTMEANS both describe between-subject spread, and they separate only
+# through how fast the initial state decays -- so whenever the estimated drift
+# comes out weak the two trade off along a ridge, the population scale wanders
+# up it, and the tests below end up measuring L-BFGS's path rather than
+# anything about the Laplace approximation. Fixing T0VAR at the value the data
+# are generated with removes the confound and leaves the population scale
+# cleanly identified, which is what these tests are actually about.
+.laplace_test_model <- function() {
+  model <- suppressWarnings(suppressMessages(ctModel(
+    type = "ct", manifestNames = "Y1", latentNames = "eta1",
+    LAMBDA = matrix(1), T0MEANS = matrix(0), CINT = matrix(0),
+    T0VAR = matrix(0.5), MANIFESTMEANS = matrix("mmean"))))
+  model$pars$indvarying <- FALSE
+  model$pars$indvarying[model$pars$param %in% "mmean"] <- TRUE
+  model
+}
+
+.laplace_test_data <- function(nsubjects = 30, nobs = 6) {
+  set.seed(20260825)
+  drift <- -0.4; diffusion <- 0.6
+  rows <- lapply(seq_len(nsubjects), function(i) {
+    intercept <- stats::rnorm(1, 1.5, 0.9)
+    state <- stats::rnorm(1, 0, 0.5)
+    out <- numeric(nobs)
+    for (t in seq_len(nobs)) {
+      if (t > 1) {
+        decay <- exp(drift)
+        state <- decay * state +
+          stats::rnorm(1, 0, sqrt(diffusion^2 / (-2 * drift) * (1 - decay^2)))
+      }
+      out[t] <- state + intercept + stats::rnorm(1, 0, 0.3)
+    }
+    data.frame(id = i, time = seq_len(nobs) - 1, Y1 = out)
+  })
+  do.call(rbind, rows)
+}
+
+
+# Fitting is the expensive part of this file -- the exact Laplace gradient costs
+# a forward sweep over the parameters on top of each subject's reverse pass --
+# and four tests below want the same two fits. They are computed once, on first
+# use, and shared. Nothing here mutates a fit, so sharing is safe.
+.laplace_fit_cache <- new.env(parent = emptyenv())
+.laplace_cached <- function(key, expr) {
+  if (!exists(key, envir = .laplace_fit_cache, inherits = FALSE)) {
+    assign(key, force(expr), envir = .laplace_fit_cache)
+  }
+  get(key, envir = .laplace_fit_cache, inherits = FALSE)
+}
+# Under a seed: the start and the finish samples come from the session's
+# generator, and "subject parameters are available at draws" reads the draws'
+# means against a bound they cross at some seeds (0.52 against 0.5 at seed 3,
+# with the effect a coordinate or integrated by the filter alike).
+.laplace_exact_fit <- function() .laplace_cached("exact", {
+  set.seed(1)
+  suppressMessages(ctFit(.laplace_test_data(), .laplace_test_model(),
+    backend = "julia", intoverpop = "laplace",
+    optimcontrol = list(finishsamples = 100)))
+})
+.laplace_augmented_fit <- function() .laplace_cached("augmented", suppressMessages(
+  ctFit(.laplace_test_data(), .laplace_test_model(), backend = "julia",
+    intoverpop = "augmented", optimcontrol = list(estonly = TRUE))))
+
+test_that("the Laplace route describes random effects without augmenting the state", {
+  model <- .laplace_test_model()
+  dat <- .laplace_test_data()
+
+  laplace <- suppressMessages(ctFit(dat, model, backend = "julia",
+    intoverpop = "laplace", fit = FALSE))
+  augmented <- suppressMessages(ctFit(dat, model, backend = "julia",
+    intoverpop = "augmented", fit = FALSE))
+
+  # The point of the route: the filtered system stays at its single-subject
+  # size, where augmenting grows it by one state per random effect.
+  expect_equal(laplace$nlatent_augmented, laplace$nlatent)
+  expect_equal(augmented$nlatent_augmented, augmented$nlatent + 1L)
+
+  spec <- laplace$laplace
+  expect_equal(spec$nrandom, 1L)
+  expect_equal(spec$param, "mmean")
+  # One scale parameter, no correlations, appended after the model's own.
+  expect_equal(spec$sd_index, spec$base_npar + 1L)
+  expect_length(spec$cor_index, 0L)
+  expect_equal(spec$npar, spec$base_npar + 1L)
+  # The varying parameter is an ordinary model parameter, not a new one.
+  expect_true(spec$re_index <= spec$base_npar)
+  expect_true(spec$re_index %in% laplace$parameter_table$parnumber)
+})
+
+test_that("the population parameter block is laid out the way Stan lays it out", {
+  # `.ctBackendPriorSpec` maps ctsem's priors onto raw positions by assuming
+  # Stan's ordering -- means, then scales, then lower-triangular correlations,
+  # then TI-predictor effects. If the Laplace block ever drifts from that, every
+  # prior lands on the wrong parameter, so the assumption is asserted here
+  # rather than left implicit.
+  model <- suppressWarnings(suppressMessages(ctModel(
+    type = "ct", manifestNames = c("Y1", "Y2"), latentNames = c("e1", "e2"),
+    LAMBDA = diag(2))))
+  model$pars$indvarying <- FALSE
+  free <- unique(model$pars$param[!is.na(model$pars$param) &
+    is.na(model$pars$value) & !grepl("[", model$pars$param, fixed = TRUE)])
+  model$pars$indvarying[model$pars$param %in% free[1:3]] <- TRUE
+
+  dat <- do.call(rbind, lapply(1:6, function(i)
+    data.frame(id = i, time = 0:4, Y1 = stats::rnorm(5), Y2 = stats::rnorm(5))))
+  spec <- suppressMessages(ctFit(dat, model, backend = "julia",
+    intoverpop = "laplace", fit = FALSE))$laplace
+
+  expect_equal(spec$nrandom, 3L)
+  expect_equal(spec$sd_index, spec$base_npar + 1:3)
+  expect_equal(spec$cor_index, spec$base_npar + 3L + 1:3)   # 3 choose 2
+  expect_equal(spec$npar, spec$base_npar + 6L)
+})
+
+test_that("Laplace and augmented agree where the integrand is exactly Gaussian", {
+  skip_without_julia()
+  model <- .laplace_test_model()
+  dat <- .laplace_test_data()
+
+  laplace <- .laplace_exact_fit()
+  augmented <- .laplace_augmented_fit()
+
+  expect_true(laplace$optim$converged)
+  expect_true(augmented$optim$converged)
+  # A random effect on an identity-transformed MANIFESTMEANS is the same model
+  # either way, so this is an equality, not a comparison. The tolerance is set
+  # by the two routes' different numerical offsets in building the population
+  # covariance (1e-8 versus none), not by the approximation.
+  expect_equal(laplace$estimate$loglik, augmented$estimate$loglik, tolerance = 1e-5)
+
+  # The estimates themselves are not compared coordinate by coordinate. The
+  # augmented model carries an extra state, so its raw vector is a different
+  # length in a different order, and matching by sorted value is a check on the
+  # optimiser's path rather than on the model: on a weakly identified ridge two
+  # routes can agree on the likelihood to eight digits while sitting at
+  # different points on it. The log likelihood is the claim being made.
+
+  # The population covariance is the exception, and it is here as a control on
+  # the categorical routes rather than as a claim about this one. With a
+  # Gaussian indicator the moment-matched update is the exact conditional, so
+  # both routes marginalise the random effect exactly and the population scale
+  # has to come out the same; with an ordinal indicator it does not, and the
+  # augmented objective loses almost all its information about that scale --
+  # 0.066 log units between a population sd of 0.7 and one of 1900, against
+  # 40.2 for laplace on the same data. Measured 2026-09-22. So a future change
+  # that made *these* two disagree would mean the loss had reached the Gaussian
+  # path, where there is no approximation to blame it on.
+  #
+  # `.ctBackendRawPopCov` rather than `summary()$popsd`, because the laplace fit
+  # draws finish samples and the augmented one is `estonly`, so their `popsd`
+  # means differ by sampling noise (0.869 against 0.852 here) and would be
+  # comparing two different quantities. The raw covariance is a deterministic
+  # function of each point estimate.
+  #
+  # The tolerance is deliberately loose. The two land 3% apart in sd on this
+  # fixture while agreeing on the likelihood to nine digits -- the ridge the
+  # paragraph above describes, at 30 subjects and 6 occasions -- so a tight
+  # bound here would be pinning the optimiser's stopping point. 20% still
+  # separates agreement from the failure this guards against by three orders of
+  # magnitude.
+  lcov <- .ctBackendRawPopCov(laplace)
+  acov <- .ctBackendRawPopCov(augmented)
+  expect_equal(length(lcov), 1L)
+  expect_equal(length(acov), 1L)
+  expect_equal(lcov[[1]]$param, acov[[1]]$param)
+  expect_equal(as.vector(lcov[[1]]$cov), as.vector(acov[[1]]$cov),
+    tolerance = 0.2)
+
+  expect_true(laplace$laplace$inner_converged)
+  expect_false(any(laplace$laplace$hessian_repaired))
+})
+
+test_that("Laplace and augmented agree in discrete time too", {
+  skip_without_julia()
+
+  # Every other model in this file is `type = 'ct'`, and so is every model in
+  # every other test-julia-*.R -- discrete time had one file to itself
+  # (test-backend-discretetime.R) whose model has no random effects at all.
+  # That is the gap a defect in exactly discrete-time-plus-random-effects
+  # lived in: the augmented route zeroed every random-effect coordinate at
+  # every prediction step, so a subject's deviation reached the first
+  # transition and nothing after it, with a finite likelihood and plausible
+  # estimates throughout. See `.ctJuliaAugmentRandomEffects()` on why DRIFT's
+  # augmented diagonal must be 1 rather than 0 for a discrete-time model.
+  #
+  # This is worth more than the Stan parity test that also covers it, because
+  # it is not parity: the two routes share no code for the random-effect
+  # integral. Laplace optimises per-subject deviations and adds a curvature
+  # correction; the augmented route pushes them through the Kalman filter as
+  # extra states. Both are exact for a linear Gaussian model, so they must
+  # agree -- and an error inherited by both, which parity cannot see, would
+  # have to be inherited through two unrelated implementations to hide here.
+  #
+  # Evaluated at a fixed raw vector rather than fitted: the claim is about the
+  # objective, and the optimiser only adds noise and seconds to it. The two
+  # routes' raw layouts coincide by construction (see `.ctJuliaLaplaceSpec`),
+  # which is what lets one vector serve both.
+  model <- suppressMessages(ctModel(
+    type = "dt", n.latent = 2, LAMBDA = diag(2),
+    DRIFT = matrix(c("d11", "d12", "d21", "d22"), 2, 2, byrow = TRUE),
+    DIFFUSION = matrix(c("q11", 0, "q21", "q22"), 2, 2, byrow = TRUE),
+    MANIFESTVAR = matrix(c("m1", 0, 0, "m2"), 2, 2, byrow = TRUE),
+    MANIFESTMEANS = matrix(0, 2, 1),
+    CINT = matrix(c("c1", "c2"), 2, 1),
+    T0MEANS = matrix(c("t01", "t02"), 2, 1)))
+  set.seed(21)
+  dat <- do.call(rbind, lapply(1:12, function(i) data.frame(
+    id = i, time = 0:5, Y1 = stats::rnorm(6, 0, .7), Y2 = stats::rnorm(6, 0, .7))))
+
+  augmented <- suppressMessages(ctFit(dat, model, backend = "julia", fit = FALSE,
+    priors = FALSE, intoverpop = "augmented"))
+  laplace <- suppressMessages(ctFit(dat, model, backend = "julia", fit = FALSE,
+    priors = FALSE, intoverpop = "laplace"))
+
+  # T0MEANS and CINT are indvarying by default, so this is 4 random effects on
+  # 2 latents: the augmented route grows the state, the Laplace route does not.
+  expect_equal(augmented$nlatent_augmented, augmented$nlatent + 2L)
+  expect_equal(laplace$nlatent_augmented, laplace$nlatent)
+  npar <- ctsem:::.ctBackendNpar(augmented)
+  expect_equal(ctsem:::.ctBackendNpar(laplace), npar)
+
+  set.seed(2)
+  raw <- stats::rnorm(npar, 0, .25)
+  a <- ctJuliaEvaluate(augmented, raw, gradient = TRUE)
+  l <- ctJuliaEvaluate(laplace, raw, gradient = TRUE)
+
+  # Measured at 8e-10 relative on the value and 8e-9 on the gradient, which is
+  # the inner optimisation's own convergence tolerance rather than anything
+  # about the approximation. Pre-fix the two disagreed by whole log-likelihood
+  # units, so there is a wide margin between passing and catching a regression.
+  expect_equal(as.numeric(l$value), as.numeric(a$value), tolerance = 1e-7)
+  expect_equal(as.numeric(l$gradient), as.numeric(a$gradient), tolerance = 1e-5)
+})
+
+test_that("the random-effect population sd is reported and recovers its value", {
+  skip_without_julia()
+  fit <- .laplace_exact_fit()
+  expect_true(fit$laplace$inner_converged)
+  summarised <- summary(fit)
+
+  expect_true("popsd" %in% names(summarised))
+  expect_true("mmean" %in% rownames(summarised$popsd))
+  # Simulated with a between-subject sd of 0.9. This is a recovery check, not a
+  # precision claim: it fails if the population scale is being read off the
+  # wrong parameter or on the wrong scale, which is what it is for.
+  expect_gt(summarised$popsd["mmean", "mean"], 0.5)
+  expect_lt(summarised$popsd["mmean", "mean"], 1.5)
+  expect_lt(summarised$popsd["mmean", "97.5%"], 3.0)
+})
+
+test_that("cores splits the Laplace subject loop without changing the answer", {
+  skip_without_julia()
+  model <- .laplace_test_model()
+  dat <- .laplace_test_data()
+
+  # `cores` reaches the Laplace path the same way it reaches the ordinary one,
+  # as a chunk count for the subject loop. Splitting only reorders a sum, so
+  # one evaluation differs by floating-point association and nothing else. A
+  # fit is many evaluations, and an iterative optimiser carries a last-digit
+  # difference to the precision of its stopping rule: the two stop at points
+  # that agree in log likelihood to 1e-8 and in the raw parameters to about
+  # 1e-5 (measured 4.5e-6). Chunks sharing scratch they should own would miss
+  # both by orders of magnitude.
+  serial <- suppressMessages(ctFit(dat, model, backend = "julia",
+    intoverpop = "laplace", cores = 1, optimcontrol = list(estonly = TRUE)))
+  split <- suppressMessages(ctFit(dat, model, backend = "julia",
+    intoverpop = "laplace", cores = 2, optimcontrol = list(estonly = TRUE)))
+
+  expect_equal(split$estimate$loglik, serial$estimate$loglik, tolerance = 1e-8)
+  expect_equal(split$estimate$raw, serial$estimate$raw, tolerance = 1e-4)
+  expect_true(split$laplace$inner_converged)
+})
+
+test_that("verbose reports the optimiser trace and the inner solve", {
+  skip_without_julia()
+  model <- .laplace_test_model()
+  dat <- .laplace_test_data(nsubjects = 8, nobs = 5)
+
+  # Neither half of the trace travels on stdout, and they do not travel
+  # together, so this captures both channels separately and asserts on the one
+  # each line is actually on. The engine's `verbose` lines are raw writes to
+  # Julia's `stderr`, which JuliaConnectoR relays to R's `stderr()`, so a sink
+  # catches them and `suppressMessages()` never could. The progress line goes
+  # through `.ctProgressSink()`, which emits it with `message()` -- a condition,
+  # which testthat muffles as it records it, so under testthat it does not reach
+  # `stderr()` for a sink to catch either. Capturing stdout and suppressing
+  # messages, as this did, saw neither: three assertions passed vacuously for as
+  # long as the greps happened to be wrong.
+  relayed <- character(); emitted <- character()
+  invisible(capture.output(
+    relayed <- capture.output(
+      emitted <- capture_messages(ctFit(dat, model, backend = "julia",
+        intoverpop = "laplace", verbose = 1,
+        optimcontrol = list(estonly = TRUE))),
+      type = "message")))
+
+  # The inner solve is part of the objective, so its status belongs in the
+  # trace rather than only on the fit object. Asserted nowhere else: the engine
+  # suite proves the solve, and this is the only check that its status is
+  # reported.
+  expect_true(any(grepl("Laplace: inner modes", relayed, fixed = TRUE)))
+  # The progress reporter replaced Optim's own trace, so the assertion is on
+  # what it emits: a labelled line carrying the objective. `Iter` was the old
+  # format's column heading and says nothing about whether the fit is going
+  # anywhere.
+  #
+  # The line's content is `test_progress.jl`'s subject and its delivery as a
+  # message is `test-julia-session.R`'s, so what is left for a real fit to prove
+  # is that the reporter is *wired in* -- which is a failure neither of those can
+  # see, and one that has happened: `progress = isTRUE(progress)` named an
+  # element of the list being built rather than anything in scope, so the sink
+  # was never called.
+  expect_true(any(grepl("optimise", emitted, fixed = TRUE)))
+  expect_true(any(grepl("logpost", emitted, fixed = TRUE)))
+})
+
+test_that("the note about smoothed trajectories is said where a trajectory is", {
+  skip_without_julia()
+  model <- .laplace_test_model()
+  dat <- .laplace_test_data(nsubjects = 8, nobs = 5)
+
+  # Either note: a single-level fit's predicted and updated trajectories are
+  # sequential (laplace_sequential.jl) and say so in their own words.
+  note <- function(messages) sum(grepl("^Laplace fit: (trajectories|predicted)", messages))
+
+  # It used to be said by `.ctBackendKalmanRaw`, which is a filter pass rather
+  # than a trajectory: every julia fit runs one for its prior residuals,
+  # `ctLOO` runs one per fold and the summary runs one per posterior draw. So a
+  # note explaining how to read a picture was printed by every Laplace fit,
+  # whether or not anyone asked for a picture.
+  #
+  # `capture_messages` evaluates its argument in this frame, so the assignments
+  # below land here and the fit is reused.
+  expect_equal(note(capture_messages(fit <- suppressWarnings(ctFit(dat, model,
+    backend = "julia", intoverpop = "laplace",
+    optimcontrol = list(estonly = TRUE))))), 0L)
+  expect_equal(note(capture_messages(suppressWarnings(summary(fit)))), 0L)
+
+  # And said once -- not once per posterior draw -- by the two calls that do
+  # hand back trajectories.
+  expect_equal(note(capture_messages(ctPredict(fit, subjects = 1:2))), 1L)
+  expect_equal(note(capture_messages(ctKalmanArray(fit, subjects = 1:2))), 1L)
+
+  # Not at all for a fit whose random effects are carrier states, where the
+  # filtered output really is filtered.
+  augmented <- suppressMessages(suppressWarnings(ctFit(dat, model,
+    backend = "julia", intoverpop = "augmented",
+    optimcontrol = list(estonly = TRUE))))
+  expect_equal(note(capture_messages(ctPredict(augmented, subjects = 1:2))), 0L)
+})
+
+# --- subjects nested in studies ----------------------------------------------
+
+.laplace_nested_model <- function() {
+  model <- suppressWarnings(suppressMessages(ctModel(
+    type = "ct", manifestNames = "Y1", latentNames = "eta1",
+    LAMBDA = matrix(1), T0MEANS = matrix(0), CINT = matrix(0),
+    T0VAR = matrix(0.5), MANIFESTMEANS = matrix("mmean"),
+    id = c("subject", "study"))))
+  # TRUE is every level of the id: mmean varies between subjects and studies.
+  model$pars$indvarying <- model$pars$param %in% "mmean"
+  model
+}
+
+.laplace_nested_data <- function(nstudy = 8, npersub = 5, nobs = 5) {
+  set.seed(20260825)
+  rows <- list(); sid <- 0
+  for (g in seq_len(nstudy)) {
+    studyeffect <- stats::rnorm(1, 0, 0.10)
+    for (j in seq_len(npersub)) {
+      sid <- sid + 1
+      intercept <- 10 * (0.15 + studyeffect + stats::rnorm(1, 0, 0.06))
+      state <- stats::rnorm(1, 0, 0.5); out <- numeric(nobs)
+      for (t in seq_len(nobs)) {
+        if (t > 1) {
+          decay <- exp(-0.4)
+          state <- decay * state + stats::rnorm(1, 0, sqrt(0.36 / 0.8 * (1 - decay^2)))
+        }
+        out[t] <- state + intercept + stats::rnorm(1, 0, 0.3)
+      }
+      rows[[length(rows) + 1L]] <- data.frame(subject = sid, study = g,
+        time = seq_len(nobs) - 1, Y1 = out)
+    }
+  }
+  do.call(rbind, rows)
+}
+
+test_that("a vector of id columns builds one level per id", {
+  model <- .laplace_nested_model()
+  dat <- .laplace_nested_data()
+  spec <- suppressMessages(ctFit(dat, model, backend = "julia",
+    intoverpop = "laplace", fit = FALSE))
+  laplace <- spec$laplace
+
+  expect_equal(laplace$nlevels, 2L)
+  expect_equal(vapply(laplace$levels, function(x) x$name, character(1)),
+    c("subject", "study"))
+  expect_equal(laplace$levels[[1]]$ngroups, 40L)   # subjects
+  expect_equal(laplace$levels[[2]]$ngroups, 8L)    # studies
+  expect_equal(laplace$levels[[1]]$param, "mmean")
+  expect_equal(laplace$levels[[2]]$param, "mmean")
+
+  # Every level's scale gets its own slot in the raw vector, and `npar` counts
+  # them all. Sizing the raw vector from the subject level alone left the study
+  # scale past its end, where it silently never moved.
+  expect_equal(laplace$levels[[1]]$sd_index, laplace$base_npar + 1L)
+  expect_equal(laplace$levels[[2]]$sd_index, laplace$base_npar + 2L)
+  expect_equal(laplace$npar, laplace$base_npar + 2L)
+  expect_length(ctsem:::.ctJuliaInitialValues(laplace$npar), laplace$npar)
+})
+
+test_that("strict nesting is required, and said so when it is not", {
+  model <- .laplace_nested_model()
+  dat <- .laplace_nested_data()
+  dat$study[dat$subject == 1][1] <- 99   # one subject in two studies
+  expect_error(suppressMessages(ctFit(dat, model, backend = "julia",
+    intoverpop = "laplace", fit = FALSE)), "strictly nested")
+
+  missingcol <- .laplace_nested_data()
+  missingcol$study <- NULL
+  expect_error(suppressMessages(ctFit(missingcol, model, backend = "julia",
+    intoverpop = "laplace", fit = FALSE)), "not found in the data")
+})
+
+test_that("both levels of a nested fit are estimated and reported separately", {
+  skip_without_julia()
+  model <- .laplace_nested_model()
+  dat <- .laplace_nested_data(nstudy = 12, npersub = 5)
+
+  fit <- suppressMessages(suppressWarnings(ctFit(dat, model, backend = "julia",
+    intoverpop = "laplace", optimcontrol = list(finishsamples = 60))))
+  expect_true(fit$laplace$inner_converged)
+  expect_equal(fit$laplace$nlevels, 2L)
+
+  summarised <- summary(fit, residualcov = FALSE)
+  # With more than one level nothing goes in the unlabelled `popsd` slot: a bare
+  # table would leave the reader guessing whether it described spread between
+  # subjects or between studies.
+  expect_null(summarised$popsd)
+  expect_true("popsd.subject" %in% names(summarised))
+  expect_true("popsd.study" %in% names(summarised))
+  expect_true(!is.null(summarised$randomEffects))
+  expect_equal(length(summarised$randomEffects), 2L)
+
+  # Simulated with a subject sd of 0.6 and a study sd of 1.0 on the transformed
+  # scale. A recovery check, not a precision claim: it fails if a level is read
+  # off the wrong parameter, on the wrong scale, or -- as it did -- pinned at
+  # its starting value because the raw vector was too short to hold it.
+  subject <- summarised$popsd.subject["mmean", "mean"]
+  study <- summarised$popsd.study["mmean", "mean"]
+  expect_gt(subject, 0.3); expect_lt(subject, 1.1)
+  expect_gt(study, 0.4);   expect_lt(study, 2.2)
+
+  # The two levels must not be reported as the *same* number, which is what a
+  # mis-wired level index would produce. Requiring them to differ by some
+  # margin instead would be wrong: two genuinely distinct levels can land close
+  # together by chance, and this assertion is about wiring, not about spacing.
+  expect_false(isTRUE(all.equal(subject, study)))
+})
+
+test_that("the Laplace prior layout reproduces the Stan one at a single level", {
+  # `.ctBackendPriorSpec` encodes the generated Stan model's raw ordering and is
+  # what every single-level fit has used. The Laplace construction builds the
+  # same thing from its own layout so it can carry more than one level. Where
+  # both apply they must agree exactly, or a fit would silently change its
+  # priors depending on which route built them.
+  standata <- list(nparams = 4L, nindvarying = 2L, nindvaryingoffdiagonals = 1L,
+    ntipredeffects = 2L, tipredeffectscale = 0.5, priormod = 1, nsubsets = 1,
+    laplaceprior = 0L, laplacetipreds = 0L, laplaceprioronly = 0L)
+  laplace <- list(npar = 7L, levels = list(list(sd_index = 5:6, cor_index = 7L)))
+
+  stanform <- ctsem:::.ctBackendPriorSpec(standata, 9L)
+  laplaceform <- ctsem:::.ctBackendLaplacePriorSpec(standata, laplace, 9L)
+  expect_equal(laplaceform, stanform)
+})
+
+test_that("every level gets the same prior shape, and its own sdscale", {
+  standata <- list(nparams = 4L, nindvarying = 1L, nindvaryingoffdiagonals = 0L,
+    ntipredeffects = 0L, priormod = 1, nsubsets = 1,
+    laplaceprior = 0L, laplacetipreds = 0L, laplaceprioronly = 0L)
+  # Two levels, one effect each: a scale slot per level, no correlations.
+  laplace <- list(npar = 6L, levels = list(list(sd_index = 5L, cor_index = integer()),
+    list(sd_index = 6L, cor_index = integer())))
+  spec <- ctsem:::.ctBackendLaplacePriorSpec(standata, laplace, 6L)
+  expect_equal(spec$index, 1:6)
+  # The same shape at both levels -- the parameterisation is identical, so the
+  # prior is. That it does more work over few studies than over many subjects
+  # is a property of the design, not something the prior should try to fix.
+  expect_equal(spec$scale, rep(1, 6))
+
+  # And a parameter's sdscale scales its population sd at every level.
+  model <- .laplace_nested_model()
+  model$pars$sdscale[model$pars$param %in% "mmean"] <- 3
+  dat <- .laplace_nested_data()
+  levels <- suppressMessages(ctFit(dat, model, backend = "julia",
+    intoverpop = "laplace", fit = FALSE))$laplace$levels
+  expect_equal(levels[[1]]$sd_scale, 3)
+  expect_equal(levels[[2]]$sd_scale, 3)
+})
+
+test_that("a grouping id adds no columns, and intercepts vary at every level", {
+  # One indvarying and one sdscale, whatever the id: levels are what the
+  # indvarying values name.
+  model <- .laplace_nested_model()
+  expect_false(any(grepl("^(indvarying|sdscale)_", names(model$pars))))
+
+  # Unspecified intercepts are TRUE, which is every level.
+  plain <- suppressWarnings(suppressMessages(ctModel(type = "ct",
+    manifestNames = "Y1", latentNames = "eta1", LAMBDA = matrix(1),
+    id = c("subject", "study"))))
+  resolved <- ctsem:::.ctResolveLevels(plain)$pars
+  intercepts <- resolved$matrix %in% c("T0MEANS", "MANIFESTMEANS", "CINT") &
+    is.na(resolved$value)
+  expect_true(any(intercepts))
+  expect_true(all(resolved$indvarying[intercepts]))
+  expect_true(all(resolved$indvarying_study[intercepts]))
+  expect_false(any(resolved$indvarying_study[!intercepts]))
+})
+
+test_that("a TI predictor operates at a grouping level when it varies there", {
+  skip_without_julia()
+  # A covariate constant within study and varying between studies is a
+  # study-level predictor: ctsem applies TI effects additively to each
+  # subject's raw vector, so a study-constant shift *is* a study-level fixed
+  # effect. Nothing special is needed for that -- but the raw vector has to be
+  # long enough to hold the coefficient, which sits after every level's
+  # population block, and it was not.
+  set.seed(31)
+  nstudy <- 10; npersub <- 4; nobs <- 5
+  rows <- list(); sid <- 0
+  for (g in seq_len(nstudy)) {
+    Z <- stats::rnorm(1)
+    studyeffect <- 1.2 * Z + stats::rnorm(1, 0, 0.04)
+    for (j in seq_len(npersub)) {
+      sid <- sid + 1
+      intercept <- 10 * (0.15 + studyeffect + stats::rnorm(1, 0, 0.06))
+      x <- stats::rnorm(1, 0, 0.5); out <- numeric(nobs)
+      for (t in seq_len(nobs)) {
+        if (t > 1) {
+          decay <- exp(-0.4)
+          x <- decay * x + stats::rnorm(1, 0, sqrt(0.36 / 0.8 * (1 - decay^2)))
+        }
+        out[t] <- x + intercept + stats::rnorm(1, 0, 0.3)
+      }
+      rows[[length(rows) + 1L]] <- data.frame(subject = sid, study = g,
+        time = seq_len(nobs) - 1, Y1 = out, Z = Z)
+    }
+  }
+  dat <- do.call(rbind, rows)
+
+  build <- function(withZ) {
+    model <- suppressWarnings(suppressMessages(ctModel(type = "ct",
+      manifestNames = "Y1", latentNames = "eta1", LAMBDA = matrix(1),
+      T0MEANS = matrix(0), CINT = matrix(0), T0VAR = matrix(0.5),
+      MANIFESTMEANS = matrix("mmean"), id = c("subject", "study"),
+      TIpredNames = if (withZ) "Z" else NULL)))
+    model$pars$indvarying <- model$pars$param %in% "mmean"
+    if (withZ) {
+      model$pars$Z_effect <- FALSE
+      model$pars$Z_effect[model$pars$param %in% "mmean"] <- TRUE
+    }
+    model
+  }
+
+  spec <- suppressMessages(ctFit(dat, build(TRUE), backend = "julia",
+    intoverpop = "laplace", fit = FALSE))
+  # The coefficient sits past every level's population block, and the raw
+  # vector must reach it.
+  expect_gt(spec$ti_effects$coefficient, spec$laplace$npar)
+  expect_length(ctsem:::.ctJuliaInitialValues(
+    max(spec$laplace$npar, spec$ti_effects$coefficient)),
+    spec$ti_effects$coefficient)
+
+  fits <- lapply(c(FALSE, TRUE), function(withZ)
+    suppressMessages(suppressWarnings(ctFit(dat, build(withZ), backend = "julia",
+      intoverpop = "laplace", optimcontrol = list(estonly = TRUE)))))
+  sdof <- function(fit, level) {
+    lv <- fit$model_spec$laplace$levels[[level]]
+    10 * (log1p(exp(2 * fit$estimate$raw[lv$sd_index] - 1)) + 1e-10) * lv$sd_scale
+  }
+
+  # The substantive check: a real study-level predictor soaks up between-study
+  # variance, so the *study* random-effect sd collapses while the subject one
+  # does not. Asserting only that the fit ran would not distinguish a predictor
+  # that works from one silently applied at the wrong level.
+  expect_lt(sdof(fits[[2]], 2), sdof(fits[[1]], 2) / 4)
+  expect_equal(sdof(fits[[2]], 1), sdof(fits[[1]], 1), tolerance = 0.3)
+  expect_gt(fits[[2]]$estimate$loglik, fits[[1]]$estimate$loglik)
+})
+
+# --- a grouping level with no subject level effects --------------------------
+
+# One intercept per study with subjects exchangeable inside it is an ordinary
+# model, and nothing about the method needs a level below the varying one. It
+# was refused anyway: every "does this model have random effects" test read the
+# subject level's `indvarying` column and no other.
+
+.laplace_studyonly_model <- function() {
+  model <- suppressWarnings(suppressMessages(ctModel(
+    type = "ct", manifestNames = "Y1", latentNames = "eta1",
+    LAMBDA = matrix(1), T0MEANS = matrix(0), CINT = matrix(0),
+    T0VAR = matrix(0.5), MANIFESTMEANS = matrix("mmean"),
+    id = c("subject", "study"))))
+  model$pars$indvarying <- ifelse(model$pars$param %in% "mmean", "study", FALSE)
+  model
+}
+
+test_that("a study level effect needs no subject level effect", {
+  # The cell can say it directly, and it is the same model as setting the
+  # columns by hand.
+  bycell <- suppressWarnings(suppressMessages(ctModel(
+    type = "ct", manifestNames = "Y1", latentNames = "eta1",
+    LAMBDA = matrix(1), T0MEANS = matrix(0), CINT = matrix(0),
+    T0VAR = matrix(0.5), MANIFESTMEANS = matrix("mmean||study"),
+    id = c("subject", "study"))))
+  cols <- c("param", "indvarying", "indvarying_study")
+  expect_equal(ctsem:::.ctResolveLevels(bycell)$pars[, cols],
+    ctsem:::.ctResolveLevels(.laplace_studyonly_model())$pars[, cols])
+
+  skip_without_julia()
+  dat <- .laplace_nested_data()
+  # Ids that are not positions, so a report labelled by position shows.
+  dat$subject <- paste0("p", dat$subject)
+  spec <- suppressMessages(ctFit(dat, .laplace_studyonly_model(),
+    backend = "julia", intoverpop = "laplace", fit = FALSE))
+
+  expect_equal(spec$laplace$nlevels, 2L)
+  expect_equal(vapply(spec$laplace$levels, function(x) x$nrandom, integer(1)),
+    c(0L, 1L))
+  expect_equal(spec$laplace$nrandom, 1L)
+
+  fit <- suppressMessages(ctFit(dat, .laplace_studyonly_model(),
+    backend = "julia", intoverpop = "laplace",
+    optimcontrol = list(estonly = TRUE)))
+  expect_true(is.finite(fit$estimate$loglik))
+
+  # Nothing varies within a study, so each subject's parameters are its
+  # study's: the subject report and the study level report must agree exactly,
+  # and both are labelled by the ids in the data.
+  subjects <- suppressMessages(ctSubjectPars(fit))
+  studies <- suppressMessages(ctSubjectPars(fit, level = "study"))
+  ids <- dimnames(subjects)[[2]]
+  expect_setequal(ids, unique(as.character(dat$subject)))
+  studyof <- as.character(dat$study[match(ids, dat$subject)])
+  expect_equal(dimnames(studies)[["study"]], unique(studyof))
+  expect_equal(unname(subjects[1, , "mmean"]), unname(studies[1, studyof, "mmean"]))
+  expect_gt(stats::sd(studies[1, , "mmean"]), 0)
+  # A grouping level's draws are drawn as a subject's are, from the same joint
+  # draw of a unit's effects: with one seed, and nothing varying within a
+  # study, a subject's draws are its study's. A posterior held at the estimate
+  # leaves only each study's own uncertainty, which is the stored posterior's.
+  posterior <- fit
+  posterior$estimate$rawposterior <- matrix(fit$estimate$raw, 300L,
+    length(fit$estimate$raw), byrow = TRUE)
+  set.seed(5)
+  subjectdraws <- suppressMessages(ctSubjectPars(posterior, pointest = FALSE,
+    uncertainty = "conditional"))
+  set.seed(5)
+  studydraws <- suppressMessages(ctSubjectPars(posterior, level = "study",
+    pointest = FALSE, uncertainty = "conditional"))
+  expect_equal(dim(studydraws), c(300L, length(unique(studyof)), 1L))
+  expect_equal(unname(subjectdraws[, , "mmean"]),
+    unname(studydraws[, studyof, "mmean"]))
+  entry <- fit$randomeffects$study
+  ratio <- apply(studydraws[, , "mmean"], 2L, stats::sd) /
+    sqrt(entry$cov[match(dimnames(studydraws)$study, entry$ids), 1L])
+  expect_lt(stats::sd(ratio) / mean(ratio), 0.1)
+  expect_equal(colMeans(studydraws[, , "mmean"]), studies[1, , "mmean"],
+    tolerance = 0.1)
+  expect_error(ctSubjectPars(fit, level = "house"), "one of this model's id levels")
+  expect_setequal(levels(suppressMessages(ctResiduals(fit))$Subject), ids)
+  # The summary says how many units each level's spread is estimated from.
+  expect_equal(suppressMessages(summary(fit))$units, paste(length(ids),
+    "subject within", length(unique(dat$study)), "study"))
+})
+
+test_that("one subject per study reproduces the subject level fit exactly", {
+  skip_without_julia()
+  # The check that is not parity between two of our own paths: with one subject
+  # in every study the two specifications are the same model, so the study
+  # level route has to return what the subject level route -- tested against
+  # closed forms elsewhere in this file -- already returns. Anything the empty
+  # inner level perturbs shows up here as a difference in the likelihood.
+  dat <- .laplace_nested_data(nstudy = 20, npersub = 1, nobs = 6)
+
+  subjectlevel <- suppressWarnings(suppressMessages(ctModel(
+    type = "ct", manifestNames = "Y1", latentNames = "eta1",
+    LAMBDA = matrix(1), T0MEANS = matrix(0), CINT = matrix(0),
+    T0VAR = matrix(0.5), MANIFESTMEANS = matrix("mmean"), id = "subject")))
+  subjectlevel$pars$indvarying <- subjectlevel$pars$param %in% "mmean"
+
+  # On the layer: the subject filter would integrate the subject level's
+  # effect (`CTSEMHybrid`), which is the same likelihood computed otherwise,
+  # so the finish samples behind summary()'s popsd would differ by their
+  # Monte Carlo error. The study level's effect is a coordinate either way.
+  old <- options(ctsem.laplace.hybrid = FALSE)
+  on.exit(options(old), add = TRUE)
+  set.seed(99)
+  one <- suppressMessages(ctFit(dat, subjectlevel, backend = "julia",
+    intoverpop = "laplace", cores = 1))
+  set.seed(99)
+  two <- suppressMessages(ctFit(dat, .laplace_studyonly_model(),
+    backend = "julia", intoverpop = "laplace", cores = 1))
+
+  expect_equal(two$estimate$loglik, one$estimate$loglik)
+  expect_equal(two$estimate$raw, one$estimate$raw)
+  expect_equal(summary(two)$popsd, summary(one)$popsd)
+})
+
+test_that("a varying grouping level chooses its own route", {
+  skip_without_julia()
+  dat <- .laplace_nested_data(nstudy = 4, npersub = 3, nobs = 4)
+
+  # 'auto' resolved to the augmented route, which reads `indvarying` alone and
+  # would have dropped the study effect without saying so.
+  auto <- suppressMessages(ctFit(dat, .laplace_studyonly_model(),
+    backend = "julia", fit = FALSE))
+  expect_identical(auto$args$resolved$intoverpop, "laplace")
+  expect_equal(auto$laplace$nlevels, 2L)
+
+  # Asked for explicitly, the same route is refused rather than silently
+  # narrowed, and the message names the parameter it could not carry.
+  expect_error(suppressMessages(ctFit(dat, .laplace_studyonly_model(),
+    backend = "julia", intoverpop = "augmented")), "mmean")
+  # Same for the backend that has one grouping level, whatever the route.
+  expect_error(suppressMessages(ctFit(dat, .laplace_studyonly_model(),
+    backend = "stan", optimize = FALSE, fit = FALSE)), "mmean")
+})
+
+
+test_that("subject parameters are available at draws, with spread", {
+  skip_without_julia()
+  fit <- .laplace_exact_fit()
+
+  point <- ctsem:::.ctBackendSubjectPars(fit, pointest = TRUE)
+  # The conditional draws are random too, from the session's generator, which
+  # the tests run before this one leave in a different state in a parallel
+  # run than in a serial one.
+  set.seed(1)
+  draws <- ctsem:::.ctBackendSubjectPars(fit, pointest = FALSE)
+  expect_equal(dim(point)[1], 1L)
+  expect_gt(dim(draws)[1], 1L)
+  expect_equal(dim(draws)[2:3], dim(point)[2:3])
+  expect_equal(dimnames(draws)$param, dimnames(point)$param)
+
+  # The draw distribution should sit around the point estimate, within each
+  # subject's own spread: the mean of the draws is not the value at the
+  # estimate -- with 30 subjects the population sd's posterior is skewed, and
+  # a subject's draws' mean sat 0.49-0.62 from it, about half its sd, which
+  # a bound of 0.5 failed by its seed -- but a point outside the bulk would
+  # be the wrong distribution...
+  centres <- apply(draws[, , 1, drop = FALSE], 2, mean)
+  spread <- apply(draws[, , 1, drop = FALSE], 2, sd)
+  expect_lt(max(abs(centres - point[1, , 1]) / spread), 2)
+  # ...and actually have spread. Reporting only the point estimate was the gap:
+  # a subject parameter carries uncertainty from the population parameters as
+  # well as from its own conditional distribution.
+  expect_true(all(apply(draws[, , 1, drop = FALSE], 2, sd) > 0))
+})
+
+test_that("the raw vector reaches every index the layout references", {
+  # Three separate bugs of this shape have shipped into this branch: a level's
+  # population scales, then the TI-predictor coefficients, each indexed past
+  # the end of a vector sized from only part of the layout. Neither failed
+  # usefully. The invariant is asserted directly so the next one cannot.
+  model <- .laplace_nested_model()
+  dat <- .laplace_nested_data()
+  spec <- suppressMessages(ctFit(dat, model, backend = "julia",
+    intoverpop = "laplace", fit = FALSE))
+  laplace <- spec$laplace
+
+  reach <- c(spec$parameter_table$parnumber, spec$ti_effects$coefficient,
+    unlist(lapply(laplace$levels, function(x)
+      c(x$re_index, x$sd_index, x$cor_index))))
+  expect_lte(max(reach, na.rm = TRUE),
+    max(laplace$npar, spec$ti_effects$coefficient, na.rm = TRUE))
+
+  # And the check itself fires rather than sitting inert.
+  broken <- laplace
+  broken$levels[[2]]$sd_index <- 999L
+  expect_error(ctsem:::.ctJuliaCheckLayout(spec$parameter_table, broken,
+    spec$ti_effects, laplace$npar), "reach raw parameter 999")
+})
+
+test_that("ctKalman on a Laplace fit selects which levels it conditions on", {
+  skip_without_julia()
+  model <- .laplace_nested_model()
+  dat <- .laplace_nested_data(nstudy = 5, npersub = 4)
+  fit <- suppressMessages(suppressWarnings(ctFit(dat, model, backend = "julia",
+    intoverpop = "laplace", optimcontrol = list(estonly = TRUE))))
+
+  # A Laplace fit can be filtered, so its prior residuals are available -- and
+  # they are conditioned on each subject's mode from their whole record, which
+  # is a different quantity from the augmented route's filtered residuals and
+  # is labelled as such.
+  expect_false(is.null(fit$priorerrors))
+  expect_match(attr(fit$priorerrors, "conditioning"), "whole record")
+
+  study <- dat$study[match(unique(dat$subject), dat$subject)]
+  first_of <- function(k) { first <- !duplicated(k$id); k$yprior[1, first, 1] }
+  # The *prior* prediction at each subject's first row, because that is driven
+  # by the parameters alone. The smoothed one uses the subject's own data
+  # whatever the parameters, so it would look nearly identical at every level
+  # and would not test anything.
+  levels <- lapply(c("subject", "study", "population"), function(lv)
+    first_of(suppressMessages(ctKalmanArray(fit, pointest = TRUE,
+      randomEffects = lv))))
+  names(levels) <- c("subject", "study", "population")
+
+  # Naming a level includes it and everything outside it, and zeroes what is
+  # inside: subjects differ; study-level trajectories are shared within a study
+  # but differ between them; population is one trajectory for everyone.
+  expect_gt(stats::sd(levels$subject), 0)
+  expect_equal(max(tapply(levels$study, study, function(x) diff(range(x)))), 0)
+  expect_gt(stats::sd(levels$study), 0)
+  expect_equal(stats::sd(levels$population), 0)
+  # Including the subject level must actually add something over the study one.
+  expect_gt(stats::sd(levels$subject - levels$study[match(study, study)]), 0)
+
+  expect_error(suppressMessages(ctKalmanArray(fit, pointest = TRUE,
+    randomEffects = "nope")), "must be 'population' or one of the model's id")
+})
+
+test_that("unsupported ways of asking for Laplace fail rather than doing something else", {
+  model <- .laplace_test_model()
+  dat <- .laplace_test_data(nsubjects = 4, nobs = 4)
+
+  expect_error(suppressMessages(ctFit(dat, model, backend = "stan",
+    intoverpop = "laplace", fit = FALSE)), "requires backend='julia'")
+
+  nonvarying <- model
+  nonvarying$pars$indvarying <- FALSE
+  expect_error(suppressMessages(ctFit(dat, nonvarying, backend = "julia",
+    intoverpop = "laplace", fit = FALSE)), "nothing to integrate over")
+
+})
+
+test_that("intoverpop values mean what they say", {
+  model <- .laplace_test_model()
+  dat <- .laplace_test_data(nsubjects = 4, nobs = 4)
+
+  # TRUE integrates the random effects out by the Laplace route, as 'auto'
+  # does when optimizing: on this model, whose only random effect shifts a
+  # manifest mean with a Gaussian indicator, inside the subject's filter.
+  # 'augmented' names the carrier states.
+  logical_spec <- suppressMessages(ctFit(dat, model, backend = "julia",
+    intoverpop = TRUE, fit = FALSE))
+  named_spec <- suppressMessages(ctFit(dat, model, backend = "julia",
+    intoverpop = "augmented", fit = FALSE))
+  auto_spec <- suppressMessages(ctFit(dat, model, backend = "julia",
+    intoverpop = "auto", fit = FALSE))
+
+  expect_false(is.null(logical_spec$laplace$hybrid))
+  expect_false(is.null(auto_spec$laplace$hybrid))
+  expect_null(named_spec$laplace)
+  expect_identical(logical_spec$args$resolved$intoverpop, "laplace")
+  expect_identical(auto_spec$args$resolved$intoverpop, "laplace")
+  expect_identical(named_spec$args$resolved$intoverpop, "augmented")
+
+  # A random effect on DRIFT is a Laplace coordinate under TRUE; 'augmented'
+  # still names the filter.
+  nonlinear <- model
+  nonlinear$pars$indvarying[nonlinear$pars$matrix %in% "DRIFT" &
+    is.na(nonlinear$pars$value)] <- TRUE
+  nonlinear_spec <- suppressMessages(ctFit(dat, nonlinear, backend = "julia",
+    intoverpop = TRUE, fit = FALSE))
+  expect_false(is.null(nonlinear_spec$laplace))
+  forced <- suppressMessages(ctFit(dat, nonlinear, backend = "julia",
+    intoverpop = "augmented", fit = FALSE))
+  expect_null(forced$laplace)
+
+  # 'none' is FALSE's name: sampling only, refused when optimizing.
+  expect_error(suppressMessages(ctFit(dat, model, backend = "julia",
+    intoverpop = "none", optimize = TRUE, fit = FALSE)), "optimize=FALSE to sample")
+  expect_error(suppressMessages(ctFit(dat, model, backend = "julia",
+    intoverpop = FALSE, optimize = TRUE, fit = FALSE)), "optimize=FALSE to sample")
+})
+
+# ---------------------------------------------------------------------------
+# The user-facing surface
+# ---------------------------------------------------------------------------
+#
+# Everything above this point asserts on numbers the engine returns. That left
+# a gap: four defects shipped in the path between a fit and what a user
+# actually sees, and none of them was a wrong number. Each produced a
+# well-formed object that was wrong in a way only visible on use -- a
+# specification quietly rebuilt as a different model, a data frame whose
+# `value` column became a list, a print method that emitted thousands of rows
+# of draws, an argument that was documented but never wired up.
+#
+# The tests below are the invariants that would have caught them, and they are
+# deliberately structural rather than numeric: the failures were all "right
+# shape, wrong content" or "wrong shape, no error", which value assertions on
+# the engine cannot see.
+
+.laplace_nested_fit <- function() .laplace_cached("nested", suppressMessages(
+  ctFit(.laplace_nested_data(), .laplace_nested_model(), backend = "julia",
+    intoverpop = "laplace", optimcontrol = list(finishsamples = 100))))
+
+test_that("re-preparing a specification preserves what the fit is", {
+  skip_without_julia()
+  fit <- .laplace_nested_fit()
+  fitted <- ctsem:::.ctBackendSpec(fit)
+  # Any non-default `subjects` or `timestep` makes `.ctBackendKalmanSpec`
+  # rebuild the specification from the data rather than reuse the fit's. That
+  # rebuild is the one step in prediction that can disagree with the fit, and
+  # it silently did: `.ctJuliaPrepare` defaults to augmenting the state, so a
+  # Laplace fit came back as a different model.
+  rebuilt <- ctsem:::.ctBackendKalmanSpec(fit, subjects = 1:5)
+
+  expect_false(is.null(rebuilt$laplace))
+  expect_equal(ctsem:::.ctBackendIntOverPop(rebuilt),
+    ctsem:::.ctBackendIntOverPop(fitted))
+  expect_equal(rebuilt$nlatent_augmented, rebuilt$nlatent)
+
+  # Group membership is allowed to change -- five subjects are not thirty --
+  # but nothing describing the *model* may.
+  for (l in seq_along(fitted$laplace$levels)) {
+    for (field in c("name", "re_index", "sd_index", "cor_index", "sd_scale",
+        "param", "nrandom")) {
+      expect_equal(rebuilt$laplace$levels[[l]][[field]],
+        fitted$laplace$levels[[l]][[field]],
+        info = paste("level", l, field))
+    }
+  }
+  expect_equal(rebuilt$laplace$npar, fitted$laplace$npar)
+})
+
+test_that("a prediction does not depend on how it was asked for", {
+  skip_without_julia()
+  fit <- .laplace_nested_fit()
+  # The whole-fit path returns the fit's own specification; naming subjects
+  # rebuilds one. Asking the same question two ways has to give one answer, and
+  # this is the cheapest assertion that covers every property re-preparation
+  # could drop -- present and future, without naming them.
+  all <- suppressMessages(ctPredict(fit, subjects = 1:40, timestep = "asdata"))
+  some <- suppressMessages(ctPredict(fit, subjects = c(2, 9, 31), timestep = "asdata"))
+
+  keep <- all[all$Subject %in% c(2, 9, 31) & all$Element %in% "yprior", ]
+  got <- some[some$Element %in% "yprior", ]
+  keep <- keep[order(keep$Subject, keep$Time), ]
+  got <- got[order(got$Subject, got$Time), ]
+  expect_equal(nrow(got), nrow(keep))
+  expect_equal(got$value, keep$value, tolerance = 1e-8)
+})
+
+test_that("the random effects used are the fitted ones, whatever is filtered", {
+  skip_without_julia()
+  fit <- .laplace_nested_fit()
+  pars <- ctSubjectPars(fit)
+  subs <- c(1, 12, 27)
+
+  # At a subject's first row the expectation is driven by its parameters and
+  # not yet by its data, so it reports the random effects the trajectory was
+  # built from. Withholding observations must not change them: a mode is
+  # defined relative to the data it was *estimated* from, and re-solving it
+  # against withheld data collapses it to zero -- which silently turned every
+  # subject into the average one, exactly when a per-subject prediction was
+  # what was being asked for.
+  firstrow <- function(...) {
+    k <- suppressMessages(ctPredict(fit, subjects = subs, ...))
+    v <- k[k$Element %in% "yprior", ]
+    v <- v[order(v$Subject, v$Time), ]
+    unlist(lapply(split(v, v$Subject), function(d) d$value[1L]))
+  }
+  baseline <- firstrow(timestep = "asdata")
+  expect_equal(firstrow(timestep = 0.5, timerange = c(0, 4)), baseline,
+    tolerance = 1e-8)
+  expect_equal(firstrow(timestep = "asdata", removeObs = TRUE), baseline,
+    tolerance = 1e-8)
+  expect_equal(firstrow(timestep = 0.5, timerange = c(0, 4), removeObs = TRUE),
+    baseline, tolerance = 1e-8)
+
+  # And they are the same effects `ctSubjectPars` reports, rather than a second
+  # copy computed some other way.
+  mm <- pars[1, subs, "mmean"]
+  expect_equal(unname(baseline), unname(mm), tolerance = 1e-6)
+})
+
+test_that("randomEffects reaches the engine and selects a level", {
+  skip_without_julia()
+  fit <- .laplace_nested_fit()
+  # It was documented on `ctBackendKalman` and unreachable from `ctPredict`,
+  # which sends `...` to plot(). A test that only called the inner function
+  # would have passed.
+  subs <- c(1, 6, 11, 16)
+  first <- function(lev) {
+    k <- suppressMessages(ctPredict(fit, subjects = subs, timestep = "asdata",
+      randomEffects = lev))
+    v <- k[k$Element %in% "yprior", ]
+    v <- v[order(v$Subject, v$Time), ]
+    unname(unlist(lapply(split(v, v$Subject), function(d) d$value[1L])))
+  }
+  subject <- first("subject"); study <- first("study"); population <- first("population")
+
+  # Subject effects give every subject its own; population gives them all one.
+  expect_gt(stats::sd(subject), 0)
+  expect_equal(population, rep(population[1L], length(population)),
+    tolerance = 1e-8)
+  # The study level sits between: not the subject answer, and these four
+  # subjects are in four different studies, so not the population one either.
+  expect_false(isTRUE(all.equal(study, subject)))
+  expect_false(isTRUE(all.equal(study, population)))
+
+  expect_error(suppressMessages(ctPredict(fit, subjects = 1,
+    randomEffects = "nosuchlevel")), "not 'nosuchlevel'")
+})
+
+test_that("a prediction data frame is numeric and its plot prints", {
+  skip_without_julia()
+  skip_if_not_installed("ggplot2")
+  fit <- .laplace_nested_fit()
+  # `meltkalman` melts everything it is handed, and `ctKalmanArray` also
+  # returns a list of per-subject matrices. Melting that made `value` a list
+  # column, which the final rbind then spread over the whole frame. It only
+  # happened with more than one subject, and `plot()` still *returned* a
+  # ggplot -- only printing it failed -- so nothing noticed.
+  for (subs in list(1L, c(1L, 2L, 3L))) {
+    k <- suppressMessages(ctPredict(fit, subjects = subs, timestep = "asdata"))
+    expect_true(is.numeric(k$value),
+      info = paste(length(subs), "subject(s)"))
+    expect_false(is.list(k$value))
+    p <- plot(k)
+    expect_s3_class(p, "ggplot")
+    # Rendering, not merely constructing: a list `value` column builds a
+    # ggplot happily and only fails when something tries to draw it. Warnings
+    # are expected -- interpolated rows carry no observation.
+    tmp <- tempfile(fileext = ".png")
+    expect_error(suppressWarnings(suppressMessages(
+      ggplot2::ggsave(tmp, p, width = 5, height = 3))), NA)
+    expect_true(file.exists(tmp))
+    unlink(tmp)
+  }
+})
+
+test_that("a multilevel summary prints its tables and not its payload", {
+  skip_without_julia()
+  fit <- .laplace_nested_fit()
+  s <- summary(fit)
+  # `$randomEffects` is the machine-readable per-level payload. It stayed
+  # reachable, and the printed summary stayed a summary: printing the draws put
+  # thousands of lines ahead of the tables that summarise them.
+  expect_false(is.null(s$randomEffects))
+  expect_equal(length(s$randomEffects), 2L)
+
+  out <- utils::capture.output(print(s))
+  expect_lt(length(out), 200L)
+  expect_true(any(grepl("Random-effects standard deviations (subject)", out,
+    fixed = TRUE)))
+  expect_true(any(grepl("Random-effects standard deviations (study)", out,
+    fixed = TRUE)))
+  # Asked for by name it is still printable, which is what keeps the exclusion
+  # a display choice rather than a removal.
+  expect_gt(length(utils::capture.output(
+    print(s, sections = "randomEffects"))), 10L)
+})
+
+test_that("optimising without integrating the random effects is refused", {
+  skip_without_julia()
+  # `intoverpop=FALSE` leaves each subject's random effects as free parameters
+  # of the objective, so maximising it maximises over those effects too and the
+  # population variance it lands on is whatever makes them most likely --
+  # zero, or as near as the data allow. Sampling is what handles that model,
+  # which is why `intoverpop='auto'` resolves to FALSE exactly when `optimize`
+  # is. Refused rather than silently corrected, because both readings of the
+  # request are plausible and guessing answers a different question.
+  set.seed(3)
+  d <- do.call(rbind, lapply(1:8, function(i) data.frame(id = i,
+    time = 0:4, Y1 = stats::rnorm(5))))
+  m <- suppressMessages(ctModel(type = "ct", n.latent = 1, n.manifest = 1,
+    manifestNames = "Y1", latentNames = "eta1", LAMBDA = matrix(1),
+    MANIFESTMEANS = matrix(0), CINT = matrix("cint"), T0MEANS = matrix(0)))
+  m$pars$indvarying <- FALSE
+  m$pars$indvarying[m$pars$param %in% "cint"] <- TRUE
+  expect_error(suppressWarnings(suppressMessages(
+    ctFit(d, m, backend = "julia", cores = 1, intoverpop = FALSE,
+      optimcontrol = list(estonly = TRUE)))),
+    "intoverpop=FALSE with optimize=TRUE")
+  # The same model with the effects integrated is fine, which is what makes
+  # the refusal a guard rather than a limitation.
+  expect_error(suppressWarnings(suppressMessages(
+    ctFit(d, m, backend = "julia", cores = 1, intoverpop = "augmented",
+      optimcontrol = list(estonly = TRUE)))), NA)
+})
+
+# --- the inner solve's own controls ------------------------------------------
+
+# A random effect on a NONLINEAR drift, which is what makes the inner problem
+# non-quadratic and so gives the inner Newton something to iterate on. On the
+# linear-Gaussian fixture above the integrand is Gaussian in `u`, Newton lands
+# on the mode in a single step, and `inner_maxiter = 1` already converges --
+# so every test below would pass there while exercising nothing.
+.laplace_nonlinear_model <- function() {
+  model <- suppressWarnings(suppressMessages(ctModel(
+    type = "ct", manifestNames = "Y1", latentNames = "eta1",
+    LAMBDA = matrix(1),
+    DRIFT = matrix("drift|-log1p_exp(-param)"),
+    T0MEANS = matrix(0), CINT = matrix(0), T0VAR = matrix(0.5),
+    MANIFESTMEANS = matrix("mmean"))))
+  model$pars$indvarying <- FALSE
+  model$pars$indvarying[model$pars$param %in% c("drift", "mmean")] <- TRUE
+  model
+}
+
+.laplace_nonlinear_data <- function(nsubjects = 40L, nobs = 7L) {
+  set.seed(20260914)
+  do.call(rbind, lapply(seq_len(nsubjects), function(i) {
+    b <- stats::rnorm(1, 1.0, 0.8)
+    d <- -exp(stats::rnorm(1, log(0.45), 0.35))
+    st <- stats::rnorm(1, 0, 0.5)
+    out <- numeric(nobs)
+    for (t in seq_len(nobs)) {
+      if (t > 1) st <- exp(d) * st + stats::rnorm(1, 0, 0.4)
+      out[t] <- st + b + stats::rnorm(1, 0, 0.3)
+    }
+    data.frame(id = i, time = seq_len(nobs) - 1, Y1 = out)
+  }))
+}
+
+test_that("the inner controls are julia-only and reach the engine", {
+  # No julia needed: this is the control-list vocabulary, checked before any
+  # data preparation happens.
+  expect_error(.ctFitCheckControls(
+    list(laplace_inner_maxiter = 400L, laplace_inner_tol = 1e-6), "julia"), NA)
+  # Refused by name on stan, which augments the latent state and has no inner
+  # solve at all -- rather than accepted and ignored, which is the shape of
+  # defect this registry exists to prevent.
+  expect_error(.ctFitCheckControls(list(laplace_inner_maxiter = 400L), "stan"),
+    "no such inner solve")
+  expect_error(.ctFitCheckControls(list(laplace_inner_tol = 1e-6), "stan"),
+    "no such inner solve")
+  expect_error(.ctFitCheckControls(list(laplace_inner_maxitr = 400L), "julia"),
+    "Unrecognised optimcontrol name")
+
+  expect_error(.ctJuliaLaplaceInner(list(inner_maxiter = 0)), "positive integer")
+  expect_error(.ctJuliaLaplaceInner(list(inner_maxiter = NA)), "positive integer")
+  # Zero is refused rather than read as "off". An absolute tolerance of zero is
+  # exact equality, which no inner gradient reaches, so accepting it would turn
+  # the criterion off by making it unmeetable -- the opposite of what a caller
+  # passing zero means.
+  expect_error(.ctJuliaLaplaceInner(list(inner_tol = 0)), "positive number")
+  expect_equal(.ctJuliaLaplaceInner(NULL), list())
+  expect_equal(.ctJuliaLaplaceInner(list()), list())
+  expect_equal(.ctJuliaLaplaceInner(list(inner_maxiter = 400)),
+    list(inner_maxiter = 400L))
+})
+
+test_that("the inner settings are part of the objective's identity", {
+  skip_without_julia()
+  model <- .laplace_test_model()
+  dat <- .laplace_test_data(nsubjects = 8, nobs = 5)
+
+  base <- .ctJuliaPrepare(dat, model, intoverpop = "laplace")
+  tuned <- .ctJuliaPrepare(dat, model, intoverpop = "laplace",
+    laplacecontrol = list(inner_maxiter = 400L, inner_tol = 1e-6))
+
+  # Absent unless asked for, so every existing model hashes exactly as it did
+  # and keeps whatever objective the cache already holds for it.
+  expect_null(base$laplace$inner)
+  expect_equal(tuned$laplace$inner,
+    list(inner_maxiter = 400L, inner_tol = 1e-6))
+  expect_equal(.ctJuliaObjectiveKey(base),
+    .ctJuliaObjectiveKey(.ctJuliaPrepare(dat, model, intoverpop = "laplace")))
+  # And separated once they are. The inner tolerance changes the *value* the
+  # objective returns, so two specifications differing only in it are not the
+  # same function -- without this the second would be handed the first's cached
+  # objective and silently return the first's likelihood, which is how
+  # `covmatcode` came to be in this key.
+  expect_false(identical(.ctJuliaObjectiveKey(base),
+    .ctJuliaObjectiveKey(tuned)))
+})
+
+test_that("a laplace fit reports the inner budget it was solved with", {
+  skip_without_julia()
+  model <- .laplace_test_model()
+  dat <- .laplace_test_data(nsubjects = 10, nobs = 5)
+
+  fit <- suppressWarnings(suppressMessages(ctFit(dat, model, backend = "julia",
+    intoverpop = "laplace", optimcontrol = list(estonly = TRUE))))
+  # Reported rather than left to be inferred from `args$optimcontrol`, where an
+  # unset name means "the engine default" and the engine default has already
+  # changed once -- 50 to 200, when the inner start moved to the origin.
+  expect_equal(fit$laplace$inner_maxiter, 200L)
+  expect_equal(fit$laplace$inner_tol, 1e-10)
+
+  tuned <- suppressWarnings(suppressMessages(ctFit(dat, model,
+    backend = "julia", intoverpop = "laplace",
+    optimcontrol = list(estonly = TRUE, laplace_inner_maxiter = 500L,
+      laplace_inner_tol = 1e-8))))
+  expect_equal(tuned$laplace$inner_maxiter, 500L)
+  expect_equal(tuned$laplace$inner_tol, 1e-8)
+  # A tolerance this far above the inner gradient the solve reaches anyway
+  # changes nothing about where the modes land, which is what makes the two
+  # fits comparable at all.
+  expect_equal(tuned$estimate$loglik, fit$estimate$loglik, tolerance = 1e-6)
+})
+
+test_that("the hessian raises the inner budget rather than returning NaN", {
+  skip_without_julia()
+  model <- .laplace_nonlinear_model()
+  dat <- .laplace_nonlinear_data()
+
+  fit <- suppressWarnings(suppressMessages(ctFit(dat, model, backend = "julia",
+    intoverpop = "laplace", optimcontrol = list(estonly = TRUE))))
+  skip_if_not(isTRUE(fit$laplace$inner_converged),
+    "fixture did not solve its modes")
+  # The fixture earns its place only if the inner solve needs iterating, which
+  # the cold budget of one below measures. The fit's own count does not: an
+  # optimisation starts each unit from its mode at the last accepted point,
+  # one Newton iteration at the optimum.
+
+  module <- .ctJuliaModule(fit$model_spec$project)
+  objective <- .ctJuliaObjective(fit)
+  raw <- fit$estimate$raw
+  setbudget <- function(n) invisible(JuliaConnectoR::juliaCall("setfield!",
+    objective, as.symbol("inner_maxiter"), as.integer(n)))
+  getbudget <- function() as.integer(JuliaConnectoR::juliaCall("getfield",
+    objective, as.symbol("inner_maxiter")))
+  complete <- function(H) sum(apply(H, 2, function(cc) all(is.finite(cc))))
+
+  setbudget(200L)
+  full <- .ctBackendJuliaValue(module$ctsem_laplace_hessian(objective,
+    .ctJuliaVector(raw)))
+  expect_equal(complete(full), ncol(full))
+
+  # `retries = 0` is the behaviour before the escalation existed, and it is the
+  # measurement that says the escalation is doing the work rather than the
+  # starved budget having been sufficient all along. Every column NaN is not a
+  # fallback anyone can use: it is what a 571-subject fit reported after a
+  # lengthy exact-Hessian pass.
+  # A budget of one. How many columns two iterations happen to solve depends
+  # on where the estimate lands -- none at the old optimiser's estimate, all
+  # seven at the new one's -- whereas one Newton iteration from the origin
+  # cannot reach a mode that is not at the origin.
+  # Cold: a warm start from the estimate's own modes (the default) reaches
+  # every mode in a budget this small, which is what it is for and not what
+  # this test measures.
+  setbudget(1L)
+  bare <- .ctBackendJuliaValue(JuliaConnectoR::juliaCall(
+    "ContinuousTimeSEM.ctsem_laplace_hessian", objective, .ctJuliaVector(raw),
+    retries = 0L, warm = FALSE))
+  expect_equal(complete(bare), 0L)
+
+  setbudget(2L)
+  rescued <- suppressMessages(.ctBackendJuliaValue(
+    module$ctsem_laplace_hessian(objective, .ctJuliaVector(raw))))
+  expect_equal(complete(rescued), ncol(rescued))
+  # The same matrix, not merely a finite one. The differencing points are 1e-4
+  # from a point whose modes were found, so a unit that only ran out of
+  # iterations there reaches the same mode given more of them.
+  expect_equal(rescued, full, tolerance = 1e-8)
+
+  # The budget is a field of a mutable objective the caller keeps, and the
+  # escalation is undone whether or not the column succeeded.
+  expect_equal(getbudget(), 2L)
+  setbudget(200L)
+})
+
+test_that("gradient = 'forward' still gives a Laplace fit's certification its curvature", {
+  skip_without_julia()
+  # `ctsem_hessian_forward` has no method for the Laplace objective, and on
+  # this route `gradient` chooses nothing about differentiation. Asking for
+  # 'forward' sent the certification's Hessian there: a MethodError inside a
+  # `try`, a NULL Hessian, and a correction loop that ended before it had
+  # anything to certify -- so no verdict, and nothing to continue from.
+  spec <- suppressWarnings(suppressMessages(ctFit(.laplace_test_data(),
+    .laplace_test_model(), backend = "julia", intoverpop = "laplace",
+    fit = FALSE)))
+  npar <- .ctBackendNpar(spec)
+  at <- rep(0.1, npar)
+  forward <- .ctBackendHessianAt(spec, at, gradient = "forward")
+  expect_true(is.matrix(forward))
+  expect_equal(forward, .ctBackendHessianAt(spec, at, gradient = "adjoint"))
+
+  # Three iterations from zero: far enough out that the optimiser's finish
+  # hands back no Hessian, so the loop has to compute its own. Unfixed, it
+  # computed none. Whether the loop then continues is the verdict's business,
+  # not this test's, and at this point it is not stable: 'adjoint' continued to
+  # the optimum in one session and stopped on 'notstationary' in a fresh one,
+  # and two identical fits in one session stopped with different probes.
+  # Inferred, not verified, to come from the inner modes the Laplace Hessian
+  # warm-starts from.
+  fit <- suppressWarnings(suppressMessages(ctFit(.laplace_test_data(),
+    .laplace_test_model(), backend = "julia", intoverpop = "laplace",
+    inits = rep(0, npar), optimcontrol = list(gradient = "forward",
+      maxiter = 3L, checks = FALSE, finishsamples = 50))))
+  expect_gte(fit$optim$hessian_evaluations, 1L)
+})
+
+test_that("a Laplace fit's certification reads the finish's Hessian and forms none of its own", {
+  skip_without_julia()
+  # A Laplace Hessian is 2 npar gradients. The finish takes one where L-BFGS
+  # hands over -- early, on its predicted gain once the stage has spent a
+  # Hessian's cost, or where it stops -- walks on it, and forms another only
+  # where the walk ends past `hessianreuse` from it; the certification and
+  # the standard errors read the last, and form no other. Before 2026-09-25
+  # no finish ran on this route and R formed the certification's Hessian
+  # itself, so the engine reported none. One at the hand-over and one where
+  # the walk ends is the most a fit this small should take.
+  fit <- suppressWarnings(suppressMessages(ctFit(.laplace_test_data(),
+    .laplace_test_model(), backend = "julia", intoverpop = "laplace",
+    optimcontrol = list(checks = FALSE, finishsamples = 50))))
+  expect_gte(fit$optim$newton_hessians, 1L)
+  expect_lte(fit$optim$newton_hessians, 2L)
+  expect_equal(fit$optim$hessian_evaluations, fit$optim$newton_hessians)
+  expect_length(fit$optim$corrections, 0L)
+  expect_equal(fit$uncertainty$certification$status, "certified")
+  # Where it was taken, and that it describes the estimate the fit reports.
+  expect_lte(fit$optim$hessian_distance, .ctBackendHessianReuse())
+  expect_identical(.ctBackendHessian(fit, as.numeric(fit$estimate$raw)),
+    fit$uncertainty$hessian)
+})
+
+# Weak data for a nonlinear random effect: 40 subjects, six waves, a random
+# `-log1p_exp` drift beside random T0MEANS and CINT. The subjects are simulated
+# here, not by ctGenerate, whose draw stream moves under unrelated commits.
+.laplace_weak_data <- function(seed = 2L, nsubjects = 40L, ntimes = 6L) {
+  set.seed(seed)
+  baseline <- stats::rnorm(nsubjects, 2, 2)
+  start <- stats::rnorm(nsubjects, baseline / 2, 1)
+  drift <- -log1p(exp(-stats::rnorm(nsubjects, 1 + (baseline - 2) / 2, 1)))
+  rows <- lapply(seq_len(nsubjects), function(i) {
+    a <- drift[i]; decay <- exp(a)
+    intercept <- (baseline[i] / a) * (decay - 1)
+    innovation <- sqrt(0.25 * (exp(2 * a) - 1) / (2 * a))
+    latent <- numeric(ntimes); latent[1] <- start[i]
+    for (t in seq_len(ntimes - 1L)) {
+      latent[t + 1L] <- decay * latent[t] + intercept +
+        stats::rnorm(1, 0, innovation)
+    }
+    data.frame(id = i, time = seq_len(ntimes) - 1L,
+      Y1 = latent + stats::rnorm(ntimes, 0, 0.5))
+  })
+  do.call(rbind, rows)
+}
+
+test_that("near-singular random-effect curvature is reported, and changes nothing", {
+  skip_without_julia()
+  model <- suppressMessages(ctModel(silent = TRUE, type = "ct", CINT = "cint",
+    MANIFESTMEANS = 0, LAMBDA = matrix(1),
+    DRIFT = "drift|-log1p_exp(-param)|TRUE"))
+  spec <- suppressWarnings(suppressMessages(ctFit(.laplace_weak_data(), model,
+    backend = "julia", intoverpop = "laplace", fit = FALSE)))
+  module <- .ctJuliaModule(spec$project)
+  objective <- .ctJuliaObjective(spec)
+  # Where a total-floor fit of these data converged: one unit parked at
+  # eigenvalues (8.5e-4, 14.9, 79.0), logdet = 0 to ten digits, which is where
+  # the total prior floor lets the optimiser rest while the unit's Laplace term
+  # is 3.1 nats above its exact integral.
+  raw <- c(0.127421404395785, 2.72694414423615, -1.14068954877124,
+    -1.61124260961682, 0.181949396643791, -0.379492126290006, 1.2518601566922,
+    -0.261116183475529, 0.501589410182815, 0.472211311761145, 0.16969291528676)
+  first <- module$ctsem_laplace_evaluate(objective, .ctJuliaVector(raw),
+    gradient = TRUE)
+  cond <- .ctJuliaLaplaceConditioning(JuliaConnectoR::juliaGet(
+    module$ctsem_laplace_conditioning(objective))$min_eigenvalue)
+  expect_gte(cond$near_singular, 1L)
+  expect_gt(cond$below_one, cond$near_singular)
+  expect_lt(min(cond$min_eigenvalue), 0.01)
+  # Report-time only: asking changes neither the value nor the gradient.
+  again <- module$ctsem_laplace_evaluate(objective, .ctJuliaVector(raw),
+    gradient = TRUE)
+  expect_identical(.ctBackendJuliaValue(again$value),
+    .ctBackendJuliaValue(first$value))
+  expect_equal(as.numeric(.ctBackendJuliaValue(again$gradient)),
+    as.numeric(.ctBackendJuliaValue(first$gradient)), tolerance = 1e-12)
+
+  # And a concave case reports nothing, on the fit and in its print.
+  fit <- .laplace_exact_fit()
+  expect_equal(fit$laplace$conditioning$below_one, 0L)
+  expect_equal(fit$laplace$conditioning$near_singular, 0L)
+  expect_false(any(grepl("near-singular", capture.output(print(fit)))))
+})
+
+test_that("laplace_soft_directions is validated, refused by name where it cannot apply", {
+  # No julia needed: control vocabulary and validation.
+  expect_error(.ctFitCheckControls(list(laplace_soft_directions = "quadrature"), "julia"), NA)
+  # Neither value describes a stan fit, which has no Laplace term.
+  expect_error(.ctFitCheckControls(list(laplace_soft_directions = "logdet_floor"), "stan"),
+    "no Laplace term")
+  expect_error(.ctFitCheckControls(list(laplace_soft_directions = "quadrature"), "stan"),
+    "no Laplace term")
+  # Recorded whenever given, default included: an absent floor is reserved for
+  # the historical 'logdet_floor' of a specification that predates the field.
+  expect_equal(.ctJuliaLaplaceInner(list(soft_directions = "quadrature")),
+    list(soft_directions = "quadrature"))
+  expect_equal(.ctJuliaLaplaceInner(list(soft_directions = "logdet_floor")),
+    list(soft_directions = "logdet_floor"))
+  # A specification saved before the rename records `floor` instead.
+  expect_equal(.ctJuliaLaplaceInner(list(floor = "gated")),
+    list(soft_directions = "quadrature"))
+  expect_equal(.ctJuliaLaplaceInner(list(floor = "total")),
+    list(soft_directions = "logdet_floor"))
+  expect_equal(.ctJuliaLaplaceInner(list()), list())
+  expect_error(.ctJuliaLaplaceInner(list(soft_directions = "eigen")),
+    "'quadrature' or 'logdet_floor'")
+  expect_error(.ctJuliaPrepare(.laplace_test_data(nsubjects = 4, nobs = 3),
+    .laplace_test_model(), intoverpop = "augmented",
+    laplacecontrol = list(soft_directions = "quadrature")), "no Laplace term")
+  expect_error(.ctJuliaPrepare(.laplace_test_data(nsubjects = 4, nobs = 3),
+    .laplace_test_model(), intoverpop = "augmented",
+    laplacecontrol = list(soft_directions = "logdet_floor")), "no Laplace term")
+})
+
+# The objective's own floor, read from the engine.
+.laplace_objective_rule <- function(objective) {
+  JuliaConnectoR::juliaCall("String", JuliaConnectoR::juliaCall("getfield",
+    objective, as.symbol("soft_directions")))
+}
+
+test_that("a fit under the soft-direction quadrature carries its rule to post-fit routes, and leaves the session alone", {
+  skip_without_julia()
+  model <- suppressMessages(ctModel(silent = TRUE, type = "ct", CINT = "cint",
+    MANIFESTMEANS = 0, LAMBDA = matrix(1),
+    DRIFT = "drift|-log1p_exp(-param)|TRUE"))
+  dat <- .laplace_weak_data()
+  # From the total-floor estimate of these data (see the conditioning test),
+  # where one subject is near-singular and the two floors differ; a few
+  # iterations are enough, since what is tested is where the floor goes.
+  inits <- c(0.127421404395785, 2.72694414423615, -1.14068954877124,
+    -1.61124260961682, 0.181949396643791, -0.379492126290006, 1.2518601566922,
+    -0.261116183475529, 0.501589410182815, 0.472211311761145, 0.16969291528676)
+  fitwith <- function(...) suppressWarnings(suppressMessages(ctFit(dat, model,
+    backend = "julia", intoverpop = "laplace", inits = inits,
+    optimcontrol = list(estonly = TRUE, maxiter = 5L, ...))))
+  # 'logdet_floor' pinned on the fits either side of the default one: what is
+  # tested is that an objective under the quadrature leaves a later
+  # 'logdet_floor' fit alone.
+  before <- fitwith(laplace_soft_directions = "logdet_floor")
+  quad <- fitwith()
+  after <- fitwith(laplace_soft_directions = "logdet_floor")
+
+  expect_equal(before$laplace$soft_directions, "logdet_floor")
+  expect_equal(quad$laplace$soft_directions, "quadrature")
+  expect_equal(quad$model_spec$laplace$inner$soft_directions, "quadrature")
+  expect_true(is.integer(quad$laplace$soft_quadrature_units))
+  expect_equal(.laplace_objective_rule(.ctJuliaObjective(quad)), "quadrature")
+
+  # A 'logdet_floor' fit after one under the quadrature in the same session is
+  # still 'logdet_floor': the
+  # same estimate and log likelihood as the one before it, and its objective
+  # is on :total.
+  expect_equal(after$laplace$soft_directions, "logdet_floor")
+  expect_equal(.laplace_objective_rule(.ctJuliaObjective(after)), "logdet_floor")
+  # Equal rather than identical: with more than one thread the units are summed
+  # per worker slot, assigned at run time, so the last bit moves between runs.
+  expect_equal(after$estimate$loglik, before$estimate$loglik, tolerance = 1e-10)
+  expect_equal(as.numeric(after$estimate$raw), as.numeric(before$estimate$raw),
+    tolerance = 1e-8)
+
+  # The two floors really are different objectives. At the starting point one
+  # subject is near-singular, and the quadrature's objective scores it by its rule;
+  # the fit then moves, and at its estimate the two may agree.
+  module <- .ctJuliaModule(quad$model_spec$project)
+  under <- function(fit, at) .ctBackendJuliaValue(module$ctsem_laplace_evaluate(
+    .ctJuliaObjective(fit), .ctJuliaVector(as.numeric(at)), gradient = FALSE)$value)
+  expect_gt(under(after, inits) - under(quad, inits), 1)
+  expect_gte(as.integer(JuliaConnectoR::juliaCall("getfield",
+    .ctJuliaObjective(quad), as.symbol("soft_quadrature_units"))), 1L)
+
+  # ctLaplaceCheck evaluates the fit's own term, which is the quadrature's.
+  check <- suppressWarnings(ctLaplaceCheck(quad, nodes = 3L, correction = FALSE))
+  expect_equal(check$laplace, under(quad, quad$estimate$raw), tolerance = 1e-10)
+
+  # ctKalman re-prepares the specification, and the floor goes with it.
+  kspec <- ctsem:::.ctBackendKalmanSpec(quad)
+  expect_equal(kspec$laplace$inner$soft_directions, "quadrature")
+  expect_equal(.laplace_objective_rule(.ctJuliaObjective(kspec)), "quadrature")
+  k <- suppressWarnings(suppressMessages(ctKalman(quad, subjects = 1:2)))
+  expect_false(is.null(k))
+
+  # A fit saved before the floor was recorded carries none, and was fitted
+  # under 'logdet_floor'. Absent means that historical meaning on every route that
+  # rebuilds the objective, not the new default.
+  legacy <- quad
+  legacy$model_spec$laplace$inner$soft_directions <- NULL
+  expect_equal(.laplace_objective_rule(.ctJuliaObjective(legacy)), "logdet_floor")
+  lspec <- ctsem:::.ctBackendKalmanSpec(legacy)
+  expect_null(lspec$laplace$inner$soft_directions)
+  expect_equal(.laplace_objective_rule(.ctJuliaObjective(lspec)), "logdet_floor")
+  lcheck <- suppressWarnings(ctLaplaceCheck(legacy, nodes = 3L, correction = FALSE))
+  expect_equal(lcheck$laplace, under(before, legacy$estimate$raw), tolerance = 1e-10)
+  # One saved before the rename records `floor = 'gated'`, which is the
+  # quadrature.
+  renamed <- quad
+  renamed$model_spec$laplace$inner$soft_directions <- NULL
+  renamed$model_spec$laplace$inner$floor <- "gated"
+  expect_equal(.laplace_objective_rule(.ctJuliaObjective(renamed)), "quadrature")
+})
+
+test_that("the default rule and an explicit 'quadrature' build and cache the same objective", {
+  skip_without_julia()
+  model <- suppressMessages(ctModel(silent = TRUE, type = "ct", CINT = "cint",
+    MANIFESTMEANS = 0, LAMBDA = matrix(1),
+    DRIFT = "drift|-log1p_exp(-param)|TRUE"))
+  dat <- .laplace_weak_data()
+  specwith <- function(...) suppressWarnings(suppressMessages(ctFit(dat, model,
+    backend = "julia", intoverpop = "laplace", fit = FALSE,
+    optimcontrol = list(...))))
+  default <- specwith()
+  quad <- specwith(laplace_soft_directions = "quadrature")
+  total <- specwith(laplace_soft_directions = "logdet_floor")
+  expect_equal(default$laplace$inner$soft_directions, "quadrature")
+  # The key hashes what the builder sends, and the builder always sends the
+  # floor, so the default and the explicit value share one cached objective.
+  expect_equal(.ctJuliaObjectiveInputs(default)$laplace$soft_directions, "quadrature")
+  expect_identical(.ctJuliaObjectiveKey(default), .ctJuliaObjectiveKey(quad))
+  expect_false(identical(.ctJuliaObjectiveKey(default), .ctJuliaObjectiveKey(total)))
+  # And a specification with no rule recorded is keyed, and built, as
+  # 'logdet_floor'.
+  legacy <- default
+  legacy$laplace$inner$soft_directions <- NULL
+  expect_equal(.ctJuliaObjectiveInputs(legacy)$laplace$soft_directions, "logdet_floor")
+  expect_identical(.ctJuliaObjectiveKey(legacy), .ctJuliaObjectiveKey(total))
+  # Sampling the effects (intoverpop = FALSE, which the backend prepares as
+  # 'none') still has a Laplace term: the sampler is placed, and its metric
+  # built, by optimising the Laplace objective of this same specification. So
+  # it gets the same default. It used to record none, which that objective is
+  # built as -- 'logdet_floor'.
+  samplewith <- function(...) suppressWarnings(suppressMessages(ctFit(dat,
+    model, backend = "julia", intoverpop = FALSE, optimize = FALSE, fit = FALSE,
+    optimcontrol = list(...))))
+  none <- samplewith()
+  expect_equal(none$laplace$inner$soft_directions, "quadrature")
+  expect_equal(.ctJuliaObjectiveInputs(none)$laplace$soft_directions, "quadrature")
+  # And a floor asked for there is honoured, not refused.
+  expect_equal(samplewith(laplace_soft_directions = "logdet_floor")$laplace$inner$soft_directions, "logdet_floor")
+  # Rebuilding the specification -- ctKalman over some subjects, prediction on
+  # other data -- passes the recorded floor back in with the recorded route, so
+  # 'none' has to accept it there too.
+  rebuilt <- .ctJuliaPrepare(dat, model, intoverpop = "none",
+    laplacecontrol = none$laplace$inner)
+  expect_equal(rebuilt$laplace$inner$soft_directions, "quadrature")
+})

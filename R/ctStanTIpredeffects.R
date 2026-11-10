@@ -1,17 +1,10 @@
-ctStanTIpredParMats <- function(fit, tipvalues){
-  newpars <- fit$stanfit$rawest
-  effect <- matrix(fit$stanfit$transformedparsfull$TIPREDEFFECT[1,,], fit$standata$nparams,fit$standata$ntipred)
-  newpars[1:fit$standata$nparams] <- newpars[1:fit$standata$nparams] + effect %*% matrix(tipvalues)
-  
-  cp=stan_constrainsamples(fit$stanmodel,standata = fit$standata,samples = matrix(newpars,1),cores = 1)
-}
-
-  #' Get time independent predictor effect estimates
+#' Get time independent predictor effect estimates
 #' 
 #' Computes and plots combined effects and quantiles for effects of time independent predictors
 #' on subject level parameters of a ctStanFit object.
+#' \code{ctStanTIpredeffects} is maintained as a backward-compatible alias.
 #'
-#' @param fit fit object from \code{\link{ctStanFit}}
+#' @param fit fit object from \code{\link{ctFit}}
 #' @param returndifference logical. If FALSE, absolute parameter values are returned. 
 #' If TRUE, only the effect of the covariate (i.e. without the average value of the parameter)
 #' are returned. The former can be easier to interpret, but the latter are more likely to fit multiple plots together. 
@@ -27,6 +20,11 @@ ctStanTIpredParMats <- function(fit, tipvalues){
 #' predictor has been included, then you can specify both the linear and squared version. 
 #' The x axis of the plot (if generated) will be based off the first indexed predictor. To 
 #' check what predictors are in the model, run \code{fit$ctstanmodel$TIpredNames}.
+#' A smooth term (\code{s(age)} in \code{\link{ctModel}}'s \code{TIpredNames}) is
+#' selected by its covariate's name, \code{whichTIpreds = 'age'}, and is drawn
+#' over that covariate, with each person's own value at their covariate value
+#' as a point (returned as \code{$persons}): the spread of the points about the
+#' curve is what the smooth leaves to the person differences.
 #' @param parmatrices Logical. If TRUE (default), system matrices rather than specific parameters
 #' are referenced -- e.g. 'DRIFT' instead of a parameter name like drift12.
 #' @param whichpars if parmatrices==TRUE, character vector specifying which matrices, and potentially which 
@@ -49,19 +47,36 @@ ctStanTIpredParMats <- function(fit, tipvalues){
 #' to only calculate effects for subjects where the tipreds of the denoted index are less than 3).
 #' @return Either a three dimensional array of predictor effects, or nothing with a plot
 #' generated.
+#' @aliases ctStanTIpredeffects
 #' @export
 #'
 #' @examples
-#' if(w32chk()){
-#'
-#' ctStanTIpredeffects(ctstantestfit,
+#' ctTIpredEffects(ctstantestfit,
 #'  whichpars=c('CINT','dtDIFFUSION[2,2]'), plot=TRUE)
-#' }
-ctStanTIpredeffects<-function(fit,returndifference=FALSE, probs=c(.025,.5,.975),
+ctTIpredEffects<-function(fit,returndifference=FALSE, probs=c(.025,.5,.975),
   includeMeanUncertainty=FALSE,
   whichTIpreds=1,parmatrices=TRUE, whichpars='all', nsamples=100, timeinterval=1,
   nsubjects=20,filter=NA,plot=FALSE){
   
+  # The julia engine materialises every model matrix from a raw parameter
+  # vector directly (R/ctBackendSummary.R), so the grid-of-covariate-values
+  # sweep this function does is read through that rather than through
+  # stan_constrainsamples(); see R/ctBackendTIpredEffects.R.
+  if(inherits(fit, 'ctJuliaFit')) return(.ctBackendTIpredEffects(fit,
+    returndifference=returndifference, probs=probs,
+    includeMeanUncertainty=includeMeanUncertainty, whichTIpreds=whichTIpreds,
+    parmatrices=parmatrices, whichpars=whichpars, nsamples=nsamples,
+    timeinterval=timeinterval, nsubjects=nsubjects, filter=filter, plot=plot))
+
+  # Nothing to report on, said plainly. Indexing straight into `tipredsdata`
+  # gave "subscript out of bounds", which names an internal and not the
+  # problem -- and this is a function someone reaches for while exploring, so
+  # the model having no predictors is an ordinary thing to run into.
+  if(is.null(fit$ctstanmodel$n.TIpred) || fit$ctstanmodel$n.TIpred < 1){
+    stop('This model has no time independent predictors, so there are no ',
+      'effects to report. Add them with n.TIpred and TIpredNames in ctModel().',
+      call.=FALSE)
+  }
   ctspec <- fit$ctstanmodel$pars
   e<-ctExtract(fit)
   rawpopmeans <- e$rawpopmeans
@@ -136,6 +151,13 @@ ctStanTIpredeffects<-function(fit,returndifference=FALSE, probs=c(.025,.5,.975),
   
   
   if(parmatrices)  {
+    # stan_constrainsamples() below runs with dokalman=FALSE, so every matrix it
+    # returns comes from the population pass -- state-dependent cells at
+    # T0MEANS, TD predictors at zero -- for every TI predictor level alike.
+    .ctContextMessage(fit, .ctContextPopLabel,
+      paste0("The covariate effect shown for those cells is therefore the effect ",
+        "at that one point, not across the range of states the covariate implies."))
+
     rawpopmeans <- rawpopmeans[rep(1:nrow(rawpopmeans),each=nsubjects),] #match rows of rawpopmeans and raweffect
     raweffect <- matrix(raweffect,ncol=dim(raweffect)[4])
     
@@ -229,4 +251,7 @@ ctStanTIpredeffects<-function(fit,returndifference=FALSE, probs=c(.025,.5,.975),
     return(g)
   }
 }
+
+#' @export
+ctStanTIpredeffects <- ctTIpredEffects
 

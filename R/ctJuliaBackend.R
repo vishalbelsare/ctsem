@@ -1,0 +1,8104 @@
+# Julia likelihood backend -------------------------------------------------
+#
+# The Julia process is deliberately process-local.  Fit objects retain only a
+# serializable specification and rebuild their proxy on demand after saveRDS.
+
+.ct_julia_cache <- new.env(parent = emptyenv())
+.ct_julia_cache$objectives <- new.env(parent = emptyenv())
+# Keyed with the same objective key: a layout describes the objective's model,
+# so it is stale in exactly the cases the objective is.
+.ct_julia_cache$layouts <- new.env(parent = emptyenv())
+.ctJuliaOr <- function(x, default) if (is.null(x)) default else x
+
+# Can a carriage return move the cursor here?
+#
+# The progress reporter overwrites one line in place, which requires that `\r`
+# reaches something that treats it as a cursor movement. A console does; a log
+# file, a knitr chunk and a captured stream do not, and there the same updates
+# have to be rarer and on their own lines or the output becomes one long line of
+# accumulated garbage.
+#
+# `interactive()` was the test and is the wrong one: it asks whether a human is
+# at a prompt, not whether output reaches a console. Under Shiny it is TRUE
+# while stdout is being captured for a log pane -- the case that motivated
+# replacing it -- and it is FALSE in a plain `R -f` run whose output is going
+# straight to a terminal that handles `\r` perfectly well.
+#
+# So: detect the cases that are actually known to capture, and let
+# `options(ctsem.progress.overwrite = )` settle it outright for anything this
+# does not know about. A front end that captures output should set it to FALSE
+# once at startup rather than passing an argument through every fitting call.
+#' @keywords internal
+.ctProgressConsole <- function() {
+  # `options(ctsem.progress.overwrite = )` is *not* read here, and used to be.
+  # This function answers "is anyone watching", and its answer decides whether
+  # a fit reports at all; the option says whether a carriage return moves the
+  # cursor, which `.ctProgressOverwrite()` reads. Conflating them meant that
+  # setting the option FALSE -- to ask for plain lines rather than an
+  # overwritten one -- silently turned reporting off altogether, which is not
+  # what it says and not what anyone setting it wants.
+  # Inside a Shiny session: a non-NULL reactive domain is the reliable signal,
+  # and reaching it through the namespace keeps shiny a suggestion rather than
+  # a dependency.
+  if ("shiny" %in% loadedNamespaces()) {
+    domain <- try(get("getDefaultReactiveDomain",
+      envir = asNamespace("shiny"))(), silent = TRUE)
+    if (!inherits(domain, "try-error") && !is.null(domain)) return(FALSE)
+  }
+  # sink() and capture.output() divert stdout to a connection; knitr collects
+  # chunk output. Both keep the carriage return as a character.
+  if (sink.number() > 0L) return(FALSE)
+  if (isTRUE(getOption("knitr.in.progress"))) return(FALSE)
+  interactive()
+}
+
+# Whether to overwrite, which is the console question and the history question
+# together. `verbose >= 2` asks to keep every update, and at that point the
+# history is the reason it was turned on.
+#
+# One line that is rewritten is the whole design, and it is not given up on for
+# a console that might not honour a carriage return: the alternative is a stream
+# of updates down the screen, which is what this exists to avoid. A slower
+# cadence only makes that stream shorter. So overwriting stays on wherever
+# anything is being watched, and the option below settles the cases this cannot
+# know about -- in both directions, which it previously did not.
+#
+# RStudio overwrites like any other console, provided each update is flushed.
+# In-place updates once showed nothing there but each stage's closing line, for
+# minutes at a time (Charles, 2026-09-28), and whole lines instead filled the
+# console with them (2026-09-29). A GUI console -- RStudio's, like RGui's --
+# holds a line that has no newline yet until R flushes the console, which R
+# does not do while it waits on the engine; so the sink flushes after every
+# update, as `txtProgressBar()` does. Inferred from those two symptoms and from
+# `?flush.console`, not run inside RStudio from here.
+# `options(ctsem.progress.overwrite = )` still settles it explicitly in either
+# direction, checked first, so this default never overrides a choice someone
+# made.
+#' @keywords internal
+.ctProgressOverwrite <- function(verbose = 0) {
+  # `verbose` is a level everywhere now, but some callers still pass a
+  # logical flag; a flag means level one, which still overwrites.
+  level <- if (is.numeric(verbose) && length(verbose) == 1L && !is.na(verbose)) {
+    verbose
+  } else if (isTRUE(verbose)) 1 else 0
+  option <- getOption("ctsem.progress.overwrite")
+  if (is.logical(option) && length(option) == 1L && !is.na(option)) {
+    return(option && level < 2)
+  }
+  .ctProgressConsole() && level < 2
+}
+
+#' Deliver an engine progress line as an R message
+#'
+#' Returns a function of `(text, kind)` -- the protocol `_deliver!()` in
+#' `progress.jl` calls, with `kind` one of `"update"`, `"done"` or `"break"`.
+#'
+#' It exists because a console draws a *message* differently from text that
+#' merely arrives on the same stream. In RStudio, `message()` output is a
+#' shaded block and a raw write to `stderr()` is plain body text, so an engine
+#' that printed its own line -- however correct the stream -- produced a fit
+#' whose progress did not look like anything else that fit said. The engine
+#' still owns the line's content: only its delivery is here, so there is no
+#' second spelling of the fields in a second language.
+#'
+#' The carriage return and the padding are this side's business too, for the
+#' same reason: whether a cursor can be moved at all is a property of the
+#' console, not of the engine.
+#'
+#' Wrapped in `tryCatch` throughout. This is called from inside a running Julia
+#' call, and an error thrown back across that boundary does not merely lose a
+#' progress line -- it desynchronises the bridge, which costs the fit. The
+#' engine drops the sink on its first failure for the same reason.
+#'
+#' @param overwrite Update one line in place rather than emitting each report
+#'   on its own line.
+#' @return A function of `(text, kind)`, invisibly stateful.
+#' @keywords internal
+.ctProgressSink <- function(overwrite = .ctProgressOverwrite(1)) {
+  pad <- 0L
+  open <- FALSE
+  function(text, kind = "update") {
+    tryCatch({
+      text <- as.character(text)[1L]
+      if (is.na(text)) text <- ""
+      if (identical(kind, "break")) {
+        # Only ends the line, so that something else can print on its own.
+        if (open) {
+          message("")
+          open <<- FALSE
+          pad <<- 0L
+        }
+        return(invisible(NULL))
+      }
+      final <- identical(kind, "done")
+      if (!overwrite) {
+        message(text)
+        open <<- FALSE
+        return(invisible(NULL))
+      }
+      pad <<- max(pad, nchar(text))
+      # `appendLF = FALSE` for an update, so the next carriage return lands on
+      # this line; the closing line ends itself. The padding is what stops a
+      # shorter update leaving the tail of a longer one behind it.
+      message("\r", formatC(text, width = -pad), appendLF = final)
+      # A GUI console shows an unfinished line only once flushed; see
+      # `.ctProgressOverwrite()`.
+      utils::flush.console()
+      open <<- !final
+      if (final) pad <<- 0L
+      invisible(NULL)
+    }, error = function(e) invisible(NULL))
+  }
+}
+
+# Is progress reporting asked for at all -- `verbose` read the way it is
+# everywhere else, a level as well as a flag.
+#
+# `isTRUE(verbose)` is the wrong test once `verbose` can be `2`: `isTRUE(2)` is
+# `FALSE`, so a caller who raised the level for more detail would silently get
+# no progress output at all. This is the same reading `.ctProgressOverwrite`
+# already gives `verbose`, pulled out because it is also needed everywhere a
+# default of `progress = isTRUE(verbose)` has to become `progress =
+# .ctVerboseOn(verbose)` instead.
+#' @keywords internal
+.ctVerboseOn <- function(verbose) {
+  isTRUE(verbose) ||
+    (is.numeric(verbose) && length(verbose) == 1L && !is.na(verbose) && verbose > 0)
+}
+
+# Whether a stage should report itself at all: the same question
+# `.ctJuliaOptimise()`'s `reporting` asks for the main line -- explicit
+# verbosity, or something watching the console -- pulled out because the
+# engine's finish, the certification, the quadrature correction and the
+# uncertainty stage all ask it too, and used to each answer it slightly
+# differently (one gated strictly on `verbose > 0`, which is how a default fit
+# went twenty-two minutes without a word: see R/ctBackendLaplaceCorrect.R).
+#' @keywords internal
+.ctBackendReporting <- function(verbose) .ctVerboseOn(verbose) || .ctProgressConsole()
+
+# The progress line a post-optimisation stage reports through, or `NULL` when
+# nothing is watching -- the same sink and the same overwrite rule
+# `.ctJuliaOptimise()` builds for the main line, so a fit's progress reads as
+# one thing throughout rather than changing style between stages.
+#' @keywords internal
+.ctBackendProgressSink <- function(verbose) {
+  if (.ctBackendReporting(verbose)) .ctProgressSink(.ctProgressOverwrite(verbose)) else NULL
+}
+
+# `1m 04s`, `12.4s`, `2h 05m` -- the R-side twin of `_duration()` in
+# `progress.jl`. Needed on this side too because `.ctBackendReportProcesses`
+# formats an ETA from what a worker process wrote to a file, not from
+# anything the engine printed, so there is no Julia-side line to reuse.
+#' @keywords internal
+.ctDuration <- function(seconds) {
+  seconds <- max(0, as.numeric(seconds)[1L])
+  if (!is.finite(seconds)) return("--")
+  if (seconds < 60) return(sprintf("%.1fs", seconds))
+  if (seconds < 3600) {
+    return(sprintf("%dm %02ds", as.integer(seconds %/% 60),
+      as.integer(round(seconds %% 60))))
+  }
+  sprintf("%dh %02dm", as.integer(seconds %/% 3600),
+    as.integer(round((seconds %% 3600) / 60)))
+}
+.ctJuliaString <- function(value) {
+  value <- as.character(value)
+  if (length(value) != 1L || is.na(value) || grepl('"', value, fixed = TRUE) ||
+      grepl("\r", value, fixed = TRUE) || grepl("\n", value, fixed = TRUE)) {
+    stop("Julia string literal must be one non-empty-line value.", call. = FALSE)
+  }
+  # Backslashes must be escaped, not merely tolerated: a Windows path pasted
+  # into a Julia string literal otherwise becomes an escape sequence, and
+  # a path like ...\Users\... fails to parse as "invalid unicode escape"
+  # rather than as anything that points at the real problem.
+  value <- gsub("\\", "\\\\", value, fixed = TRUE)
+  paste0('"', value, '"')
+}
+
+# Where Julia is, in order of authority: what the caller named, what the user
+# configured, what ctsem installed itself, what is on the PATH, and finally
+# juliaup's own installs -- which R started from a launcher rather than a shell
+# will not have inherited a PATH entry for. NULL means "nowhere we can see",
+# which is what makes ctJuliaInstall() offer to fetch one.
+.ctJuliaBin <- function(julia_bin = NULL) {
+  if (!is.null(julia_bin)) {
+    return(normalizePath(julia_bin, winslash = "/", mustWork = TRUE))
+  }
+  configured <- Sys.getenv("JULIA_BINDIR", unset = "")
+  if (.ctJuliaIsBinDir(configured)) {
+    return(normalizePath(configured, winslash = "/", mustWork = TRUE))
+  }
+  managed <- .ctJuliaManagedBin()
+  if (!is.null(managed)) return(managed)
+  # The PATH's, else juliaup's, either one a launcher to follow.
+  onpath <- Sys.which("julia")[[1]]
+  found <- if (nzchar(onpath)) normalizePath(dirname(onpath), winslash = "/",
+    mustWork = TRUE) else .ctJuliaJuliaupBin()
+  .ctJuliaLauncherTarget(found)
+}
+
+.ctJuliaRequire <- function() {
+  if (.ctJuliaConnectoROk()) return(invisible(TRUE))
+  # Offered rather than demanded: this is one CRAN package away from working,
+  # and sending the user off to install it by hand and come back is the friction
+  # ctJuliaInstall() exists to remove.
+  if (isTRUE(tryCatch(.ctJuliaInstallConnectoR(), error = function(e) FALSE))) {
+    return(invisible(TRUE))
+  }
+  stop(.ctJuliaConnectoRNeeded(), call. = FALSE)
+}
+
+# Why there is no usable JuliaConnectoR, and what to do: install it, update it,
+# or -- with an update installed under a loaded older copy -- restart R.
+#' @keywords internal
+.ctJuliaConnectoRNeeded <- function(installed = .ctJuliaConnectoRVersion()) {
+  if (is.null(installed)) {
+    return(paste0("backend='julia' (the default) needs the JuliaConnectoR package, which is ",
+      "not installed.\n", .ctJuliaDeclined()))
+  }
+  paste0("backend='julia' needs JuliaConnectoR ", .ct_juliaconnector_min,
+    " or later, and ", installed, " is ",
+    if ("JuliaConnectoR" %in% loadedNamespaces()) "loaded" else "installed",
+    ": install.packages('JuliaConnectoR'), then restart R.")
+}
+
+# The engine's identity: a hash of its own source.
+#
+# This used to be a git commit recorded in `inst/julia/engine.json` by a script
+# that copied the engine in from a separate repository. The engine is now simply
+# part of ctsem -- `inst/julia/ContinuousTimeSEM/` is the source, edited in place
+# like any other file here -- so there is no upstream commit to record, and no
+# bookkeeping step that can be forgotten.
+#
+# Hashing the content rather than maintaining a version is what makes the cached
+# project self-invalidating. That cache is keyed on this and is only populated
+# when empty, so any identifier that has to be *updated by hand* strands a user
+# on a stale engine the moment someone edits the source without bumping it: they
+# upgrade ctsem, get the new R code, and run it against the old engine, silently.
+# A content hash cannot be forgotten.
+# Deliberately not memoized. Hashing 45 files takes 5.6 ms against 1.1 ms for a
+# cached lookup, and the saving is invisible next to anything that asks for it
+# -- but a cache keyed on the path alone would report a stale version after an
+# edit within the same session, which is precisely the property this exists to
+# provide. A guarantee with an exception is not a guarantee.
+#
+# What is hashed is what the engine is built from: everything but `test/`.
+# Hashing the tests too made an edit to one a new engine for every user -- a
+# new cached project, and a precompile of the engine (about twenty minutes)
+# for code no build reads.
+.ctJuliaEngineVersion <- function(path = .ctJuliaEnginePath()) {
+  files <- .ctJuliaEngineFiles(path, recursive = TRUE)
+  manifest <- paste(substring(files, nchar(path) + 2L), tools::md5sum(files),
+    collapse = "
+")
+  handle <- tempfile(fileext = ".txt")
+  on.exit(unlink(handle), add = TRUE)
+  writeLines(manifest, handle)
+  substr(unname(tools::md5sum(handle)), 1L, 12L)
+}
+
+# The engine's files the build reads: everything but its `test/` directory.
+# Top-level entries when not `recursive` (what a copy of the engine takes),
+# every file below them when it is (what its hash takes), sorted.
+.ctJuliaEngineFiles <- function(path, recursive = FALSE) {
+  top <- list.files(path, full.names = TRUE)
+  top <- top[basename(top) != "test"]
+  if (!recursive) return(top)
+  sort(unlist(lapply(top, function(f) if (dir.exists(f))
+    list.files(f, recursive = TRUE, full.names = TRUE) else f)))
+}
+
+# Path to the copy of ContinuousTimeSEM.jl shipped inside this ctsem install.
+.ctJuliaEnginePath <- function() {
+  path <- system.file("julia", "ContinuousTimeSEM", package = "ctsem")
+  if (!nzchar(path) || !file.exists(file.path(path, "Project.toml"))) {
+    stop("The Julia engine is missing from this ctsem installation; reinstall ctsem.", call. = FALSE)
+  }
+  normalizePath(path, winslash = "/", mustWork = TRUE)
+}
+
+# A writable project directory for the engine, keyed by the engine's content
+# hash so that any change to it -- a ctsem upgrade, or an edit made while
+# working on the engine -- gets a fresh environment instead of reusing a stale
+# one.
+#
+# The engine tree is *copied* here rather than activated in place: activating a
+# project writes to its Manifest.toml, and an R library directory is frequently
+# read-only. The copy is under 400 KB.
+.ctJuliaEnvDir <- function(version = .ctJuliaEngineVersion()) {
+  base <- tools::R_user_dir("ctsem", which = "cache")
+  # Forward slashes throughout: this path is used by R and also embedded in
+  # Julia source, and Julia accepts them on every platform.
+  gsub("\\", "/", file.path(base, "julia", paste0("engine-", version)), fixed = TRUE)
+}
+
+# Is a Julia session live? *Without* starting one.
+#
+# This used to fall back to `JuliaConnectoR::juliaEval("true")`, which starts a
+# session rather than reporting on one -- so the predicate created the situation
+# it was asked about. Two things followed, both silent:
+#
+#   * `ctJuliaSetup(threads = 10, force = TRUE)` cleared the session, then asked
+#     this question, then warned that a session was already running and refused
+#     to apply `threads`. `force` could not work.
+#   * `ctFit(backend = 'julia', cores = n)` sets `JULIA_NUM_THREADS` only when no
+#     session is running. The check started one first, so the variable was never
+#     set and every fit ran single-threaded whatever `cores` said.
+#
+# JuliaConnectoR exports no non-starting predicate, so its connection is read
+# directly and defensively: if that internal ever moves, the answer degrades to
+# "not running", which is the safe direction -- we then set the thread count,
+# which is a no-op when it was already right.
+.ctJuliaSessionRunning <- function() {
+  .ctJuliaCheckSession()
+  if (!is.null(.ct_julia_cache$module)) return(TRUE)
+  isTRUE(tryCatch({
+    connection <- get("pkgLocal", envir = asNamespace("JuliaConnectoR"))$con
+    !is.null(connection) && isOpen(connection)
+  }, error = function(e) FALSE))
+}
+
+.ctJuliaCheckAvailable <- function() {
+  if (isTRUE(.ctJuliaStartable())) return(invisible(TRUE))
+  # Same reasoning as .ctJuliaRequire(): ask, rather than end the session's work
+  # with an instruction to install something and start again.
+  if (isTRUE(tryCatch(.ctJuliaOfferJulia(), error = function(e) FALSE)) &&
+      isTRUE(.ctJuliaStartable())) {
+    return(invisible(TRUE))
+  }
+  stop("Julia was not found, and backend='julia' (the default) needs it (", .ct_julia_minimum, " or newer).\n",
+    .ctJuliaDeclined(), "\n",
+    "  ctJuliaInstall() downloads the official build into ", .ctJuliaInstallRoot(), ".\n",
+    "  To use a Julia you already have, set JULIA_BINDIR, e.g.\n",
+    "    Sys.setenv(JULIA_BINDIR = \"/path/to/julia/bin\")",
+    call. = FALSE)
+}
+
+# Does a failed `using ContinuousTimeSEM` say a package is not installed, which
+# instantiating fixes, rather than that the engine itself is broken? Julia names
+# a missing package directly when the engine's environment is empty, nested
+# inside "Failed to precompile ContinuousTimeSEM" when a dependency is absent,
+# and -- on a fresh depot under 1.12 -- as "failed to find source of parent
+# package" when the absent package is one with extensions. That last shape went
+# unrecognised, so a first fit on a new machine was told that installing would
+# not help, which is the opposite of the remedy. The phrases are Base's own,
+# from loading.jl.
+.ctJuliaLoadFailIsMissing <- function(msg) {
+  grepl(paste("not found in current path", "not found in",
+    "not found during precompilation", "does not seem to be installed",
+    "failed to find source of parent package", sep = "|"), msg)
+}
+
+# Whether the environment's manifest was resolved under another minor version
+# of Julia than the running session's (its `julia_version`), where a package
+# it pins may be one this Julia cannot load. FALSE where either is unknown.
+.ctJuliaManifestOtherJulia <- function(env_dir) {
+  path <- file.path(env_dir, "Manifest.toml")
+  if (!file.exists(path)) return(FALSE)
+  line <- grep("^julia_version\\s*=", readLines(path, n = 20L, warn = FALSE),
+    value = TRUE)[1L]
+  running <- tryCatch(as.character(.ctJuliaEval("string(VERSION)")),
+    error = function(e) NA_character_)
+  if (is.na(line) || is.na(running)) return(FALSE)
+  minor <- function(v) sub("^(\\d+\\.\\d+).*$", "\\1", v)
+  resolved <- sub('^julia_version\\s*=\\s*"([^"]+)".*$', "\\1", line)
+  !identical(minor(resolved), minor(running))
+}
+
+# Is there a Julia that a session could be started with? Without starting one:
+# `JuliaConnectoR::juliaSetupOk()`, which this used to ask, answers by starting
+# a session through JuliaConnectoR itself, bypassing the start in
+# R/ctJuliaBridge.R that names the version, records the process id and cannot be
+# left half-launched by Escape.
+.ctJuliaStartable <- function() {
+  if (nzchar(Sys.getenv("JULIACONNECTOR_SERVER", unset = ""))) return(TRUE)
+  wire <- .ctJuliaWire()
+  if (!is.null(wire) && !is.null(wire$pkgLocal$con)) return(TRUE)
+  bin <- tryCatch(.ctJuliaBin(), error = function(e) NULL)
+  if (is.null(bin)) return(FALSE)
+  .ctJuliaVersionOk(.ctJuliaCachedVersion(bin))
+}
+
+# Could a julia fit run here now, without installing or asking anything? A
+# Julia that reports a version is not enough: a runner's juliaup shim printed
+# one and then could not load its own system image, and a Julia without the
+# engine's packages starts but cannot load the engine, and installing them
+# needs consent an example or a check cannot give. So a one-off `julia`
+# process -- not a session: it pins no thread count, holds no connection and
+# exits -- confirms both that Julia runs and that every package the engine
+# depends on is installed, without loading the engine (which could mean
+# precompiling it for minutes). Once per binary and R session. "ok", "absent"
+# (Julia runs, the packages are not there) or "broken" (Julia did not run).
+.ctJuliaEngineInstalled <- function(bin) {
+  known <- .ct_julia_cache$engine_installed
+  if (!is.null(known[[bin]])) return(known[[bin]])
+  env_dir <- .ctJuliaEnvDir()
+  project <- if (file.exists(file.path(env_dir, "Project.toml"))) env_dir else
+    system.file("julia", "ContinuousTimeSEM", package = "ctsem")
+  if (!nzchar(project)) return("broken")
+  script <- tempfile(fileext = ".jl")
+  on.exit(unlink(script), add = TRUE)
+  writeLines(c(
+    "import TOML",
+    "deps = keys(get(TOML.parsefile(Base.active_project()), \"deps\", Dict()))",
+    "absent = [d for d in deps if (id = Base.identify_package(d);",
+    "  id === nothing || Base.locate_package(id) === nothing)]",
+    "print(isempty(absent) ? \"CTSEM-ENGINE-DEPS-OK\" : \"CTSEM-ENGINE-DEPS-ABSENT\")"),
+    script)
+  out <- tryCatch(suppressWarnings(system2(file.path(bin, .ctJuliaExeName()),
+    c("--startup-file=no", "--history-file=no",
+      paste0("--project=", shQuote(project)), shQuote(script)),
+    stdout = TRUE, stderr = FALSE, timeout = 120)),
+    error = function(e) character())
+  state <- if (any(grepl("CTSEM-ENGINE-DEPS-OK", out, fixed = TRUE))) "ok" else
+    if (any(grepl("CTSEM-ENGINE-DEPS-ABSENT", out, fixed = TRUE))) "absent" else
+      "broken"
+  .ct_julia_cache$engine_installed <- c(known, stats::setNames(list(state), bin))
+  state
+}
+
+#' Configure the Julia engine used by ctsem
+#'
+#' Prepares the copy of ContinuousTimeSEM.jl that ships inside this ctsem
+#' installation. The engine source itself is vendored in \code{inst/julia/} --
+#' no repository credentials and no network access are involved in getting
+#' that -- but its Julia package dependencies still have to be instantiated,
+#' which reaches the network on a machine where they are not already cached.
+#' That step is consent-gated exactly as in \code{\link{ctJuliaInstall}}: asked
+#' for interactively, skipped with a message when the environment is already
+#' instantiated, and declined by default in a non-interactive session unless
+#' \code{agree = TRUE} or \code{CTSEM_JULIA_AGREE=yes} said otherwise in
+#' advance.
+#'
+#' The first call downloads and precompiles those dependencies (roughly 120 MB)
+#' and compiles the engine, which takes several minutes; later calls in new
+#' sessions reuse both.
+#'
+#' The engine is compiled in advance, by fitting a small model on each route,
+#' and every model of a route runs that same compiled code: a model's sizes,
+#' parameters and state-dependent cells are data to the engine rather than part
+#' of its types. So the first fit of a new model in a session compiles little,
+#' and takes seconds more than later fits rather than minutes. A model with a
+#' categorical indicator, or a Laplace unit with more than four random effects,
+#' compiles a little more the first time. \code{ctFit(forcerecompile = TRUE)}
+#' compiles a heavily state-dependent model's expressions for faster gradients,
+#' at a minute or more of compile.
+#'
+#' Pressing Escape (or Ctrl-C) during a julia fit returns to the R prompt at
+#' once, and keeps the Julia session and everything it has compiled. Julia
+#' stops the interrupted work at its next iteration; work that has no
+#' iterations, such as compiling for a new model shape, finishes in the
+#' background. If it is still running when the next julia call starts, that
+#' call says so and waits, and Escape during that wait stops Julia outright.
+#' \code{\link{ctJuliaProcesses}} lists the Julia processes ctsem has running,
+#' including any left by R sessions that have ended, and
+#' \code{\link{ctJuliaKill}} stops them.
+#'
+#' If \pkg{JuliaConnectoR} or Julia itself is missing, this offers to install it
+#' rather than failing -- the same thing \code{\link{ctJuliaInstall}} does, which
+#' is the function to reach for when setting the backend up deliberately, or
+#' from a script.
+#' @param project Optional local ContinuousTimeSEM.jl checkout to use instead of
+#'   the copy that ships with ctsem. Rarely needed: the engine is part of ctsem
+#'   and is edited in place under \code{inst/julia/}.
+#' @param julia_bin Optional Julia binary directory.
+#' @param threads Number of Julia threads, fixed for the life of the session.
+#'   The engine splits its subject loop across them, and \code{ctFit}'s
+#'   \code{cores} cannot exceed this count: Julia fixes it at process start, so
+#'   setting it here takes effect only if no Julia session is running yet --
+#'   pass \code{force = TRUE} to restart one. \code{NULL}, the default, starts
+#'   a session at \code{getOption("mc.cores", 2)} threads unless
+#'   \code{JULIA_NUM_THREADS} is set; a session started by a call with a
+#'   \code{cores} argument -- a fit, \code{ctFitUncertainty}, \code{ctLOO} and
+#'   the rest -- is instead as wide as that call's \code{cores}, if more. A
+#'   number given here is also the ceiling for any call that sets none. A fit
+#'   that asks for more cores than
+#'   the session has threads says so; see \code{\link{ctFit}}.
+#' @param force Reconfigure an existing Julia session.
+#' @param agree \code{TRUE} to consent to instantiating the engine's Julia
+#'   package dependencies without being asked, \code{FALSE} to refuse.
+#'   \code{NULL}, the default, asks in an interactive session and refuses
+#'   otherwise; see \code{\link{ctJuliaInstall}}.
+#' @return A Julia-engine status list, invisibly.
+#' @seealso \code{\link{ctJuliaInstall}}, \code{\link{ctJuliaStatus}}
+#' @examples
+#' \dontrun{
+#' ctJuliaSetup()                         # prepare the engine, asking first
+#' ctJuliaSetup(threads = 8, force = TRUE) # restart the session wider
+#' }
+#' @export
+ctJuliaSetup <- function(project = NULL, julia_bin = NULL,
+  threads = NULL, force = FALSE, agree = NULL) {
+  .ctJuliaRequire()
+  if (isTRUE(force)) .ctJuliaClearSession()
+  julia_bin <- .ctJuliaBin(julia_bin)
+  if (!is.null(julia_bin)) Sys.setenv(JULIA_BINDIR = julia_bin)
+  if (!is.null(threads)) {
+    threads <- max(1L, as.integer(threads)[1L])
+    # Julia fixes Threads.nthreads() at process start and JuliaConnectoR's
+    # subprocess inherits this environment, so it has to be set before the
+    # session exists. Warning rather than silently doing nothing matters here:
+    # a user asking for 8 threads and getting 1 would otherwise just see a
+    # disappointing benchmark.
+    if (.ctJuliaSessionRunning()) {
+      if (!identical(Sys.getenv("JULIA_NUM_THREADS", unset = ""), as.character(threads))) {
+        warning("A Julia session is already running, so threads=", threads,
+          " has no effect. Use ctJuliaSetup(threads=", threads,
+          ", force=TRUE) to restart it.", call. = FALSE)
+      }
+    } else {
+      Sys.setenv(JULIA_NUM_THREADS = as.character(threads))
+      # Asked for by name, so it is not ctsem's own default to replace -- even
+      # when it happens to equal the value `.ctJuliaProvision()` last set, which
+      # is all that function can compare.
+      .ct_julia_cache$threads_from_cores <- NULL
+    }
+  }
+  .ctJuliaCheckAvailable()
+  engineversion <- .ctJuliaEngineVersion()
+
+  if (!is.null(project)) {
+    # Developer override: use the checkout as its own project, in place.
+    project <- normalizePath(project, winslash = "/", mustWork = TRUE)
+    env_dir <- project
+  } else {
+    env_dir <- .ctJuliaEnvDir(engineversion)
+    if (!file.exists(file.path(env_dir, "Project.toml"))) {
+      dir.create(dirname(env_dir), recursive = TRUE, showWarnings = FALSE)
+      unlink(env_dir, recursive = TRUE)
+      # copy the vendored tree, then rename to the target so an interrupted
+      # copy cannot leave a half-populated environment behind. The staging
+      # directory is this process's own: two sessions setting up one engine
+      # at once shared `-partial`, and one deleted it under the other's copy
+      # ("more 'from' files than 'to' files"). The first copy renamed into
+      # place stands, and a later one is discarded.
+      staging <- paste0(env_dir, "-partial-", Sys.getpid())
+      unlink(staging, recursive = TRUE)
+      dir.create(staging, recursive = TRUE, showWarnings = FALSE)
+      # What the hash covers and nothing else, so the copy is what its key
+      # names: the tests run from the package's own copy, never from here.
+      file.copy(.ctJuliaEngineFiles(.ctJuliaEnginePath()), staging,
+        recursive = TRUE)
+      if (!isTRUE(suppressWarnings(file.rename(staging, env_dir)))) {
+        unlink(staging, recursive = TRUE)
+      }
+    }
+    .ctJuliaTouchEngine(env_dir)
+    .ctJuliaPruneEngines(env_dir)
+  }
+
+  .ctJuliaEval("using Pkg, Logging")
+  # Quietly. `Pkg.activate()` announces itself, and the environment is ctsem's
+  # own vendored one -- the first thing a user saw was
+  # `Activating project at C:\Users\...\engine-4f87c9793c9f`, naming a cache
+  # path, followed by a three-line Pkg warning recommending `Pkg.resolve()` on a
+  # manifest they did not write. Alarming, and about a situation this code
+  # already handles: the resolve fallback below is exactly that recommendation,
+  # taken automatically.
+  #
+  # `io=devnull` silences the announcements and a NullLogger the warnings.
+  # Failures are exceptions rather than logs, so they still propagate to the
+  # fallback and to the user.
+  activate <- sprintf("Pkg.activate(%s; io=devnull)", .ctJuliaString(env_dir))
+  silently <- function(code) paste0(
+    "Logging.with_logger(Logging.NullLogger()) do; ", code, "; end")
+  .ctJuliaEval(silently(activate))
+
+  # `Pkg.instantiate()` is the network-touching step: it fetches whatever the
+  # manifest lists that is not already in the user's Julia depot. Consent-gated
+  # exactly like the other two installs `ctJuliaInstall()` offers (see
+  # `.ctJuliaAgreed()`), and skipped entirely -- no prompt, no network -- when
+  # the environment already loads, which is the ordinary case after the first
+  # session on a machine.
+  # A first load of a new engine precompiles it, and by default Julia writes
+  # the image on a thread per CPU (`JULIA_IMAGE_THREADS`) and Pkg builds that
+  # many packages at once: 15 cores on dev2 for the last minute of a
+  # `cores = 2` fit's precompile. The build is held to the width of the call
+  # that started the session -- `cores` is every core a call uses -- and a
+  # value set outside ctsem wins. OpenBLAS in a build process is held too.
+  .ctJuliaBuildWidth(.ctJuliaOr(threads, .ctJuliaOr(.ct_julia_cache$build_cores,
+    .ctJuliaDefaultCores())))
+  .ct_julia_cache$build_cores <- NULL
+  loadfail <- NULL
+  ready <- tryCatch({
+    .ctJuliaEval("using ContinuousTimeSEM")
+    TRUE
+  }, error = function(e) { loadfail <<- conditionMessage(e); FALSE })
+
+  if (!ready) {
+    # Tell a short environment from a broken engine, because the two need
+    # opposite things from the reader and this code used to say the first
+    # whatever had happened. A docstring error in the engine -- which fails at
+    # load and nowhere earlier -- came out as "dependencies not installed, and
+    # consent was not given", which is wrong about the cause, wrong about the
+    # remedy, and sends the user to install packages that are already there.
+    #
+    # The presence of a missing-package phrase is what identifies the case
+    # instantiating can fix, and its absence identifies the case it cannot; see
+    # .ctJuliaLoadFailIsMissing.
+    missing <- !is.null(loadfail) && .ctJuliaLoadFailIsMissing(loadfail)
+    # Unless the manifest was resolved under another Julia: there a package it
+    # pins can be one that Julia cannot precompile, which only a resolve for
+    # this Julia fixes (below). Only for ctsem's own copy of the engine, whose
+    # manifest it may delete; a developer's checkout keeps its own.
+    other <- is.null(project) && .ctJuliaManifestOtherJulia(env_dir)
+    if (!is.null(loadfail) && !missing && !other) {
+      stop("The julia engine failed to load. This is not a missing ",
+        "dependency -- installing packages will not help.\n",
+        "  environment: ", env_dir, "\n",
+        "Julia reported:\n", loadfail, call. = FALSE)
+    }
+    agreed <- .ctJuliaAgreed(agree, paste0(
+      "The julia backend needs to install the vendored engine's Julia package ",
+      if (missing || is.null(loadfail)) "dependencies, which are not yet present.\n"
+      else "dependencies again, resolved for this Julia.\n",
+      "  environment: ", env_dir, "\n",
+      "  This downloads packages from the Julia package registry."))
+    if (!agreed) {
+      stop("The julia backend needs its Julia package dependencies installed, ",
+        "and consent was not given.\n", .ctJuliaDeclined(),
+        if (is.null(loadfail)) "" else paste0("\nJulia reported:\n", loadfail),
+        call. = FALSE)
+    }
+
+    # `Pkg.instantiate()` precompiles the environment, and then `using` precompiles
+    # the engine again -- two full builds of the same package on every fresh
+    # session with a cold cache. That was cheap until the engine started
+    # precompiling model shapes; now it is a hundred seconds paid twice.
+    # `JULIA_PKG_PRECOMPILE_AUTO` turns off only Pkg's automatic pass, so `using`
+    # still builds whatever is stale, and `withenv` puts it back rather than
+    # leaving the session's Pkg quietly reconfigured.
+    quiet_instantiate <- paste0('withenv("JULIA_PKG_PRECOMPILE_AUTO" => "0") do; ',
+      'Pkg.instantiate(io=devnull); end')
+    # The vendored manifest pins the versions this ctsem release was tested
+    # against, but on a different Julia version it can be unsatisfiable, or
+    # satisfiable and not loadable: resolved under 1.13.3, it instantiates on
+    # 1.11 and its PrecompileTools does not precompile there (`Base.StaticData`
+    # is 1.12's), so a first install on 1.11 stopped at load. Falling back to
+    # a fresh resolve is better than refusing to run; the compat bounds in
+    # Project.toml still apply.
+    reresolve <- function() {
+      unlink(file.path(env_dir, "Manifest.toml"))
+      .ctJuliaEval(silently(paste0(activate,
+        "; Pkg.resolve(io=devnull); ", quiet_instantiate)))
+    }
+    instantiated <- (missing || is.null(loadfail)) && tryCatch({
+      .ctJuliaEval(silently(paste0(activate, "; ", quiet_instantiate)))
+      TRUE
+    }, error = function(e) FALSE)
+    if (!instantiated) reresolve()
+    loaded <- tryCatch({ .ctJuliaEval("using ContinuousTimeSEM"); TRUE },
+      error = function(e) e)
+    if (!isTRUE(loaded)) {
+      if (!instantiated || !other) stop(loaded)
+      reresolve()
+      .ctJuliaEval("using ContinuousTimeSEM")
+    }
+  }
+  .ctJuliaTuneBridge()
+  # Where Escape asks a running call to stop, and which R process the engine
+  # should outlive by no more than a checkpoint; see R/ctJuliaBridge.R.
+  if (!is.null(.ct_julia_cache$interrupt_file)) {
+    try(.ctJuliaCall("ContinuousTimeSEM.ctsem_set_interrupt!",
+      .ct_julia_cache$interrupt_file, Sys.getpid()), silent = TRUE)
+  }
+  # The subject-chunk ceiling for a call that sets none, which holds OpenBLAS
+  # too. Every fit sets its own `cores`; without this, a session started for a
+  # `cores = 8` fit would make an uncapped call -- ctKalman(),
+  # ctJuliaEvaluate() -- that wide too, and OpenBLAS would keep the half of the
+  # machine LinearAlgebra gives it, in every worker process as well. `threads`
+  # when asked for, and otherwise what `cores` defaults to.
+  cap <- if (!is.null(threads)) threads else .ctJuliaDefaultCores()
+  cap <- suppressWarnings(as.integer(cap)[1L])
+  if (!is.na(cap) && cap >= 1L) {
+    try(.ctJuliaCall("ContinuousTimeSEM.ctsem_set_max_chunks!", cap), silent = TRUE)
+  }
+  .ct_julia_cache$project <- project
+  .ct_julia_cache$engine <- engineversion
+  .ct_julia_cache$module <- .ctJuliaImport("ContinuousTimeSEM")
+  # Last, so the cache is only ever stamped with the session everything above it
+  # was built in.
+  .ct_julia_cache$session <- .ctJuliaSessionStamp()
+  invisible(ctJuliaStatus())
+}
+
+#' Report Julia backend availability
+#'
+#' Reports what \code{backend='julia'} would find, and installs nothing: it is
+#' safe to call on a machine with no Julia and no \pkg{JuliaConnectoR}, where it
+#' says so rather than erroring. \code{\link{ctJuliaInstall}} supplies whatever
+#' it reports as missing.
+#'
+#' @inheritParams ctJuliaSetup
+#' @return A list describing the selected Julia engine: whether it is
+#'   \code{available} -- a julia fit could run now without asking anything,
+#'   which needs a Julia that starts and the engine's Julia packages installed,
+#'   or consent to install them given in advance with
+#'   \code{CTSEM_JULIA_AGREE=yes} (checked by a short \code{julia} process,
+#'   once per session, never a session) -- whether the \code{connectoR} bridge
+#'   package is installed at a version the backend runs on,
+#'   the \code{julia_bin} directory in use and the \code{julia} version there,
+#'   the \code{engine} version (a hash of the engine source shipped with this
+#'   ctsem, which is also what its cached project directory is keyed on), and
+#'   the number of \code{threads} in a running session (\code{NA} when none is
+#'   running: this never starts one, so it leaves the session's width to the
+#'   first call that needs it).
+#' @examples
+#' status <- ctJuliaStatus()
+#' status$available
+#' @export
+ctJuliaStatus <- function(project = NULL, julia_bin = NULL) {
+  connectoR <- .ctJuliaConnectoROk()
+  julia_bin <- .ctJuliaBin(julia_bin)
+  if (!is.null(julia_bin)) Sys.setenv(JULIA_BINDIR = julia_bin)
+  # A running session can be asked its own version; only a Julia that has never
+  # started needs a subprocess spawned to find out. One that has died is let go
+  # first, so this reports on a new one rather than waiting on the old.
+  #
+  # Never a session started here. Asking one that was not running for its
+  # version used to start it, at mc.cores threads -- and a session's thread
+  # count is fixed when it starts, so `if (ctJuliaStatus()$available)` before
+  # `ctFit(cores = 8)`, the guard every julia example uses, left the fit at two.
+  # It also left a connection open, which R CMD check's example harness counts
+  # as an error on any machine with Julia.
+  running <- connectoR && isTRUE(tryCatch({
+    try(.ctJuliaCheckAlive(), silent = TRUE)
+    .ctJuliaSessionRunning()
+  }, error = function(e) FALSE))
+  version <- if (running) tryCatch(as.character(.ctJuliaEval("string(VERSION)")),
+    error = function(e) NA_character_) else NA_character_
+  if (is.na(version) && !is.null(julia_bin)) version <- .ctJuliaCachedVersion(julia_bin)
+  # Whether a julia fit could run now without asking anything: the engine
+  # loaded in a running session, or a Julia that starts and has the engine's
+  # packages (`.ctJuliaEngineInstalled`) or consent given in advance to install
+  # them. This is the guard the julia examples run under, so on a machine where
+  # a fit would stop to ask -- or where `julia` is a shim that cannot start --
+  # it has to say no.
+  engine <- if (connectoR && !is.null(julia_bin) && !(running &&
+      !is.null(.ct_julia_cache$module)) && isTRUE(tryCatch(.ctJuliaStartable(),
+        error = function(e) FALSE)))
+    tryCatch(.ctJuliaEngineInstalled(julia_bin), error = function(e) "broken") else NA
+  available <- connectoR && ((running && !is.null(.ct_julia_cache$module)) ||
+    nzchar(Sys.getenv("JULIACONNECTOR_SERVER", unset = "")) ||
+    identical(engine, "ok") ||
+    (identical(engine, "absent") && .ctJuliaAgreedInAdvance()))
+  threads <- if (running) {
+    tryCatch(as.integer(.ctJuliaEval("Threads.nthreads()")),
+      error = function(e) NA_integer_)
+  } else NA_integer_
+  list(available = available, connectoR = connectoR,
+    julia_bin = .ctJuliaOr(julia_bin, NA_character_), julia = version,
+    project = .ctJuliaOr(project, .ct_julia_cache$project),
+    engine = .ctJuliaOr(.ct_julia_cache$engine,
+      tryCatch(.ctJuliaEngineVersion(), error = function(e) NA_character_)),
+    threads = threads)
+}
+
+# The socket the bridge runs on ----------------------------------------------
+#
+# JuliaConnectoR sends every message as a run of small writes -- an indicator
+# byte, a length, a name, a count, then each argument -- and reads the reply the
+# same way. On Linux that write-write-read pattern meets Nagle's algorithm on
+# the sending side and a delayed ACK on the receiving side, and the second write
+# waits up to 40 ms for an acknowledgement the kernel is deliberately holding
+# back. Measured on a bare socket with neither Julia nor R packages in the way
+# (23-core Linux box): one write per request 0.033 ms, two writes 40.7 ms, eight
+# writes 40.8 ms. One stall per message, independent of payload.
+#
+# That is the whole of what looked like a per-round-trip latency. A bridge
+# message cost 41 ms when one direction split into several writes and 82 ms when
+# both did, which made `ctJuliaEvaluate` ~370 ms and read as "about nine round
+# trips of 42 ms". It sends six messages, not nine, and the unit is a TCP stall
+# rather than a round trip. (Six: marshal the parameter vector, release the
+# proxies R collected since the last call, evaluate, then three for `juliaGet`,
+# which sets a flag, fetches, and unsets it.)
+#
+# `ctsem_tune_bridge!` in the engine turns both halves off. Same box, per
+# message: 82 ms untuned, 41 ms with Nagle disabled, 2.5 ms with the quickack
+# task as well. Windows and macOS are unaffected either way -- Windows measures
+# ~0.3 ms a message untuned, and TCP_QUICKACK does not exist there.
+#
+# What is left, quantified rather than guessed at: three of the six messages are
+# `juliaGet`, which exists only because the engine returns a NamedTuple and
+# JuliaConnectoR sends those by reference. A flat `Array{Float64}` comes back by
+# value in the call's own message, so a flattened R-facing return would drop
+# those three. That was worth ~220 ms a call before the socket fix and is worth
+# ~5 ms after it, which is why it has not been done -- and why it should not be
+# done for speed alone. The cleaner fix belongs upstream: if JuliaConnectoR
+# buffered each message into one `send()`, neither the stall nor the task below
+# would exist.
+#
+# Everything here is advisory: a failure costs the tuning, never the session.
+.ctJuliaCommunicator <- function() {
+  # The Julia object that owns the socket. JuliaConnectoR keeps it in a
+  # package-private environment and passes it to Julia itself when a call needs
+  # it -- `juliaGet` does exactly this. `asNamespace` rather than `:::` because
+  # the latter is an R CMD check note, and the tryCatch is for the day the name
+  # changes.
+  tryCatch({
+    local_env <- get("pkgLocal", envir = asNamespace("JuliaConnectoR"))
+    communicator <- local_env$communicator
+    if (inherits(communicator, "JuliaProxy")) communicator else NULL
+  }, error = function(e) NULL)
+}
+
+# Which Julia session the cache belongs to -------------------------------------
+#
+# Everything `.ct_julia_cache` holds is a handle into one Julia process: the
+# imported module, and every objective compiled under it. Nothing in ctsem ends
+# that process without clearing the cache too (see `.ctJuliaClearSession()`),
+# but plenty outside ctsem does -- a user or another package calling
+# `JuliaConnectoR::stopJulia()`, or Julia dying on its own. The handles then
+# name objects no running session holds, and the next call fails from inside the
+# bridge rather than here:
+#
+#     Evaluation in Julia failed. ... Object reference 195c50a34f0 could not be
+#     resolved
+#
+# when the module has since been re-imported into a replacement session, and
+#
+#     UndefVarError: `ContinuousTimeSEM` not defined in `Main`
+#
+# when it has not. Neither names ctsem, a model or a fit, and the fit is not the
+# problem: a `ctJuliaFit` carries no Julia handles at all -- only the plain R
+# `model_spec` that `.ctJuliaObjective()` builds from, which is why `summary()`
+# on the same object keeps working while anything needing live Julia does not.
+# That split was reported as a stored fit going stale, and it is not: a saved
+# and restored fit is fine, and the only stale thing is this cache.
+#
+# So the recovery is to notice and rebuild. The stamp is taken at setup and
+# compared by identity, so asking costs nothing and needs no round trip.
+.ctJuliaSessionStamp <- function() {
+  # `pkgLocal` rather than an exported predicate, for the reason
+  # `.ctJuliaCommunicator()` gives: JuliaConnectoR offers none, and a rename
+  # upstream should degrade to "no session" rather than error. `isOpen()` on a
+  # closed connection errors, which the tryCatch turns into the same answer.
+  tryCatch({
+    local_env <- get("pkgLocal", envir = asNamespace("JuliaConnectoR"))
+    connection <- local_env$con
+    if (is.null(connection) || !isOpen(connection)) return(NULL)
+    # The port as well as the connection: a connection object carries an
+    # external pointer, so comparing the port too means a replacement session
+    # would have to reuse both a freed address and the same port to pass for its
+    # predecessor.
+    list(connection = connection, port = local_env$port)
+  }, error = function(e) NULL)
+}
+
+# Drop what the departed session issued, without touching whatever is running
+# now.
+#
+# Not `.ctJuliaClearSession()`, which stops Julia: that is right when ctsem is
+# the one ending the session and wrong here, because the session this cache
+# belonged to has already gone and the one that replaced it may be mid-use.
+#
+# Collecting the proxies is half of it. The other half is that JuliaConnectoR
+# queues each finalized proxy's reference for a decrement it sends with the next
+# call -- and these references belong to a session that has gone, so that
+# decrement reaches whatever is running now and names a key it never issued.
+# It is sent inside JuliaConnectoR's own `try()`, so it cannot fail a call, but
+# it *prints*: about twenty-five lines of Julia stacktrace
+# (`MethodError: no method matching decrefcounts(::Nothing, ...)`, or a
+# `KeyError`) arriving from inside the next unrelated call. A recovery that
+# announces itself that way is no better than the failure it replaced, so the
+# queue is restored to what it held before the collection -- dropping exactly
+# the references this function orphaned, and keeping any that were already
+# waiting. The cost is those reference counts never being decremented in a
+# session that cannot be holding the objects anyway.
+#
+# `.ctJuliaClearSession()` avoids all of this by releasing before it stops, in
+# that order. The ordering is not available here, because we did not end the
+# session.
+.ctJuliaForgetSession <- function() {
+  .ct_julia_cache$module <- NULL
+  .ct_julia_cache$project <- NULL
+  .ct_julia_cache$engine <- NULL
+  .ct_julia_cache$session <- NULL
+  # A reply owed by an interrupted call, and the restores queued behind it,
+  # belong to the session being forgotten (R/ctJuliaBridge.R).
+  .ct_julia_cache$inflight <- NULL
+  .ct_julia_cache$deferred <- NULL
+  .ctJuliaUnregister(.ct_julia_cache$pid)
+  .ct_julia_cache$pid <- NULL
+  .ct_julia_cache$pid_session <- NULL
+  if (!is.null(.ct_julia_cache$interrupt_file)) unlink(.ct_julia_cache$interrupt_file)
+  .ct_julia_cache$interrupt_file <- NULL
+  .ct_julia_cache$objectives <- new.env(parent = emptyenv())
+  .ct_julia_cache$layouts <- new.env(parent = emptyenv())
+  local_env <- tryCatch(get("pkgLocal", envir = asNamespace("JuliaConnectoR")),
+    error = function(e) NULL)
+  queued <- if (is.null(local_env)) NULL else local_env$finalizedRefs
+  # Two passes, as .ctJuliaClearSession(): the first frees the proxies, the
+  # second any proxy a finalizer from the first pass happened to drop.
+  gc(verbose = FALSE); gc(verbose = FALSE)
+  if (!is.null(local_env)) try(local_env$finalizedRefs <- queued, silent = TRUE)
+  invisible(NULL)
+}
+
+# Called before every read of cached session state, and idempotent.
+#
+# Three callers, because there are three ways in: `.ctJuliaModule()` reads the
+# module, `.ctJuliaCached()` reads an objective *before* the module is asked
+# for, and `.ctJuliaSessionRunning()` answers whether a session exists at all.
+# Checking in one of them would leave the others handing back dead handles.
+#
+# A stamp that could not be read is stored as NULL and then matches a session
+# that cannot be read either, so a JuliaConnectoR whose internals have moved
+# leaves this a no-op and the backend exactly as it behaved before. That is the
+# safe direction: the alternative -- distrusting an unreadable stamp -- would
+# invalidate the cache on every call and rebuild the engine forever.
+#
+# First, whether the process is still there at all -- before the early return,
+# because a session whose engine never loaded has no module and is still one
+# the next `juliaEval()` would write into.
+.ctJuliaCheckSession <- function() {
+  .ctJuliaCheckAlive()
+  if (is.null(.ct_julia_cache$module)) return(invisible(FALSE))
+  if (identical(.ctJuliaSessionStamp(), .ct_julia_cache$session)) return(invisible(FALSE))
+  .ctJuliaForgetSession()
+  message("The julia session this model was compiled in has ended; rebuilding.")
+  invisible(TRUE)
+}
+
+# A Julia process that has gone, told apart from one that is only idle ---------
+#
+# A Julia that exits leaves R's end of the socket open. `isOpen()` still says
+# yes and the session stamp still matches, so the next call writes into the
+# socket, warns "problem writing to connection", and waits for a reply that
+# cannot come: JuliaConnectoR's read loop takes end-of-file for "nothing yet"
+# and spins at full CPU for as long as the R session lasts. Nothing errors, and
+# a suite run in that state hangs rather than fails.
+#
+# So the socket is asked, without blocking. Nothing waiting is a live session
+# at rest. Something waiting is either end-of-file -- the process has gone --
+# or output a Julia task printed after the last call returned, which the next
+# call would have printed first; that is printed now instead, so the stream
+# stays in step. Anything else
+# waiting between calls means the stream is already out of step, and a session
+# in that state is no more usable than a dead one.
+#
+# The internals are resolved before anything is read: if they have moved, the
+# answer is "not gone", which is how the backend behaved before this existed.
+#
+# The message is read here rather than by JuliaConnectoR's `readOutput`, whose
+# length read loops on `readBin` until it has four bytes -- forever, at end of
+# file. A process that dies mid-message leaves exactly that, and on Linux every
+# SIGTERM does: Julia prints its signal report to stderr on the way out, so
+# the socket holds a stderr marker, part or all of a message, then end of
+# file. Windows ends a process without a word, which is why this only hung on
+# Linux, where test-julia-backend.R's killed-session test spun at full CPU.
+.ctJuliaPeerGone <- function(connection) {
+  jc <- tryCatch({
+    ns <- asNamespace("JuliaConnectoR")
+    list(stdout = get("STDOUT_INDICATOR", envir = ns),
+      stderr = get("STDERR_INDICATOR", envir = ns))
+  }, error = function(e) NULL)
+  if (is.null(jc)) return(FALSE)
+  repeat {
+    if (!isTRUE(.ctSocketReadable(connection))) return(FALSE)
+    first <- .ctJuliaReadBytes(connection, 1L)
+    if (is.null(first)) return(TRUE)
+    stream <- if (identical(first, jc$stdout)) stdout() else
+      if (identical(first, jc$stderr)) stderr() else NULL
+    if (is.null(stream)) return(TRUE)
+    output <- .ctJuliaReadOutput(connection)
+    if (is.null(output)) return(TRUE)
+    cat(output, file = stream)
+  }
+}
+
+# Exactly `n` bytes from a socket, or NULL at end of file. A read that returns
+# nothing is end of file when the socket says it is readable, and more still to
+# come when it is not -- for up to `wait` seconds of silence, after which the
+# stream is taken as out of step and NULL returned too.
+#
+# Five seconds suits the liveness check between calls, where nothing should
+# be arriving at all. It does not suit a read during a call: JuliaConnectoR
+# relays Julia's output from a task pinned to Julia's main thread, writing a
+# message's marker, length and text separately, so a message can stop after
+# its marker for as long as that thread is busy -- loading the engine's package
+# image, say, for longer than five seconds. The bridge waits with `Inf`, and
+# only the end of the stream ends the wait: a Julia that has died closes its
+# socket, which reads as readable and empty.
+.ctJuliaReadBytes <- function(connection, n, wait = 5) {
+  read <- function() tryCatch(suppressWarnings(readBin(connection, "raw", n - length(out))),
+    error = function(e) raw(0))
+  out <- raw(0)
+  while (length(out) < n) {
+    got <- read()
+    if (!length(got)) {
+      waited <- 0
+      repeat {
+        step <- min(1, wait - waited)
+        ready <- tryCatch(socketSelect(list(connection), timeout = step),
+          error = function(e) NA)
+        if (is.na(ready)) return(NULL)
+        if (isTRUE(ready)) break
+        waited <- waited + step
+        if (waited >= wait) return(NULL)
+      }
+      got <- read()
+      if (!length(got)) return(NULL)
+    }
+    out <- c(out, got)
+  }
+  out
+}
+
+# Whether a socket has something to read, answered at once.
+#
+# `socketSelect(list(con), timeout = 0)` is not that on Windows: R's select
+# loop there waits out a fixed 200 ms interval before it consults the timeout,
+# so a socket with nothing waiting -- a live session at rest, the usual case --
+# costs 204 ms a call (R 4.6.0). The liveness check above runs as operations
+# come in, twice for some, so every Julia call there was 0.2-0.4 s slower and a
+# function making hundreds of them minutes slower: ctVarianceDecomposition's
+# test file went from 215 s to 45 minutes, both processes idle throughout.
+# Asking about writing on the same socket in the same call ends the wait at
+# once, since a connected socket with an empty send buffer is writable, and
+# leaves the read answer as it was -- a peer that has gone still reads as
+# readable, which is how the check finds it.
+.ctSocketReadable <- function(connection) {
+  ready <- tryCatch(socketSelect(list(connection, connection),
+    write = c(FALSE, TRUE), timeout = 0), error = function(e) NA)
+  ready[1L]
+}
+
+# Refuse, by name, to call into a Julia process that has gone.
+#
+# Both caches still pointing at it are cleared first -- ctsem's, and
+# JuliaConnectoR's connection -- so this errors once and the call after it
+# starts a new session rather than writing into the old socket.
+# `stopJulia()` would write its goodbye into the dead socket first, which is
+# harmless and warns.
+.ctJuliaCheckAlive <- function() {
+  # Bytes waiting are expected while an interrupted call's reply is owed, and
+  # collecting that reply notices a process that has gone.
+  if (!is.null(.ct_julia_cache$inflight)) return(invisible(TRUE))
+  connection <- tryCatch(get("pkgLocal",
+    envir = asNamespace("JuliaConnectoR"))$con, error = function(e) NULL)
+  if (is.null(connection) ||
+    !isTRUE(tryCatch(isOpen(connection), error = function(e) FALSE)) ||
+    !.ctJuliaPeerGone(connection)) {
+    return(invisible(TRUE))
+  }
+  .ctJuliaForgetSession()
+  suppressWarnings(try(JuliaConnectoR::stopJulia(), silent = TRUE))
+  stop("The Julia session has ended: its process is no longer running. ",
+    "Calling again starts a new one.", call. = FALSE)
+}
+
+# The objective cache, read and written only through these three.
+#
+# The read is where the staleness check has to happen: `.ctJuliaObjective()`
+# answers from the cache without ever asking for the module, so a check placed
+# only at the module would never see the call that fails.
+.ctJuliaCached <- function(key) {
+  .ctJuliaCheckSession()
+  if (!exists(key, envir = .ct_julia_cache$objectives, inherits = FALSE)) return(NULL)
+  get(key, envir = .ct_julia_cache$objectives, inherits = FALSE)
+}
+
+.ctJuliaCacheStore <- function(key, objective) {
+  assign(key, objective, envir = .ct_julia_cache$objectives)
+  objective
+}
+
+# Drops a specification's objectives from the cache -- the one whose own
+# variances the filter integrates (`hybrid = TRUE`) and the one without -- so
+# that once no caller holds them, R's collector releases the proxies and
+# JuliaConnectoR lets go of them. For an objective built for data no later
+# call will see again, a cross-validation fold's training data, which the
+# cache would otherwise hold for the rest of the session with every workspace
+# it grew.
+.ctJuliaForgetObjective <- function(object) {
+  spec <- if (inherits(object, "ctJuliaFit")) object$model_spec else object
+  for (hybrid in c(FALSE, TRUE)) {
+    variant <- spec
+    if (!hybrid && !is.null(variant$laplace$hybrid)) variant$laplace$hybrid <- NULL
+    key <- .ctJuliaObjectiveKey(variant)
+    if (exists(key, envir = .ct_julia_cache$objectives, inherits = FALSE)) {
+      rm(list = key, envir = .ct_julia_cache$objectives)
+    }
+  }
+  invisible(NULL)
+}
+
+.ctJuliaTuneBridge <- function() {
+  # `ctsem.julia.tunebridge = FALSE` leaves the socket exactly as JuliaConnectoR
+  # opened it. It exists as an escape hatch and as the control arm for measuring
+  # what the tuning is worth: the options are set on the connection, so an A/B
+  # needs two sessions rather than a switch inside one.
+  if (!isTRUE(getOption("ctsem.julia.tunebridge", TRUE))) return(invisible(NA_integer_))
+  # `ctsem.julia.quickack` is how often the Julia task re-arms TCP_QUICKACK, in
+  # seconds; zero or less asks for no task at all, which leaves the Nagle half of
+  # the fix in place and the R->Julia half not. Floored at 0.1 ms rather than
+  # taken literally: the task's `sleep` becomes a spin below that, and the stall
+  # it is removing is 40 ms, so there is nothing to win by asking for less.
+  interval <- getOption("ctsem.julia.quickack", 0.001)
+  if (!is.numeric(interval) || length(interval) != 1L || is.na(interval)) {
+    interval <- 0.001
+  } else if (interval > 0) {
+    interval <- max(interval, 1e-4)
+  }
+  communicator <- .ctJuliaCommunicator()
+  if (is.null(communicator)) return(invisible(NA_integer_))
+  out <- tryCatch(as.integer(.ctBackendJuliaValue(.ctJuliaCall(
+    "ContinuousTimeSEM.ctsem_tune_bridge!", communicator,
+    quickack_interval = as.numeric(interval)))),
+    error = function(e) NA_integer_)
+  invisible(out)
+}
+
+.ctJuliaModule <- function(project = NULL) {
+  .ctJuliaCheckSession()
+  if (!is.null(.ct_julia_cache$module) && identical(project, .ct_julia_cache$project)) return(.ct_julia_cache$module)
+  ctJuliaSetup(project = project)
+  .ct_julia_cache$module
+}
+
+# Drop every Julia proxy *before* stopping Julia, and collect them while the
+# session that issued them is still there to hear it.
+#
+# JuliaConnectoR hands R proxy objects that hold a reference counted on the
+# Julia side, and releases them from an R finalizer. Stopping Julia first and
+# clearing the cache afterwards leaves those proxies alive with nothing to talk
+# to: their finalizers run whenever R next collects, which may be after a new
+# session has started, and the decrement then names a reference that session
+# never issued. That surfaces as
+#
+#     KeyError: key 0x0000... not found
+#       decrefcount!(communicator, ref) at sharing.jl:134
+#
+# from inside an unrelated later call. Order is the whole fix -- release, then
+# collect, then stop.
+.ctJuliaClearSession <- function() {
+  # A session still working on an interrupted call would not read the goodbye
+  # until that call ends, which may be a compile away; it is ended outright.
+  if (!is.null(.ct_julia_cache$inflight)) return(.ctJuliaKill())
+  .ct_julia_cache$module <- NULL
+  .ct_julia_cache$project <- NULL
+  .ct_julia_cache$engine <- NULL
+  .ct_julia_cache$session <- NULL
+  .ct_julia_cache$deferred <- NULL
+  .ctJuliaUnregister(.ct_julia_cache$pid)
+  .ct_julia_cache$pid <- NULL
+  .ct_julia_cache$pid_session <- NULL
+  if (!is.null(.ct_julia_cache$interrupt_file)) unlink(.ct_julia_cache$interrupt_file)
+  .ct_julia_cache$interrupt_file <- NULL
+  .ct_julia_cache$objectives <- new.env(parent = emptyenv())
+  .ct_julia_cache$layouts <- new.env(parent = emptyenv())
+  # Two passes: the first frees the proxies, the second any proxy a finalizer
+  # from the first pass happened to drop.
+  gc(verbose = FALSE); gc(verbose = FALSE)
+  if (requireNamespace("JuliaConnectoR", quietly = TRUE)) {
+    try(JuliaConnectoR::stopJulia(), silent = TRUE)
+  }
+  invisible(NULL)
+}
+
+# What Escape during a fit leaves behind, one layer above the Julia session.
+#
+# The session itself needs nothing here any more: an interrupted call leaves
+# its reply owed rather than half read, and the next call collects it
+# (R/ctJuliaBridge.R), so the session and everything it compiled survive.
+#
+# The worker pool still has to go. A sampled fit runs its chains in
+# `future::multisession` workers, and Escape during one leaves two kinds of
+# wreckage: the chains keep running, so every worker is still busy when the
+# next fit asks for one, and if the interrupt landed while the parent was
+# reading a worker's result then that socket is desynchronised. Reported from a
+# real session as workers that "seem broken", after which sampling silently
+# fell back to one process for the rest of the session. Dropping the pool costs
+# each worker's compiled shapes; an unusable pool lasts as long as the session.
+#
+# `withCallingHandlers` rather than `tryCatch`: the handler runs and the
+# interrupt then carries on unwinding, so Escape still aborts the fit.
+#
+# Two further catches. JuliaConnectoR, on the paths it still handles itself,
+# ends Julia on Escape and returns NULL instead of passing the interrupt on; its
+# "Stopping Julia" message is noted, and the error that NULL then causes, or
+# the next call, stops the fit as an interrupt rather than letting it carry on
+# into a new session. And a Julia that died between two of the fit's calls:
+# JuliaConnectoR only warns when a write into its socket fails, so the warning
+# is the moment to say so -- matched on the call, since the message is
+# translated.
+#' @keywords internal
+.ctJuliaInterruptSafe <- function(expr) {
+  withCallingHandlers(expr, interrupt = function(cnd) {
+    pool <- isNamespaceLoaded("future") &&
+      isTRUE(tryCatch(inherits(future::plan(), "multisession"), error = function(e) FALSE))
+    try(.ctBackendWarmStop(NULL), silent = TRUE)
+    if (pool) message("Sampling workers stopped.")
+  }, message = .ctJuliaNoteSwallowed, error = function(cnd) {
+    .ctJuliaCheckSwallowed()
+  }, warning = function(cnd) {
+    call <- conditionCall(cnd)
+    if (is.call(call) && identical(call[[1L]], as.name("writeBin"))) {
+      .ctJuliaCheckAlive()
+    }
+  })
+}
+
+# The identity of a cached objective: the digest of every value the builder
+# sends to Julia, as `.ctJuliaObjectiveInputs` assembles them, plus the engine
+# and project that receive them.
+#
+# Derived rather than listed. The key used to name spec fields one at a time,
+# and three times a field the builder read was missing from it -- the random
+# effect integration, `covmatcode`, and then `manifesttype` with the censoring
+# limits -- and each time a model built after another on the same data was
+# handed the earlier objective and silently returned the earlier likelihood.
+# Hashing the builder's own inputs means a new argument is in the key the
+# moment it is sent, and a spec field nothing sends cannot split the cache.
+.ctJuliaObjectiveKey <- function(spec, inputs = .ctJuliaObjectiveInputs(spec)) {
+  if (!requireNamespace("digest", quietly = TRUE)) {
+    stop("Julia objective caching requires the suggested package digest.", call. = FALSE)
+  }
+  digest::digest(list(inputs, spec$project, spec$engine), algo = "sha256")
+}
+
+.ctJuliaSubjectStarts <- function(ids) {
+  if (!length(ids)) stop("The Julia backend requires at least one observation.", call. = FALSE)
+  if (length(ids) == 1L) return(1L)
+  c(1L, which(ids[-1L] != ids[-length(ids)]) + 1L)
+}
+
+.ctJuliaNumericVector <- function(values) {
+  values <- as.numeric(values)
+  if (!length(values)) return(.ctJuliaEval("Float64[]"))
+  # JuliaConnectoR maps an R length-one numeric to a scalar, so a length-one
+  # vector has to go across as a list to arrive as an AbstractVector. Every
+  # other length must NOT: `juliaPut` marshals a plain numeric vector as a
+  # binary block and a list element by element, and both arrive as the same
+  # `Vector{Float64}`. Measured on this machine, marshalling the parameter
+  # vector of a 1490-parameter model took 0.069 s as a list against 0.0002 s
+  # as a vector -- 344x, and *half the total wall time of a gradient call*,
+  # which made every published Julia backend timing mostly JuliaConnectoR
+  # rather than Julia. This function is called once per objective evaluation,
+  # so it sits directly in the optimizer's inner loop.
+  .ctJuliaPut(if (length(values) == 1L) list(values) else values)
+}
+
+# Replace NA with the sentinel the engine's column API expects. Done here rather
+# than in Julia so every column arrives concretely typed, with no
+# `Union{Missing,T}` in the model constructor.
+.ctJuliaNoNA <- function(values, sentinel) {
+  values[is.na(values)] <- sentinel
+  values
+}
+
+# Marshal an atomic vector, preserving vector-ness. JuliaConnectoR maps a
+# length-one R vector to a Julia scalar, so that case has to go across as a
+# list; every other length must not, because a list is marshalled element by
+# element (see .ctJuliaNumericVector).
+.ctJuliaVector <- function(values) {
+  if (!length(values)) {
+    stop("Internal error: an empty vector cannot be marshalled to Julia; ",
+      "omit the argument instead.", call. = FALSE)
+  }
+  .ctJuliaPut(if (length(values) == 1L) list(values) else values)
+}
+
+# Raw starting values for the reduced-rank loadings, or NULL when the model has
+# none.
+#
+# Every other parameter can start at raw zero because its transform decides what
+# that means. A loading's transform is linear, so raw zero means a population
+# covariance of zero -- and `Sigma = L L'` has `dSigma/dL = 0` there, so the
+# origin is a stationary point of the map rather than merely a small value.
+# Measured fit-free on a 3-latent, 6-effect model at 90 subjects, the loading
+# gradients at `initsd = .01` are 6.3 against 131.9 for the rest of the model,
+# where the full covariance's own block is 52.4 at the same point: `initsd` was
+# tuned for coordinates in which raw zero means a population sd of 3.47.
+#
+# So each basis effect's own diagonal loading starts at raw 1, which its linear
+# transform turns into one `sdscale` of spread: a diagonal population covariance
+# of `sdscale^2`. The off-diagonals need nothing, because
+# `dSigma[i,m]/dL[i,m] = L[m,m]` and a unit diagonal gives them an O(1)
+# gradient too.
+#
+# The diagonal is the largest dimension each basis effect loads on: the matrix
+# is triangular in its first `r` rows, so the effect at position `pos` loads on
+# dimensions `1..pos` and `pos` is its own.
+.ctJuliaLoadingStart <- function(spec) {
+  loadings <- spec$model$popregression$loadings
+  if (is.null(loadings) || !nrow(loadings)) return(NULL)
+  pt <- spec$parameter_table
+  if (is.null(pt) || !all(c("param", "parnumber") %in% names(pt))) return(NULL)
+  own <- vapply(split(loadings, loadings$param), function(rows)
+    rows$loading[which.max(rows$dimension)], character(1L))
+  number <- pt$parnumber[match(own, as.character(pt$param))]
+  number <- number[!is.na(number)]
+  if (!length(number)) return(NULL)
+  number
+}
+
+# How much a raw unit is worth, per parameter.
+#
+# `|d value / d raw|` from each parameter's own transform, evaluated at the
+# starting point. With `optimcontrol$precondition = TRUE` the optimiser uses it
+# as a diagonal metric so that a step of one unit means the same amount of
+# *model* in every coordinate -- see `ctsem_optimize`'s `precondition`. Off by
+# default since L-BFGS learns a scale per coordinate; the call site says why.
+#
+# Read from the parameter table, which is where the transform text lives;
+# `model$pars$transform` holds the numeric transform code and would silently
+# differentiate to zero. A parameter appearing in several cells takes the
+# largest factor, since that is the one that sets how far a step goes wrong.
+# Anything that cannot be differentiated finitely gets 1, which is the same as
+# not preconditioning that coordinate.
+#' @keywords internal
+.ctJuliaParameterScale <- function(spec, at = NULL, npar = NULL) {
+  pt <- spec$parameter_table
+  if (is.null(pt)) return(NULL)
+  pt <- as.data.frame(pt, stringsAsFactors = FALSE)
+  if (!all(c("parnumber", "transform") %in% names(pt))) return(NULL)
+  rows <- which(!is.na(pt$parnumber) & pt$parnumber > 0 &
+    !is.na(pt$transform) & nzchar(pt$transform))
+  if (!length(rows)) return(NULL)
+  width <- max(pt$parnumber, na.rm = TRUE)
+  if (is.null(npar) || !is.finite(npar)) npar <- width
+  if (is.null(at) || length(at) < width) at <- rep(0, width)
+  out <- rep(1, npar)
+  # An environment whose parent is this frame: `eval()` given a list looks
+  # unresolved names up in `parent.frame()`, which from inside a numerical
+  # derivative is not this package.
+  scope <- new.env(parent = environment())
+  for (i in rows) {
+    number <- as.integer(pt$parnumber[i])
+    if (number > npar) next
+    expr <- try(parse(text = pt$transform[i]), silent = TRUE)
+    if (inherits(expr, "try-error")) next
+    value <- function(v) {
+      x <- at[seq_len(width)]
+      x[number] <- v
+      assign("param", x, envir = scope)
+      got <- try(eval(expr, scope), silent = TRUE)
+      if (inherits(got, "try-error") || length(got) != 1L) NA_real_ else
+        as.numeric(got)
+    }
+    base <- at[number]
+    step <- 1e-4 * max(1, abs(base))
+    up <- value(base + step); down <- value(base - step)
+    if (!is.finite(up) || !is.finite(down)) next
+    d <- abs(up - down) / (2 * step)
+    if (!is.finite(d) || d <= 0) next
+    out[number] <- max(out[number], d)
+  }
+  out
+}
+
+.ctJuliaInitialValues <- function(npar, inits = NULL, initsd = .01,
+  spec = NULL) {
+  # Match stanoptimis(): absent initial values are small, R-seeded draws in
+  # unconstrained space rather than an exact all-zero vector, and `initsd` is
+  # its name for the scale, with its default.
+  if (is.null(inits) || identical(inits, "random")) {
+    out <- stats::rnorm(npar, 0, as.numeric(initsd)[1L])
+    # Not optional and not jittered. A supplied `inits` is never touched --
+    # a starting value the caller chose is the one thing here that is not a
+    # guess -- but a random start has to leave the origin, whatever
+    # `optimcontrol$datastart` says, because this is the parameterisation and
+    # not the data's scale.
+    diagonal <- if (is.null(spec)) NULL else .ctJuliaLoadingStart(spec)
+    if (length(diagonal)) out[diagonal[diagonal <= npar]] <- 1
+    return(out)
+  }
+  # Another julia fit's estimates, matched to this model by name.
+  values <- if (inherits(inits, "ctFit") && .ctFitIsJulia(inits))
+    .ctJuliaInitsFromFit(inits, spec, npar) else as.numeric(inits)
+  if (length(values) != npar) {
+    stop("inits has ", length(values), " value", if (length(values) != 1L) "s",
+      "; the model has ", npar, " free parameters, one value each on the raw ",
+      "scale (as fit$estimate$raw holds them). Julia initial values must have ",
+      "one entry per free parameter.", call. = FALSE)
+  }
+  if (anyNA(values)) stop("Julia initial values must be numeric.", call. = FALSE)
+  values
+}
+
+# Starting values from another julia fit, by raw parameter name: a model
+# extended by a covariate or a smooth starts where the old one stopped, and its
+# new coordinates at zero, no effect. A level's correlation coordinates are
+# carried only where the level varies the same parameters, since they mean
+# something else in a block of another size.
+.ctJuliaInitsFromFit <- function(old, spec, npar) {
+  if (is.null(spec)) stop("Internal: starting values from a fit need the ",
+    "prepared specification.", call. = FALSE)
+  raw <- as.numeric(.ctFitRawEstimate(old))
+  oldnames <- .ctBackendRawParameterNames(old, length(raw))
+  newnames <- .ctBackendRawParameterNames(list(model_spec = spec), npar)
+  values <- raw[match(newnames, oldnames)]
+  spread <- function(names) sort(names[grepl("^popsd_", names)])
+  if (!identical(spread(oldnames), spread(newnames))) {
+    values[grepl("^rawcor_", newnames)] <- NA
+  }
+  carried <- sum(!is.na(values))
+  values[is.na(values)] <- 0
+  message("Starting values from the fit for ", carried, " of ", npar,
+    " parameters; the rest start at zero.")
+  values
+}
+
+.ctJuliaUnsupported <- function(model, optimize, priors, intoverpop, gendata,
+  stanmodeltext, compileArgs, forcerecompile, intoverstates = TRUE,
+  optimcontrol = list(), savescores = FALSE, savesubjectmatrices = FALSE,
+  dots = character()) {
+  failures <- character()
+  # `optimcontrol$is` selects Stan's optimization-plus-importance-sampling
+  # route (see R/ctFit.R's estimation-method message); the julia path's only
+  # uncertainty methods are the Hessian and ctOptimUncertainty()'s sampling,
+  # neither of which is importance sampling, so silently ignoring it would
+  # leave the user told one thing happened when another did.
+  if (isTRUE(optimcontrol$is)) {
+    failures <- c(failures, "optimcontrol$is (importance sampling)")
+  }
+  # `intoverstates=FALSE` fits over the joint density of parameters and states
+  # (see `state_sampling.jl`), which composes with the augmented route --
+  # augmented random effects are extra states, so they are sampled along with
+  # every other one -- and does not compose with the Laplace route, which wraps
+  # the likelihood in an inner problem the state path replaces.
+  if (!isTRUE(intoverstates) && identical(as.character(intoverpop)[1L], "laplace")) {
+    failures <- c(failures,
+      "intoverstates=FALSE together with intoverpop='laplace'")
+  }
+  # A refusal that depends on `nlcontrol`, or on which random-effect route was
+  # taken, cannot live here: this function is called twice from `ctFit()`
+  # (ctFit.R), and neither call can ask. The first runs before `nlcontrol` is
+  # attached to the model, so `model$nlcontrol` reads NULL whatever the caller
+  # set. By the second, `ctFit()` has already turned `intoverpop` into the
+  # plain logical that drives augmentation everywhere downstream (TRUE only for
+  # `'augmented'`), so a `'laplace'` route and a `'none'` route are both FALSE
+  # here. Ask the prepared `model_spec` in `.ctFitJuliaBackendImpl()` instead,
+  # with `.ctBackendIntOverPop()`.
+  # `optimize=FALSE` is supported now: the engine has its own No-U-Turn sampler,
+  # and which target it samples is decided by `intoverpop`. See
+  # `.ctJuliaSampleFit`.
+  # Binary and ordinal manifest variables are supported now: the filter
+  # integrates the observation rather than linearising it, which is why it is
+  # worth having here at all. See
+  # inst/julia/ContinuousTimeSEM/src/binary_measurement.jl.
+  if (any(!model$manifesttype %in% 0:4)) {
+    failures <- c(failures, "manifest types beyond censored (manifesttype > 4)")
+  }
+  # `covmattransform` reaches the engine at every construction site, including
+  # the population covariance and the laplace route, and 'rawcorr', 'cholesky'
+  # and 'z' agree with stan to machine precision.
+  #
+  # 'cholesky' used to be refused because the engine could not build it: the
+  # branch selecting the factor form was commented out, so a code of 1 fell
+  # through to the correlation square root. Before it was refused it was
+  # accepted and silently ignored, and a 'cholesky' model measured 3.76 log
+  # units away from the same model on stan with no error and no warning --
+  # which is why the refusal came first and the implementation second.
+  #
+  # 'rawcorr_indep' (code -1) is still refused, and not because the engine
+  # cannot build it: it selects the same construction as 'rawcorr' and differs
+  # only in the prior, so accepting it would mean accepting a setting that
+  # does nothing. That is an accident of the stan path and the julia contract
+  # does not inherit it.
+  if (!is.null(model$covmattransform) &&
+      !as.character(model$covmattransform)[1L] %in%
+        c("rawcorr", "cholesky", "z")) {
+    failures <- c(failures, paste0("covmattransform='",
+      as.character(model$covmattransform)[1L],
+      "' (only 'rawcorr', 'cholesky' and 'z')"))
+  }
+  if (isTRUE(gendata)) failures <- c(failures, paste0("generation through ",
+    "the fit call (gendata=TRUE); use ctGenerate(), or ctGenerateFromFit() ",
+    "on a fit"))
+  # `forcerecompile` is honoured on julia: it compiles the model's expressions
+  # (`.ctJuliaObjectiveInputs`).
+  if (!is.na(stanmodeltext)[1] || length(compileArgs) > 0L) failures <- c(failures, "Stan compilation controls (stanmodeltext, compileArgs)")
+  # Stored on a stan fit at fit time; the julia path computes them after the
+  # fit instead, and accepting the flag would promise output it never writes.
+  saved <- c("savescores", "savesubjectmatrices")[c(isTRUE(savescores),
+    isTRUE(savesubjectmatrices))]
+  if (length(saved)) failures <- c(failures, paste0(paste(saved,
+    collapse = " and "), ", which a julia fit computes afterwards: ",
+    "ctKalman() for the filter output, ctSubjectPars() for subject matrices"))
+  # `...` reaches rstan::stan() on the stan path and nothing on this one.
+  if (length(dots)) failures <- c(failures, paste0("the extra argument",
+    if (length(dots) > 1L) "s" else "", " ", paste(dots, collapse = ", "),
+    ", which only backend='stan' passes on (to rstan::stan())"))
+  if (length(failures)) stop("backend='julia' (the default) does not support ",
+    paste(failures, collapse = "; "), ".", call. = FALSE)
+}
+
+.ctJuliaTDExpression <- function(expression) {
+  # ctModelStatesAndPARS emits Stan-style row references. Julia receives the
+  # current row as a vector in CTSEMRowContext instead, and the subject's time
+  # independent predictors beside it.
+  expression <- gsub("tdpreds\\[rowi\\s*,\\s*([0-9]+)\\]", "ctx.tdpreds[\\1]",
+    expression, perl = TRUE)
+  expression <- gsub("(?<![.\\w])tipreds\\[\\s*([0-9]+)\\s*\\]", "ctx.tipreds[\\1]",
+    expression, perl = TRUE)
+  expression
+}
+
+# stationary = TRUE starts the latent processes from the distribution DRIFT,
+# CINT and DIFFUSION settle into, which exists only while those are the
+# subject's constants. A cell of theirs over the latent processes that reads a
+# state or a time dependent predictor -- directly, or through a PARS or other
+# cell that does -- describes a different system at every state and row. The
+# engine evaluates the stationary moments once, at the first row and a
+# placeholder state (`_ctsem_stationary!`), so such a model would start from
+# the distribution of a system it is not; refused here, by cell. A state past
+# `nlatent` is a random effect the augmented route carries as a state, and
+# 'laplace' is the route that keeps it fixed for each subject. `rows` are the
+# latents whose moments are needed: all of them, or for single stationary
+# elements the closure of the marked ones.
+.ctJuliaStationaryCheck <- function(table, nlatent, rows = seq_len(nlatent)) {
+  blank <- function(x) .ctJuliaNoNA(as.character(x), "")
+  expression <- paste(blank(table$predicttransform),
+    blank(table$updatetransform), blank(table$tdtransform))
+  key <- paste(table$matrix, table$row, table$col)
+  cellpattern <- "\\b([A-Za-z][A-Za-z0-9]*)\\s*\\[\\s*(\\d+)\\s*(?:,\\s*(\\d+)\\s*)?\\]"
+  reach <- lapply(expression, function(e) {
+    found <- regmatches(e, gregexpr(cellpattern, e, perl = TRUE))[[1L]]
+    if (!length(found)) return(integer(0))
+    parts <- regmatches(found, regexec(cellpattern, found, perl = TRUE))
+    match(vapply(parts, function(p) paste(p[2L], p[3L],
+      if (nzchar(p[4L])) p[4L] else "1"), character(1)), key)
+  })
+  states <- lapply(expression, function(e) as.integer(regmatches(e,
+    gregexpr("(?<=\\bstate\\[)\\s*\\d+", e, perl = TRUE))[[1L]]))
+  varying <- lengths(states) > 0L | grepl("tdpreds\\s*\\[", expression)
+  carrier <- vapply(states, function(s) any(s > nlatent), logical(1))
+  repeat {
+    through <- function(flag) flag | vapply(reach, function(i)
+      any(flag[i], na.rm = TRUE), logical(1))
+    nextvarying <- through(varying)
+    nextcarrier <- through(carrier)
+    if (identical(nextvarying, varying) && identical(nextcarrier, carrier)) break
+    varying <- nextvarying
+    carrier <- nextcarrier
+  }
+  dynamics <- table$matrix %in% c("DRIFT", "CINT", "DIFFUSION") &
+    table$row %in% rows & (table$matrix %in% "CINT" | table$col <= nlatent)
+  bad <- which(dynamics & varying)
+  if (!length(bad)) return(invisible(TRUE))
+  cells <- paste(paste0(table$matrix[bad], "[", table$row[bad], ",",
+    table$col[bad], "]"), collapse = ", ")
+  if (any(carrier[bad])) stop("Stationary initial conditions need DRIFT, CINT ",
+    "and DIFFUSION fixed within each subject, and intoverpop = 'augmented' ",
+    "carries the individual variation in ", cells, " as a state. Use ",
+    "intoverpop = 'laplace'.", call. = FALSE)
+  stop("Stationary initial conditions need DRIFT, CINT and DIFFUSION fixed ",
+    "within each subject, and ", cells, " depend on the latent states or on time ",
+    "dependent predictors, so there is no one stationary distribution. ",
+    "Estimate T0MEANS and T0VAR instead.", call. = FALSE)
+}
+
+.ctJuliaCanonicalModel <- function(model) {
+  # ctFit has already established the canonical, augmented layout before it
+  # dispatches to a backend. Reusing it keeps the state and parameter ordering
+  # identical to Stan's matsetup/matvalues contract.
+  if (!is.null(model$modelmats) && !is.null(model$intoverpop)) return(model)
+  # A model no fit has set up -- an internal caller, or a test, handing the
+  # preparation a model as written -- set up as a fit sets it up, by the same
+  # code (`.ctFitModelSetup()`), on the route that does not augment. A partial
+  # copy of those steps stood here, and missed every step added to ctFit. The
+  # caller's random stream is put back: the setup's draws are a fit's, for
+  # its starting values, and nothing here fits.
+  # The route is the one an optimising julia fit takes, chosen on the model as
+  # set up, as the generator chooses it: a 'stationary' T0MEANS cell is a
+  # varying intercept until the setup fixes it.
+  keep <- .ctStreamKeep()
+  tryCatch(.ctFitModelSetup(model, intoverpop = "auto", checks = FALSE)$ctm,
+    finally = keep())
+}
+
+# A reference inside a matrix the engine evaluates once, from the parameters
+# alone -- T0MEANS and T0VAR are the two -- rather than per row or per state.
+#
+# `PARS[k,1]` there is not dynamics, it is aliasing. Declaring a parameter in
+# PARS and naming it in several cells is how ctsem shares one parameter
+# between them, and `.ctModelIntOverPop()` rewrites every such use into a
+# reference. The value is known as soon as the parameter vector is; there is
+# nothing to evaluate per row. This used to be refused wholesale, by a check
+# that fired on any `[` in the cell and reported every case as "does not
+# support a state-dependent expression in ..." -- including, as here, cells
+# with no state in them at all. What it actually stopped was a
+# behaviour-genetics model whose T0MEANS is four cells sharing two PARS
+# parameters.
+#
+# So resolve it the way the T0MEANS *state* references above are resolved:
+# compose the transform text at model-build time, leaving an ordinary
+# transformed free parameter that needs no engine support. Refuse only what
+# genuinely cannot be resolved, and say which of the four reasons it is.
+#
+# Any number of distinct references per cell. This used to be one, because
+# `parameter_transforms.jl` materialised each cell from exactly one entry of
+# the parameter vector, `sp.parnumber[tf_idx]`, and `adjoint_parameters.jl`
+# built its parameter-layer pullback on that -- one seeded dual, one scalar
+# derivative. A cell over two raw parameters had no single `parnumber` to
+# give, so it was refused rather than mis-indexed, which would have been a
+# wrong gradient rather than an error. The forward pass never needed the
+# restriction: the composed text is just Julia source and evaluates fine.
+#
+# What lifted it was making the pullback read the support set that
+# `_ctsem_regular_transform_supports` already *discovers* exactly, with a
+# recording vector, instead of asserting it equals `[parnumber]`. `parnumber`
+# is now the cell's representative parameter -- it still marks the position as
+# mutable and sizes the subject buffer -- and the julia side verifies that it
+# is a member of the discovered support, which is the part of the old
+# assertion that still catches an R-side rendering mistake.
+#
+# `stateref`-style multiplicity is not affected: a cell still belongs to one
+# matrix position and is still written once per evaluation.
+#
+# The referencing cell's own `transform` is dropped, not composed on top of
+# the referenced value. Measured against stan, which is the reference: for
+# `PARS = 'a'` with `T0MEANS = c('a','a')`, whose cells carry ctsem's default
+# `10 * param`, stan reports T0MEANS[1,1] equal to PARS[1,1] and not ten
+# times it. The comment above `use_mapped` says the same thing from the other
+# side -- a parameter reused in another matrix must not reapply that cell's
+# local transform.
+#
+# Circularity is caught here by `visited`, and again, earlier and with a
+# better message, by `ctModelCycleCheck.R` when the model is built. Both are
+# worth having: this one also covers a chain that only exists after
+# `.ctModelIntOverPop()` has rewritten the cells.
+# Any cell of the table read by matrix, row and column -- PARS, or another
+# system matrix such as the `DRIFT[1,1]` a drift-scaled diffusion reads. The
+# name is matched against the table's matrices, so `state[k]`, `tdpreds[k]`
+# and `tipreds[j]`, which take one index, are never cells.
+.CT_JULIA_CELLREF <- "\\b([A-Za-z][A-Za-z0-9_]*)\\s*\\[\\s*(\\d+)\\s*,\\s*(\\d+)\\s*\\]"
+# A T0MEANS or T0VAR cell may also read the subject's TI predictors, which
+# `ctModelWriter.R` has already written as `tipreds[j]`. They stay in the text:
+# the engine reads them from a tail of the subject's parameter vector
+# (`EKFParameters.ti_tail`), since these cells are evaluated from that vector
+# before any row, with no row context to read them from.
+.CT_JULIA_TIPREDREF <- "\\btipreds\\s*\\[\\s*\\d+\\s*\\]"
+
+# `required` says, per row, whether a cell that cannot be resolved is an error
+# (a matrix the engine evaluates only from the parameters) or stays as it is (a
+# matrix it can also evaluate per row; see `.ctJuliaParameterTable()`). Every
+# cell is resolved against the table as it was passed in and the results
+# applied afterwards, so a cell reading another that is resolved here reads
+# its expression, not the row that resolving it left behind. Which rows
+# resolved is the result's attribute `resolved`.
+.ctJuliaResolveStaticRefs <- function(p, rows, required = rep(TRUE, length(rows))) {
+
+  matrices <- unique(as.character(p$matrix))
+  refs_of <- function(x) {
+    found <- regmatches(x, gregexpr(.CT_JULIA_CELLREF, x, perl = TRUE))[[1L]]
+    found <- gsub("[[:space:]]", "", found)
+    unique(found[sub("\\[.*$", "", found) %in% matrices])
+  }
+  name_of <- function(ref) sub("\\[.*$", "", ref)
+  index_of <- function(ref) as.integer(regmatches(ref, gregexpr("\\d+", ref))[[1L]])
+  cellname <- function(i) paste0(p$matrix[i], "[", p$row[i], ",", p$col[i], "]")
+  refpattern <- function(ref) {
+    kc <- index_of(ref)
+    paste0("\\b", name_of(ref), "\\s*\\[\\s*", kc[1L], "\\s*,\\s*", kc[2L], "\\s*\\]")
+  }
+
+  # `resolve` and `compose` are mutually recursive -- a PARS cell may itself
+  # be an expression over another PARS cell -- which works because both are
+  # looked up when they are called, not when they are defined.
+  resolve <- function(key, visited) {
+    if (key %in% visited) return(list(kind = "no", why = paste0(
+      "It is a circular reference: ", paste(c(visited, key), collapse = " -> "),
+      ". Break the chain by making one of those cells a fixed value")))
+    kc <- index_of(key)
+    row_k <- which(p$matrix == name_of(key) & p$row == kc[1L] & p$col == kc[2L])
+    if (!length(row_k)) return(list(kind = "no", why = paste0(
+      "It references ", key, ", which the model does not define")))
+    row_k <- row_k[1L]
+    text_k <- p$param[row_k]
+    if (is.na(text_k)) {
+      value <- suppressWarnings(as.numeric(p$value[row_k]))
+      if (is.na(value)) return(list(kind = "no", why = paste0(
+        key, " is neither a free parameter nor a fixed value")))
+      return(list(kind = "fixed", value = value))
+    }
+    if (grepl("[", text_k, fixed = TRUE)) return(compose(text_k, c(visited, key), key))
+    parnumber <- p$parnumber[row_k]
+    if (is.na(parnumber)) return(list(kind = "no", why = paste0(
+      key, " has no parameter number, so there is nothing to reference")))
+    inner <- if (is.na(p$transform[row_k])) "param" else as.character(p$transform[row_k])
+    list(kind = "free", parnumber = parnumber, parnumbers = parnumber,
+      text = gsub("\\bparam\\b", paste0("param[", parnumber, "]"), inner, perl = TRUE))
+  }
+
+  compose <- function(text, visited, what) {
+    if (grepl("tdpreds[", text, fixed = TRUE)) return(list(kind = "no", why = paste0(
+      what, " depends on the time-dependent predictor data, which varies by row, ",
+      "and this matrix is evaluated once from the parameters")))
+    if (grepl("\\bstate\\s*\\[", text, perl = TRUE)) return(list(kind = "no", why = paste0(
+      what, " depends on a latent state")))
+    refs <- refs_of(text)
+    reads_tipreds <- grepl(.CT_JULIA_TIPREDREF, text, perl = TRUE)
+    # Anything indexed but the table's cells and the TI predictors is not
+    # something this matrix can read.
+    other <- gsub(.CT_JULIA_TIPREDREF, "", text, perl = TRUE)
+    for (ref in refs) other <- gsub(refpattern(ref), "", other, perl = TRUE)
+    if (grepl("[", other, fixed = TRUE) || (!length(refs) && !reads_tipreds)) {
+      return(list(kind = "no", why = paste0(
+        what, " contains an index the julia backend does not recognise: ", text)))
+    }
+    if (!length(refs)) {
+      return(list(kind = "data", parnumber = NA_integer_, parnumbers = integer(0),
+        text = text))
+    }
+    # Each distinct reference is resolved on its own and substituted at its own
+    # occurrences, so an expression over several PARS cells composes exactly as
+    # one over a single cell does. Substitution goes through placeholders
+    # because a resolved text is itself `param[k]`: rewriting every reference
+    # to a bare `param` first, as the single-reference version could afford to,
+    # would make the second substitution rewrite the first one's output.
+    inner <- lapply(refs, resolve, visited = visited)
+    for (k in seq_along(inner)) {
+      if (identical(inner[[k]]$kind, "no")) return(inner[[k]])
+    }
+    marks <- paste0("\001", seq_along(refs), "\001")
+    outer <- text
+    for (k in seq_along(refs)) {
+      outer <- gsub(refpattern(refs[k]), marks[k], outer, perl = TRUE)
+    }
+    for (k in seq_along(refs)) {
+      outer <- gsub(marks[k], if (identical(inner[[k]]$kind, "fixed")) {
+        paste0("(", format(inner[[k]]$value, digits = 17, scientific = FALSE), ")")
+      } else paste0("(", inner[[k]]$text, ")"), outer, fixed = TRUE)
+    }
+    parnumbers <- unique(unlist(lapply(inner, `[[`, "parnumbers")))
+    # Predictors and no parameter: a value per subject that is data, carried
+    # by the engine's predictor tail rather than by a raw parameter.
+    if (!length(parnumbers) && reads_tipreds) {
+      return(list(kind = "data", parnumber = NA_integer_, parnumbers = integer(0),
+        text = outer))
+    }
+    if (!length(parnumbers)) {
+      # Every reference was a fixed value, so the whole cell is one too.
+      folded <- try(eval(parse(text = outer)), silent = TRUE)
+      if (inherits(folded, "try-error") || !is.numeric(folded) || length(folded) != 1L ||
+          !is.finite(folded)) {
+        return(list(kind = "no", why = paste0(what,
+          " resolves to a fixed value the expression could not be evaluated at: ", text)))
+      }
+      return(list(kind = "fixed", value = as.numeric(folded)))
+    }
+    list(kind = "free", parnumber = parnumbers[1L], parnumbers = parnumbers,
+      text = outer)
+  }
+
+  results <- lapply(rows, function(i)
+    compose(as.character(p$param[i]), character(0), cellname(i)))
+  resolved <- logical(length(rows))
+  for (j in seq_along(rows)) {
+    i <- rows[j]
+    r <- results[[j]]
+    if (identical(r$kind, "no")) {
+      if (!required[j]) next
+      stop("Julia backend cannot resolve ", cellname(i), " = ", p$param[i], ". ",
+        r$why, ".", call. = FALSE)
+    }
+    resolved[j] <- TRUE
+    p$param[i] <- NA_character_
+    if (identical(r$kind, "fixed")) {
+      p$value[i] <- r$value
+      p$transform[i] <- NA_character_
+      p$parnumber[i] <- NA_integer_
+    } else if (identical(r$kind, "data")) {
+      # No parameter number: the engine gives the cell its first predictor's
+      # tail position (`_ctsem_ti_tail_rendering`).
+      p$value[i] <- NA_real_
+      p$parnumber[i] <- NA_integer_
+      p$transform[i] <- r$text
+    } else {
+      # Already in final `param[k]` form. This row is not in `free` -- that
+      # was computed with `!grepl("[", param)` and this cell's param had one
+      # -- so the substitution loop below leaves the text alone, which is
+      # what keeps `param[3]` from becoming `param[3][3]`.
+      p$value[i] <- NA_real_
+      p$parnumber[i] <- r$parnumber
+      p$transform[i] <- r$text
+    }
+  }
+  attr(p, "resolved") <- resolved
+  p
+}
+
+.ctJuliaParameterTable <- function(model) {
+  ctm <- .ctJuliaCanonicalModel(model)
+  p <- as.data.frame(ctm$pars, stringsAsFactors = FALSE)
+  p$matrix <- as.character(p$matrix)
+  render_transform <- function(transform, multiplier, meanscale, offset, inneroffset) {
+    transform <- as.integer(transform)
+    if (transform == 0L) {
+      return(sprintf("%.17g + %.17g * (param * %.17g + %.17g)",
+        offset, multiplier, meanscale, inneroffset))
+    }
+    tform("param", transform, multiplier, meanscale, offset,
+      inneroffset, singletext = TRUE)
+  }
+  # The model's own transform text, matched by cell rather than by row order.
+  # `ctFit` records it before `ctModelTransformsToNum` reduces each transform
+  # to four fitted numbers; see the comment there for what that reduction
+  # loses and why it matters.
+  exact <- rep(NA_character_, nrow(p))
+  if (!is.null(ctm$transformtext)) {
+    recorded <- ctm$transformtext
+    exact <- recorded$text[match(paste(p$matrix, p$row, p$col, sep = "
+"),
+      paste(recorded$matrix, recorded$row, recorded$col, sep = "
+"))]
+  }
+  numeric_transform <- !is.na(suppressWarnings(as.integer(p$transform)))
+  for (i in which(numeric_transform)) {
+    rendered <- render_transform(p$transform[i], p$multiplier[i],
+      p$meanscale[i], p$offset[i], p$inneroffset[i])
+    if (length(rendered) != 1L) {
+      stop("Julia backend cannot render scalar transform ", p$transform[i],
+        " for ", p$matrix[i], "[", p$row[i], ",", p$col[i], "].", call. = FALSE)
+    }
+    p$transform[[i]] <- rendered[[1L]]
+  }
+  p$parnumber <- NA_integer_
+  p$predicttransform <- NA_character_
+  p$updatetransform <- NA_character_
+  free <- !is.na(p$param) & !grepl("[", p$param, fixed = TRUE) &
+    is.na(suppressWarnings(as.numeric(p$value)))
+  parnames <- unique(as.character(p$param[free]))
+  p$parnumber[free] <- match(as.character(p$param[free]), parnames)
+
+  # The exact transform text wherever it survived, for the free parameters only.
+  #
+  # `ctModelTransformsToNum` turns each transform string into four numbers by a
+  # grid search and keeps the string beside them as `transformtext`;
+  # re-rendering from the numbers loses any constant the search could not see,
+  # which is every variance diagonal's `1e-10` floor -- see the comment there
+  # for what a floorless variance does to the filter.
+  #
+  # Free parameters only, because a cell that is not one has no `param[k]` to
+  # write and its text still says `param`. Under `intoverpop` the CINT cells
+  # become references to augmented states and are exactly that: substituting
+  # there left `10 * param` in the table with no index on it, which the engine
+  # compiled into a closure over the whole parameter vector.
+  substitute_exact <- free & !is.na(exact)
+  p$transform[substitute_exact] <- exact[substitute_exact]
+  if (!is.null(ctm$modelmats$matsetup)) {
+    matrix_codes <- .ctMatricesList()$all
+    setup <- as.data.frame(ctm$modelmats$matsetup)
+    values <- as.data.frame(ctm$modelmats$matvalues)
+    setup$matrix_name <- names(matrix_codes)[match(setup$matrix, matrix_codes)]
+    setup_key <- paste(setup$matrix_name, setup$row, setup$col, sep = "\r")
+    parameter_key <- paste(p$matrix, p$row, p$col, sep = "\r")
+    setup_row <- match(parameter_key, setup_key)
+    mapped <- setup$param[setup_row]
+    use_mapped <- free & !is.na(mapped) & mapped > 0L
+    p$parnumber[use_mapped] <- as.integer(mapped[use_mapped])
+
+    # Stan transforms each raw population coordinate once, using the first
+    # matching base/PARS setup row. Reusing a parameter in another matrix must
+    # not reapply that cell's local transform.
+    #
+    # Which row is canonical comes from `matsetup`, but the transform *text*
+    # comes from the model, and re-rendering it from `matvalues` instead is
+    # lossy. `ctModelTransformsToNum` recovers `matvalues` from the model's
+    # transform string by fitting the four numbers to it by least squares and
+    # then rounding to six decimal places, so any constant below 5e-7 is gone:
+    # every variance diagonal carries a `1e-10` floor -- `1e-10 + 5 *
+    # log1p_exp(2 * param)` -- and re-rendering gives `0 + 5 * (...)` back.
+    # DRIFT's `1e-06` floor survives the rounding, which is why this showed up
+    # only in the variances.
+    #
+    # A variance with no floor reaches *exactly* zero, because `log1p_exp(x)`
+    # is exactly zero once `1 + exp(x)` rounds to one, at about `x = -37` --
+    # which one subject's TI-predictor offset is quite enough to reach. What
+    # follows is division by that zero and derivatives of `sqrt` at it, and
+    # since `isfinite` on a dual number tests only its value, the NaN travels
+    # in the partials with nothing to stop it. It surfaced as trial points
+    # rejected for a non-finite gradient -- 64 of 229 in one Laplace fit --
+    # and a fit that stopped 0.6 log units short.
+    setup_parameter <- as.integer(setup$param)
+    setup_when <- as.integer(setup$when)
+    # when == 0 only. A `when == 100` row is a PARS cell whose text references
+    # a state, and its `param` column holds that *state* index rather than a
+    # parameter number, so including it let a carrier cell claim a real
+    # parameter and replace its transform. This mirrors the same correction in
+    # stan's parvectform; see the comment there for why 100 was ever accepted.
+    candidate <- which(setup_parameter > 0L & setup_when %in% 0L)
+    canonical <- rep(NA_character_, max(c(0L, setup_parameter), na.rm = TRUE))
+    own_row <- match(setup_key, parameter_key)
+    for (row in candidate) {
+      parameter <- setup_parameter[row]
+      if (!is.na(canonical[parameter])) next
+      own <- own_row[row]
+      text <- if (!is.na(own) && !is.na(p$transform[own]))
+        as.character(p$transform[own]) else NA_character_
+      canonical[parameter] <- if (!is.na(text)) text else
+        render_transform(setup$transform[row], values$multiplier[row],
+          values$meanscale[row], values$offset[row], values$inneroffset[row])
+    }
+    use_canonical <- free & !is.na(p$parnumber) & p$parnumber <= length(canonical) &
+      !is.na(canonical[p$parnumber])
+    p$transform[use_canonical] <- canonical[p$parnumber[use_canonical]]
+  }
+  # A T0MEANS cell that references exactly one other latent state -- the
+  # standard idiom for a stable latent intercept, ctsem's state-space
+  # replacement for MANIFESTTRAITVAR -- is not state-dependent in the sense
+  # the predict/update/td groups below handle. The state it reads is fully
+  # determined at t0 by other free parameters and fixed values, with no
+  # runtime dependency on the Kalman filter's evolving state: `ctStanModel`'s
+  # cycle check (see `ctModelCycleCheck.R`) has already refused any model
+  # where that is not true, so every reference here resolves, in a finite
+  # number of steps, to a free parameter or a fixed constant.
+  #
+  # Rather than adding a fourth state-dependent transform group to the engine
+  # -- mirrored through the adjoint tape, the sampler and the summary
+  # routines, for predict/update/td -- that chain is resolved here, at
+  # model-build time, by composing transform text: T0MEANS[1,1] =
+  # tform_outer(state[3]) becomes T0MEANS[1,1] = tform_outer(tform_inner(param[pn])),
+  # the same free-parameter transform machinery every other T0MEANS cell
+  # already uses. This is numerically identical to Stan's own resolution,
+  # which evaluates state 3 first and then applies tform_outer to that number
+  # (see the two-pass t0 block in `ctModelWriter.R`) -- composing the
+  # transforms symbolically is the same computation done in one pass instead
+  # of two.
+  #
+  # Individual variation on the *referenced* state (an indvarying T0MEANS
+  # cell feeding a state-reference chain) is not propagated to the composed
+  # cell here -- out of scope for the idiom this resolves, which by
+  # construction carries no individual variation of its own.
+  .ctJuliaStateIndex <- function(x) {
+    m <- regmatches(x, regexpr("\\bstate\\[\\d+\\]", x, perl = TRUE))
+    if (!length(m) || !nzchar(m)) return(NA_integer_)
+    as.integer(gsub("\\D", "", m))
+  }
+  t0_resolve_cache <- new.env(parent = emptyenv())
+  resolve_t0_state <- function(state_idx, visited) {
+    key <- as.character(state_idx)
+    cached <- t0_resolve_cache[[key]]
+    if (!is.null(cached)) return(cached)
+    if (state_idx %in% visited) {
+      stop("Circular t0 state reference at state ", state_idx,
+        " -- this should already have been refused when the model was built.",
+        call. = FALSE)
+    }
+    row_k <- which(p$matrix == "T0MEANS" & p$row == state_idx & p$col == 1L)
+    if (!length(row_k)) {
+      stop("T0MEANS[", state_idx, ",1] not found while resolving a state reference.",
+        call. = FALSE)
+    }
+    row_k <- row_k[1L]
+    text_k <- p$param[row_k]
+    result <- if (is.na(text_k)) {
+      # A fixed constant: nothing to compose, this state's t0 value is a number.
+      list(kind = "fixed", value = as.numeric(p$value[row_k]))
+    } else if (simpleStateCheck(text_k)) {
+      # This state's own t0 value is itself a reference to another state --
+      # resolve that one first, then apply this cell's own transform to it.
+      inner <- resolve_t0_state(.ctJuliaStateIndex(text_k), c(visited, state_idx))
+      outer_text <- gsub("\\bstate\\[\\d+\\]", "param", text_k, perl = TRUE)
+      if (identical(inner$kind, "fixed")) {
+        list(kind = "fixed", value = eval(parse(text = gsub("\\bparam\\b",
+          format(inner$value, digits = 17, scientific = FALSE), outer_text, perl = TRUE))))
+      } else {
+        inner_text <- if (is.na(inner$text)) "param" else inner$text
+        list(kind = "free", parnumber = inner$parnumber,
+          text = gsub("\\bparam\\b", paste0("(", inner_text, ")"), outer_text, perl = TRUE))
+      }
+    } else if (grepl("[", text_k, fixed = TRUE)) {
+      stop("T0MEANS[", state_idx, ",1] is a state-dependent expression the ",
+        "julia backend cannot resolve at model-build time: ", text_k, ".", call. = FALSE)
+    } else {
+      # An ordinary free parameter.
+      pn <- p$parnumber[row_k]
+      if (is.na(pn)) {
+        stop("T0MEANS[", state_idx, ",1] must be a free parameter or a fixed ",
+          "value to be referenced by another state's t0 cell.", call. = FALSE)
+      }
+      list(kind = "free", parnumber = pn,
+        text = if (is.na(p$transform[row_k])) NA_character_ else as.character(p$transform[row_k]))
+    }
+    t0_resolve_cache[[key]] <- result
+    result
+  }
+  t0state_rows <- which(p$matrix == "T0MEANS" & !is.na(p$param) &
+    vapply(p$param, function(x) !is.na(x) && simpleStateCheck(x), logical(1)))
+  if (length(t0state_rows)) {
+    # Resolve every reference first, entirely from the table's original
+    # (pre-resolution) contents -- then apply the results in a second pass.
+    # Mutating `p` between resolutions would let one cell's resolved,
+    # already-rewritten row be misread as a fixed value by a later lookup of
+    # the same state.
+    #
+    # Resolved on the state *this row defines* (`p$row[i]`), not the state its
+    # text references: `resolve_t0_state` reads that row's own text and
+    # composes its own outer transform on top of what the reference resolves
+    # to. Resolving the referenced state directly and using it unchanged would
+    # silently drop this row's own transform -- exactly right for a bare
+    # reference, silently wrong for anything else, e.g. `0.5 * eta2`.
+    resolved <- lapply(t0state_rows, function(i)
+      resolve_t0_state(p$row[i], integer(0)))
+    for (j in seq_along(t0state_rows)) {
+      i <- t0state_rows[j]
+      r <- resolved[[j]]
+      p$param[i] <- NA_character_
+      if (identical(r$kind, "fixed")) {
+        p$value[i] <- r$value
+        p$transform[i] <- NA_character_
+        p$parnumber[i] <- NA_integer_
+      } else {
+        inner_text <- if (is.na(r$text)) "param" else r$text
+        p$value[i] <- NA_real_
+        p$parnumber[i] <- r$parnumber
+        # Substituted to its final `param[pn]` form directly, rather than left
+        # for the `free`-only substitution loop below: `free` was computed
+        # before this row was resolved, so it does not include this row.
+        p$transform[i] <- gsub("\\bparam\\b", paste0("param[", r$parnumber, "]"),
+          inner_text, perl = TRUE)
+      }
+    }
+  }
+
+  dynamic <- !is.na(p$param) & grepl("[", p$param, fixed = TRUE)
+  predict_matrices <- c("PARS", "DRIFT", "CINT", "DIFFUSION", "JAx")
+  update_matrices <- c("LAMBDA", "MANIFESTMEANS", "MANIFESTVAR", "Jy", "RESPONSE")
+  td_matrices <- c("TDPREDEFFECT", "Jtd")
+  # A cell written as an expression is evaluated per row only where it reads a
+  # latent state or a time dependent predictor, directly or through the cells
+  # it reads. One that reads only parameters, other cells and the unit's TI
+  # predictors is a constant of the subject: it is composed into an ordinary
+  # transform here (`.ctJuliaResolveStaticRefs()`) and evaluated once a
+  # subject, as the matrices with no per-row evaluation always were. Evaluated
+  # per row it was recomputed at every prediction or update, and a per-row
+  # group writing JAx, DIFFUSION or MANIFESTVAR makes the reverse pass release
+  # every deferred cotangent at every row (`_ctsem_reverse_tape!`). On the
+  # affect pilot that was 296 cells -- set points tracking slower processes,
+  # drift-scaled diffusions, varying residual sds, window loadings -- none of
+  # which read a state.
+  candidates <- which(dynamic)
+  per_row_capable <- p$matrix[candidates] %in%
+    c(predict_matrices, update_matrices, td_matrices)
+  p <- .ctJuliaResolveStaticRefs(p, candidates, required = !per_row_capable)
+  per_row <- dynamic
+  per_row[candidates[attr(p, "resolved")]] <- FALSE
+  attr(p, "resolved") <- NULL
+  p$predicttransform[per_row & p$matrix %in% predict_matrices] <- .ctJuliaTDExpression(p$param[per_row & p$matrix %in% predict_matrices])
+  p$updatetransform[per_row & p$matrix %in% update_matrices] <- .ctJuliaTDExpression(p$param[per_row & p$matrix %in% update_matrices])
+  p$tdtransform[per_row & p$matrix %in% td_matrices] <- .ctJuliaTDExpression(p$param[per_row & p$matrix %in% td_matrices])
+  p$param[dynamic] <- NA_character_
+  bare <- free & is.na(p$transform)
+  p$transform[bare] <- paste0("param[", p$parnumber[bare], "]")
+  for (i in which(free & !is.na(p$transform))) {
+    p$transform[i] <- gsub("\\bparam\\b", paste0("param[", p$parnumber[i], "]"),
+      as.character(p$transform[i]), perl = TRUE)
+  }
+  # Julia consumes these canonical columns directly.  Preserve absent optional
+  # transforms as explicit NA columns: omitting them changes the DataFrame
+  # schema and prevents a serialised specification from being reconstructed.
+  keep <- c("matrix", "row", "col", "param", "parnumber", "value", "transform",
+    "predicttransform", "updatetransform", "tdtransform", "indvarying",
+    grep("_effect$", names(p), value = TRUE))
+  for (name in setdiff(keep, names(p))) p[[name]] <- NA
+  out <- p[, keep, drop = FALSE]
+  # The buffered Julia kernels always carry a PARS component, even for models
+  # without user-declared state parameters.  Give such models one fixed dummy
+  # entry so the component axis is stable and complex-transform calls remain
+  # well-defined.
+  if (!"PARS" %in% out$matrix) {
+    dummy <- out[1L, , drop = FALSE]
+    dummy[] <- NA
+    dummy$matrix <- "PARS"
+    dummy$row <- 1L
+    dummy$col <- 1L
+    dummy$value <- 0
+    dummy$indvarying <- FALSE
+    out <- rbind(out, dummy)
+  }
+  # Complex transforms can use PARS values. Keep that component first so its
+  # state-derived entries are refreshed before dependent DRIFT/JAc transforms.
+  matrix_order <- c("PARS", unique(as.character(out$matrix[out$matrix != "PARS"])))
+  out <- out[order(match(out$matrix, matrix_order)), , drop = FALSE]
+  rownames(out) <- NULL
+  out
+}
+
+# Create a matrix the table does not have yet, as a complete rectangle.
+#
+# `.ctJuliaPadMatrix()` deliberately no-ops when the matrix is absent -- it
+# fills gaps in one the model already declared, and creating TDPREDEFFECT for a
+# model with no TD predictors would be wrong. RAWPOPVAR is the opposite case:
+# it exists only because the augmentation is adding it.
+#
+# Every cell gets a value of 0 rather than NA for the reason
+# `.ctJuliaPadMatrix()` does the same: `ekf_from_columns` treats NaN as "no
+# fixed value", so a cell with neither a value nor a parameter is never written
+# and reads the UNSET_PARAMETER sentinel. The cells the loops below claim have
+# their value replaced by a parameter; the upper triangle keeps the zero, which
+# is what the construction expects to ignore.
+.ctJuliaAddMatrix <- function(table, matrix, nrow, ncol) {
+  if (any(table$matrix == matrix)) {
+    return(.ctJuliaPadMatrix(table, matrix, nrow, ncol))
+  }
+  .ctJuliaZeroCells(table, 1L, matrix, nrow, ncol)
+}
+
+.ctJuliaPadMatrix <- function(table, matrix, nrow, ncol) {
+  present <- table$matrix == matrix
+  if (!any(present)) return(table)
+  .ctJuliaZeroCells(table, which(present)[1L], matrix, nrow, ncol,
+    have = paste(table$row[present], table$col[present]))
+}
+
+# The cells of an nrow x ncol matrix the table lacks (`have`, as "row col"),
+# appended in row-major order, each fixed at 0 on the template row's columns.
+# Bound once: appended a cell at a time, an augmented 20-latent model's padding
+# took four seconds.
+.ctJuliaZeroCells <- function(table, template, matrix, nrow, ncol, have = character()) {
+  row <- rep(seq_len(nrow), each = ncol)
+  col <- rep(seq_len(ncol), times = nrow)
+  keep <- !paste(row, col) %in% have
+  if (!any(keep)) return(table)
+  entry <- table[rep(template, sum(keep)), , drop = FALSE]
+  entry[] <- NA
+  entry$matrix <- matrix
+  entry$row <- row[keep]
+  entry$col <- col[keep]
+  entry$value <- 0
+  entry$indvarying <- FALSE
+  effect_columns <- grep("_effect$", names(entry), value = TRUE)
+  if (length(effect_columns)) entry[effect_columns] <- "FALSE"
+  rbind(table, entry)
+}
+
+# Which parameter cells are written by a state-dependent expression. Shared by
+# both random-effect routes, which need the same answer for the same reason:
+# a cell whose value depends on the current state cannot be treated as a
+# constant of the filter.
+.ctJuliaRewrittenCells <- function(table) {
+  predict_transform <- replace(table$predicttransform, is.na(table$predicttransform), "")
+  update_transform <- replace(table$updatetransform, is.na(table$updatetransform), "")
+  td_transform <- replace(table$tdtransform, is.na(table$tdtransform), "")
+  table[grepl("state\\[", predict_transform) |
+    grepl("state\\[", update_transform) |
+    grepl("state\\[", td_transform),
+    c("matrix", "row", "col"), drop = FALSE]
+}
+
+# Which raw parameters the engine flagged as saturated, by name.
+#
+# The engine reports indices, and never an empty vector -- a zero-length
+# vector deadlocks the JuliaConnectoR bridge, so "nothing saturated" arrives
+# as the single index 0. "Raw parameter 10" is not something a user can act
+# on; "rawcor_mm2__mm1" is, and it is usually the whole diagnosis.
+.ctJuliaSaturatedNames <- function(result, model_spec, npar,
+    field = "saturated_parameters") {
+  index <- suppressWarnings(as.integer(result[[field]]))
+  index <- index[!is.na(index) & index >= 1L & index <= npar]
+  if (!length(index)) return(character())
+  names <- try(.ctBackendRawParameterNames(list(model_spec = model_spec), npar),
+    silent = TRUE)
+  if (inherits(names, "try-error") || length(names) != npar) {
+    return(paste0("raw[", index, "]"))
+  }
+  as.character(names[index])
+}
+
+# Every index the specification references must lie inside the raw parameter
+# vector the fit will actually allocate.
+#
+# This invariant is here because breaking it has been the single recurring bug
+# of this feature, three times over: a level's population scales, and then the
+# TI-predictor coefficients, each indexed past the end of a vector sized from
+# only part of the layout. Neither failed usefully. The first left a level
+# pinned at its starting value while the summary printed the transform of that
+# value as though it were an estimate -- the same number for every dataset. The
+# second threw a bounds error that the optimizer's invalid-point guard
+# swallowed, which then surfaced as a line search crashing on an unrelated
+# assertion. Both were found by recovery studies, days later.
+#
+# Checking it costs nothing and turns that whole class into an immediate,
+# specific error.
+.ctJuliaCheckLayout <- function(table, laplace, ti_effects, npar, ti_missing = NULL) {
+  used <- list(
+    `model parameters` = as.integer(table$parnumber),
+    `TI-predictor coefficients` = as.integer(ti_effects$coefficient))
+  if (!is.null(ti_missing) && nrow(ti_missing)) {
+    used[["sampled TI-predictor values"]] <- as.integer(ti_missing$parameter)
+  }
+  if (!is.null(laplace)) {
+    for (level in laplace$levels) {
+      # Zero is a stated value, not a raw position.
+      used[[paste0("'", level$name, "' population scales")]] <-
+        setdiff(as.integer(level$sd_index), 0L)
+      used[[paste0("'", level$name, "' correlations")]] <-
+        setdiff(as.integer(level$cor_index), 0L)
+      used[[paste0("'", level$name, "' loadings")]] <- as.integer(level$load_index)
+      used[[paste0("'", level$name, "' own variances")]] <-
+        setdiff(as.integer(level$unique_index), 0L)
+      used[[paste0("'", level$name, "' varying parameters")]] <- as.integer(level$re_index)
+    }
+  }
+  for (what in names(used)) {
+    index <- used[[what]]
+    index <- index[!is.na(index)]
+    if (length(index) && max(index) > npar) {
+      stop("Internal layout error: the ", what, " reach raw parameter ",
+        max(index), " but the raw vector holds ", npar,
+        ". This is a bug in ctsem rather than in the model; please report it.",
+        call. = FALSE)
+    }
+  }
+  invisible(TRUE)
+}
+
+# Which parameters vary at a given level, and the column that says so: the
+# per-level logicals .ctResolveLevels() makes, `indvarying` for the subject and
+# `indvarying_<idname>` above it. The model here is always resolved.
+.ctJuliaLevelColumn <- function(model, level) {
+  if (level == 1L) return("indvarying")
+  paste0("indvarying_", model$groupIDnames[level - 1L])
+}
+
+# The rank asked of one level's population covariance, or `k` when nothing was
+# asked. `model$laplacerank` is a named integer vector, one entry per level
+# name, written by `ctFit()` from `poprank`, passed or stated on the model.
+#
+# Clamped to `k` rather than refused when it exceeds the number of effects: a
+# rank at or above `k` is the unrestricted covariance, which is what the user
+# asking for it means, and refusing a model that merely has fewer varying
+# parameters than the number they typed would be pedantry. Below 1 is refused,
+# because a rank of zero is "no variation at this level" and is said by
+# removing the effects, not by restricting them.
+.ctJuliaLevelRank <- function(model, name, k) {
+  spec <- model[['laplacerank']]
+  if (is.null(spec) || !length(spec) || k == 0L) return(as.integer(k))
+  value <- if (!is.null(names(spec)) && name %in% names(spec))
+    spec[[name]] else NA
+  value <- suppressWarnings(as.integer(value))
+  if (!length(value) || is.na(value)) return(as.integer(k))
+  # Zero is a covariance of own variances alone (`popunique`), which
+  # `ctFit()` has already checked covers every effect at the level.
+  own <- length(model[['laplaceunique']][[name]]) > 0L
+  if (value < 0L || (value < 1L && !own)) {
+    stop("poprank for level '", name, "' is ", value,
+      ". A rank below 1 is not a restricted covariance, it is no variation at ",
+      "that level -- say that by removing the level's random effects, or give ",
+      "every effect there an own variance with popunique.",
+      call. = FALSE)
+  }
+  as.integer(min(value, k))
+}
+
+# The matching sdscale column. One value per id element, so a level scales its
+# own population sd rather than borrowing the subject level's.
+.ctJuliaLevelScaleColumn <- function(model, level) {
+  if (level == 1L) return("sdscale")
+  paste0("sdscale_", model$groupIDnames[level - 1L])
+}
+
+# Each subject's group at each level, and a check that the nesting is strict.
+#
+# Strict nesting is what makes the hierarchy a tree, and a tree is what lets the
+# integral factorise into one unit per outermost group. A subject appearing in
+# two studies is not a hierarchy this method can integrate, so it is refused
+# here rather than producing a quietly wrong answer later.
+.ctJuliaHierarchy <- function(dat, model) {
+  subjects <- unique(dat[[model$subjectIDname]])
+  levels <- list(list(name = model$subjectIDname,
+    group = seq_along(subjects), ngroups = length(subjects),
+    labels = subjects))
+  for (nm in model$groupIDnames) {
+    if (!nm %in% colnames(dat)) {
+      stop("Grouping id column '", nm, "' not found in the data.", call. = FALSE)
+    }
+    rows <- match(subjects, dat[[model$subjectIDname]])
+    labels <- dat[[nm]][rows]
+    # One group per subject, and the same one on every row of that subject.
+    perrow <- split(dat[[nm]], dat[[model$subjectIDname]])
+    ambiguous <- names(perrow)[vapply(perrow, function(x) length(unique(x)) > 1L, logical(1))]
+    if (length(ambiguous)) {
+      stop("Subject(s) ", paste(utils::head(ambiguous, 5), collapse = ", "),
+        " have more than one value of '", nm, "'. The hierarchy must be strictly ",
+        "nested: each subject belongs to exactly one group at every level.",
+        call. = FALSE)
+    }
+    unique_labels <- unique(labels)
+    levels[[length(levels) + 1L]] <- list(name = nm,
+      group = match(labels, unique_labels), ngroups = length(unique_labels),
+      labels = unique_labels)
+  }
+  .ctJuliaCheckNesting(levels)
+  levels
+}
+
+# Every level must nest inside the next one out.
+#
+# The per-level check above catches a subject that spans two groups at one
+# level. It does not catch two levels that cross *each other* -- pupils in
+# classes and in neighbourhoods, where a class draws from several
+# neighbourhoods -- and that is the case the engine cannot represent at all.
+#
+# Nesting is what makes a unit's curvature a tree: a block couples to another
+# only when a member depends on both, and with nesting that means one contains
+# the other, so eliminating innermost-first produces no fill-in and the cost is
+# linear rather than cubic in a group's members. Crossing puts a cycle in that
+# graph, and the block factorisation and the nested quadrature both stop being
+# the right decomposition. Refusing is honest; silently treating one grouping
+# as nested inside the other would not be.
+.ctJuliaCheckNesting <- function(levels) {
+  if (length(levels) < 2L) return(invisible(NULL))
+  for (inner in seq_len(length(levels) - 1L)) {
+    for (outer in seq(inner + 1L, length(levels))) {
+      split_outer <- split(levels[[outer]]$group, levels[[inner]]$group)
+      crossed <- vapply(split_outer, function(x) length(unique(x)) > 1L, logical(1))
+      if (any(crossed)) {
+        offending <- levels[[inner]]$labels[as.integer(names(which(crossed)))]
+        stop("Grouping '", levels[[inner]]$name, "' is not nested within '",
+          levels[[outer]]$name, "': ", sum(crossed), " group(s) of '",
+          levels[[inner]]$name, "' span more than one '", levels[[outer]]$name,
+          "' (for example ", paste(utils::head(offending, 3), collapse = ", "),
+          "). The julia backend represents strictly nested hierarchies only -- ",
+          "that is what makes each unit's curvature a tree and its cost linear ",
+          "rather than cubic in group size. Crossed designs need a different ",
+          "factorisation and are not supported.", call. = FALSE)
+      }
+    }
+  }
+  invisible(NULL)
+}
+
+# The Laplace route's counterpart to `.ctJuliaAugmentRandomEffects`.
+#
+# Where the augmented route grows the latent state, so that the ordinary filter
+# integrates the random effects out alongside the dynamic states, this route
+# leaves the model's state space alone and describes the random effects to the
+# engine as *indices*: which raw parameters vary between subjects, and which
+# raw parameters say how much. The engine then integrates them out per subject.
+#
+# The raw vector's layout is Stan's, deliberately: population means, then
+# population scales, then lower-triangular correlation coordinates, then TI
+# predictor effects. `.ctBackendPriorSpec` maps ctsem's priors onto exactly
+# that layout, and `.ctJuliaAugmentRandomEffects` already reproduces it, so
+# reusing it means priors, uncertainty and the summary need no Laplace-specific
+# case -- and the two routes' raw vectors are directly comparable, which is
+# what makes an augmented-versus-Laplace check meaningful at all.
+.ctJuliaLaplaceSpec <- function(model, table, prepared_data = NULL, dat) {
+  base_npar <- suppressWarnings(max(c(0L, as.integer(table$parnumber)), na.rm = TRUE))
+  varying <- integer()
+  sdscale <- numeric()
+  if (length(prepared_data$indvaryingindex)) {
+    # Stan's own `indvaryingindex`, built by .ctPrepareData from the same matsetup.
+    # Preferred when present so both backends agree on the set and its order.
+    varying <- as.integer(prepared_data$indvaryingindex)
+    sdscale <- as.numeric(prepared_data$sdscale)
+  } else if (!is.null(model$modelmats$matsetup)) {
+    setup <- as.data.frame(model$modelmats$matsetup)
+    values <- as.data.frame(model$modelmats$matvalues)
+    varying <- .ctIndvaryingIndex(setup[as.integer(setup$param) > 0L, , drop = FALSE])
+    sdscale <- as.numeric(values$sdscale)[match(varying, as.integer(setup$param))]
+  } else {
+    # Neither, which is a model straight from `ctModel()`. `ctFit()` always
+    # supplies both -- it builds `modelmats` and hands `.ctPrepareData()`'s
+    # output over as `prepared_data` -- so this branch is for a caller that
+    # prepares a specification from a model no fit has set up.
+    # Without it `nrandom` came out zero on a model that plainly has random
+    # effects and `intoverpop='laplace'` was refused as "no parameters are
+    # marked indvarying", which is the opposite of what the model said.
+    #
+    # `table` is the canonical parameter table, so its `indvarying` is the
+    # flag after `.ctJuliaCanonicalModel()` has had its say, and its
+    # `parnumber` is the raw index. `sdscale` is not carried on the table, so
+    # it is read from the model's own `pars`, off the cell holding each
+    # parameter.
+    hit <- which(table$indvarying %in% TRUE & !is.na(table$parnumber) &
+      table$parnumber > 0L)
+    varying <- sort(unique(as.integer(table$parnumber[hit])))
+    sdscale <- rep(1, length(varying))
+    if (!is.null(model$pars$sdscale)) {
+      names_at_index <- .ctJuliaLaplaceNames(table, varying)
+      matched <- .ctParamRows(model, names_at_index)
+      supplied <- suppressWarnings(as.numeric(model$pars$sdscale[matched]))
+      sdscale[is.finite(supplied)] <- supplied[is.finite(supplied)]
+    }
+  }
+  if (length(sdscale) != length(varying)) sdscale <- rep(1, length(varying))
+  usable <- !is.na(varying) & varying > 0L & varying <= base_npar
+  varying <- varying[usable]
+  sdscale <- sdscale[usable]
+  sdscale[!is.finite(sdscale)] <- 1
+
+  hierarchy <- .ctJuliaHierarchy(dat, model)
+
+  # Level 1 is the subject level and uses the `indvarying` set found above.
+  # Outer levels read their own column.
+  setup <- if (!is.null(model$modelmats$matsetup)) as.data.frame(model$modelmats$matsetup) else NULL
+  cursor <- base_npar
+  levels <- list()
+  for (l in seq_along(hierarchy)) {
+    if (l == 1L) {
+      lv_varying <- varying; lv_scale <- sdscale
+    } else {
+      column <- .ctJuliaLevelColumn(model, l)
+      lv_varying <- integer(); lv_scale <- numeric()
+      if (column %in% names(model$pars)) {
+        names_at_level <- unique(model$pars$param[model$pars[[column]] %in% TRUE &
+          !is.na(model$pars$param) & is.na(model$pars$value)])
+        hit <- which(!is.na(table$parnumber) & table$param %in% names_at_level)
+        lv_varying <- sort(unique(as.integer(table$parnumber[hit])))
+        lv_varying <- lv_varying[lv_varying <= base_npar]
+        # This level's own sdscale, not the subject level's: `sdscale` is one
+        # value per id element and each level uses its own.
+        scalecolumn <- .ctJuliaLevelScaleColumn(model, l)
+        lv_scale <- rep(1, length(lv_varying))
+        if (scalecolumn %in% names(model$pars)) {
+          for (position in seq_along(lv_varying)) {
+            row <- which(!is.na(table$parnumber) & table$parnumber == lv_varying[position])
+            name <- if (length(row)) as.character(table$param[row[1L]]) else NA_character_
+            match_row <- which(model$pars$param %in% name)
+            if (length(match_row)) {
+              value <- as.numeric(model$pars[[scalecolumn]][match_row[1L]])
+              if (is.finite(value)) lv_scale[position] <- value
+            }
+          }
+        }
+      }
+    }
+    k <- length(lv_varying)
+    lv_names <- .ctJuliaLaplaceNames(table, lv_varying)
+    # Blocks of shared dimensions (`popblocks`, R/ctPopBlocks.R): the level's
+    # rank is their sum, and it is a loading level whatever that is.
+    blocks <- model[['laplaceblocks']][[hierarchy[[l]]$name]]
+    pattern <- if (length(blocks)) .ctJuliaBlockPattern(blocks, lv_names) else NULL
+    rank <- if (length(blocks)) sum(vapply(blocks, function(b) as.integer(b$rank),
+      integer(1))) else .ctJuliaLevelRank(model, hierarchy[[l]]$name, k)
+    reduced <- rank < k || !is.null(pattern)
+    # What RAWPOPVAR (RAWPOPVAR_<level> above the subject) states for this
+    # level: a number fixes that scale or correlation coordinate, a label or
+    # nothing leaves it free. A fixed entry takes no place in the raw vector;
+    # it reaches the engine as index 0 with its raw value beside it.
+    field <- if (l == 1L) "RAWPOPVAR" else paste0("RAWPOPVAR_", model$groupIDnames[l - 1L])
+    stated <- function(i, j = i) .ctModelRawPopVarValue(
+      .ctModelRawPopVarEntry(model, lv_names[i], lv_names[j], field = field))
+    sd_fixed <- vapply(seq_len(k), function(j) {
+      value <- stated(j)
+      if (!is.finite(value)) return(NA_real_)
+      if (!(value > 0)) stop(field, "['", lv_names[j], "', '", lv_names[j],
+        "'] is ", value, ": a population sd must be positive.", call. = FALSE)
+      .ctJuliaRawPopSd(value, lv_scale[j])
+    }, numeric(1))
+    pairs <- which(lower.tri(diag(k)), arr.ind = TRUE)
+    pairs <- pairs[order(pairs[, "col"], pairs[, "row"]), , drop = FALSE]
+    cor_fixed <- vapply(seq_len(nrow(pairs)), function(t)
+      stated(pairs[t, "row"], pairs[t, "col"]), numeric(1))
+    if (reduced && any(is.finite(c(sd_fixed, cor_fixed)))) {
+      stop(field, " states values for level '", hierarchy[[l]]$name,
+        "', which poprank reduces to rank ", rank, ": a loading matrix has no ",
+        "scale or correlation of its own to fix. Use poprank=NA for that level, ",
+        "or leave ", field, " free.", call. = FALSE)
+    }
+    # A level is described one way or the other, never both: scales and
+    # correlations at full rank, a loading matrix below it. Allocating the
+    # unused set anyway would leave parameters in the vector that nothing
+    # reads, which the optimiser would then wander along.
+    sdfree <- if (reduced) logical() else !is.finite(sd_fixed)
+    corfree <- if (reduced) logical() else !is.finite(cor_fixed)
+    nsd <- sum(sdfree)
+    noff <- sum(corfree)
+    nload <- if (!is.null(pattern)) length(pattern$row) else
+      if (reduced) as.integer(k * rank - rank * (rank - 1L) / 2L) else 0L
+    # Own variances (`popunique`), one raw position each after the loadings,
+    # 0 for an effect without one. Only on a reduced level: `ctFit()` refuses
+    # them at full rank, where they would not be identified.
+    own <- lv_names %in% model[['laplaceunique']][[hierarchy[[l]]$name]]
+    if (any(own) && !reduced) stop("popunique gives level '",
+      hierarchy[[l]]$name, "' own variances, which need a reduced rank there.",
+      call. = FALSE)
+    nown <- sum(own)
+    unique_index <- integer(k)
+    unique_index[own] <- cursor + nsd + noff + nload + seq_len(nown)
+    sd_index <- integer(length(sdfree))
+    sd_index[sdfree] <- cursor + seq_len(nsd)
+    cor_index <- integer(length(corfree))
+    cor_index[corfree] <- cursor + nsd + seq_len(noff)
+    levels[[l]] <- list(
+      name = hierarchy[[l]]$name,
+      re_index = as.integer(lv_varying),
+      sd_index = as.integer(sd_index),
+      cor_index = as.integer(cor_index),
+      sd_fixed = if (reduced) numeric() else as.numeric(sd_fixed),
+      cor_fixed = if (reduced) numeric() else as.numeric(cor_fixed),
+      load_index = if (nload) as.integer(cursor + seq_len(nload)) else integer(),
+      unique_index = if (nown) as.integer(unique_index) else integer(),
+      # The effect and dimension of each loading, and its prior scale, where
+      # the level has blocks; absent for the triangle
+      # (`.ctJuliaLoadingEntries()`).
+      load_row = if (!is.null(pattern)) pattern$row else NULL,
+      load_col = if (!is.null(pattern)) pattern$col else NULL,
+      load_prior = if (!is.null(pattern)) pattern$prior else NULL,
+      blocks = blocks,
+      rank = as.integer(rank),
+      sd_scale = as.numeric(lv_scale),
+      param = lv_names,
+      nrandom = as.integer(k),
+      group = as.integer(hierarchy[[l]]$group),
+      ngroups = as.integer(hierarchy[[l]]$ngroups),
+      labels = hierarchy[[l]]$labels)
+    cursor <- cursor + nsd + noff + nload + nown
+  }
+
+  # What a level's groups cannot support is *rank*, not parameter count.
+  #
+  # The sufficient statistic for a level's covariance is the scatter of its
+  # groups' deviations, whose rank is at most the number of groups. A
+  # covariance of rank r is estimable when r <= ngroups and degenerate above
+  # it: at full rank with more varying parameters than groups the unrestricted
+  # MLE *is* that singular scatter matrix.
+  #
+  # The parameter count is not the test, and an earlier version of this message
+  # used it and was wrong. Eighteen loadings over thirteen groups sounds
+  # hopeless and is not: a rank-1 covariance says the deviations lie on a line,
+  # and thirteen points determine a line in eighteen dimensions comfortably.
+  # Simulated at k=18, n=13, the estimated loading correlates 0.99 with the
+  # truth and the Hessian is positive definite in all eighteen directions with
+  # a condition number of 19. Parameters tied together by a low-rank structure
+  # are not independent things to estimate.
+  for (lv in levels) {
+    rank <- as.integer(if (is.null(lv$rank)) lv$nrandom else lv$rank)
+    if (lv$ngroups > 0L && rank > lv$ngroups) {
+      message("Level '", lv$name, "': a rank-", rank, " covariance over ",
+        lv$ngroups, " groups. The scatter of ", lv$ngroups,
+        " deviations has rank at most ", lv$ngroups,
+        ", so this one is degenerate at its maximum. Set poprank for this ",
+        "level to ", lv$ngroups, " or below.")
+    }
+  }
+
+  total <- sum(vapply(levels, function(x) x$nrandom, integer(1)))
+  affine <- .ctJuliaLaplaceAffine(model, setup, levels)
+  out <- list(
+    levels = levels,
+    # Level-one fields kept at the top for every existing single-level caller.
+    re_index = levels[[1]]$re_index,
+    sd_index = levels[[1]]$sd_index,
+    cor_index = levels[[1]]$cor_index,
+    sd_scale = levels[[1]]$sd_scale,
+    param = levels[[1]]$param,
+    nrandom = as.integer(total),
+    nlevels = length(levels),
+    base_npar = as.integer(base_npar),
+    npar = as.integer(cursor),
+    inert = .ctJuliaLaplaceInert(model, setup, levels, dat),
+    hybrid = .ctJuliaLaplaceHybrid(model, setup, levels),
+    quadratic = !is.null(affine) && all(unlist(affine))
+  )
+  # Where some effects are mean effects and others not, and only then, so
+  # every other model's specification is as it was.
+  if (!is.null(affine) && any(unlist(affine)) && !all(unlist(affine))) out$affine <- affine
+  out
+}
+
+# Which subject-level effects the subject filter integrates itself instead of
+# the Laplace layer (the engine's `CTSEMHybrid`): a list of the effects
+# (indices into the subject level's), the kind of cell each one moves (1 a
+# manifest intercept, 2 an initial state mean, 3 a continuous intercept, 4 a
+# time dependent predictor's effect), the manifest or latent it moves, that
+# cell's transform's slope in the raw value, a predictor effect's predictor
+# (`pred`, 0 for the others), and `block` -- or NULL. On a reduced-rank level the candidates are the own
+# variances (`popunique`), the shared loadings staying in the layer; on a
+# full-rank level every effect is (`block`), and the filter integrates the
+# qualifying ones given the rest, the layer keeping the rest as its
+# coordinates.
+#
+# An effect qualifies when every matsetup cell carrying its raw position
+# is one MANIFESTMEANS, T0MEANS, CINT or TDPREDEFFECT cell with the affine
+# transform (code 0: `(raw * meanscale + inneroffset) * multiplier + offset`,
+# slope `meanscale * multiplier`). Then, for fixed deviations, a linear
+# Gaussian filter's covariances and gains do not depend on them, the log
+# likelihood is exactly quadratic in them, and the filter integrates them in
+# closed form, in continuous or discrete time; Laplace runs over what is left.
+# So the model must also be linear and Gaussian: every indicator Gaussian, no
+# cell referencing a state, and no calculation that could carry the
+# deviations into a covariance or gain (`.ctJuliaHybridCalcsOk`). An initial mean the model
+# replaces by a stationary moment is no initial mean, so a T0MEANS effect
+# stays in the layer there; and that moment, `-A^-1 b` over the stationary
+# closure, moves with every continuous intercept in the closure, which the
+# filter's intercept column (zero at the first state) does not carry, so such
+# a CINT effect stays too. Integrated, the level form of a random intercept
+# (`ctModelLatentLevel`) read 39 nats under the layer at the same point. Off
+# with `options(ctsem.laplace.hybrid = FALSE)`,
+# which keeps every own variance in the Laplace layer as before.
+.ctJuliaLaplaceHybrid <- function(model, setup, levels) {
+  if (!isTRUE(getOption("ctsem.laplace.hybrid", TRUE))) return(NULL)
+  if (is.null(setup) || !nrow(setup) || !length(levels)) return(NULL)
+  lv <- levels[[1]]
+  rank <- as.integer(if (is.null(lv$rank)) lv$nrandom else lv$rank)
+  block <- rank == as.integer(lv$nrandom) && is.null(lv$load_row)
+  own <- if (block) seq_along(lv$re_index) else which(as.integer(lv$unique_index) > 0L)
+  if (!length(own)) return(NULL)
+  if (length(model$manifesttype) && any(as.integer(model$manifesttype) != 0L)) return(NULL)
+  if (!.ctJuliaHybridCalcsOk(model)) return(NULL)
+  if ("stateref" %in% names(setup) && any(as.integer(setup$stateref) > 0L)) return(NULL)
+  values <- as.data.frame(model$modelmats$matvalues)
+  base <- .ctMatricesList()$base
+  kinds <- c(MANIFESTMEANS = 1L, T0MEANS = 2L, CINT = 3L, TDPREDEFFECT = 4L)
+  codes <- as.integer(base[names(kinds)])
+  stationary <- isTRUE(as.logical(model$stationary)) || !is.null(model$t0stationary)
+  # The latents whose intercepts a stationary initial mean reads.
+  t0s <- model$t0stationary
+  meanreads <- if (isTRUE(as.logical(model$stationary))) function(i) TRUE else
+    if (!is.null(t0s) && any(as.logical(t0s$means))) function(i) isTRUE(t0s$closure[i]) else
+    function(i) FALSE
+  param <- as.integer(setup$param)
+  effect <- integer(); kind <- integer(); target <- integer(); slope <- numeric()
+  pred <- integer()
+  for (p in own) {
+    rows <- which(param == as.integer(lv$re_index[p]))
+    if (!length(rows)) next
+    mats <- unique(as.integer(setup$matrix[rows]))
+    if (length(mats) != 1L || !mats %in% codes) next
+    k <- kinds[[match(mats, codes)]]
+    if (k == 2L && stationary) next
+    if (k == 3L && meanreads(as.integer(setup$row[rows[1]]))) next
+    if (!all(as.integer(setup$transform[rows]) == 0L) ||
+        length(unique(as.integer(setup$row[rows]))) != 1L ||
+        length(unique(as.integer(setup$col[rows]))) != 1L) next
+    sl <- as.numeric(values$meanscale[rows]) * as.numeric(values$multiplier[rows])
+    if (!all(is.finite(sl)) || any(abs(sl - sl[1]) > 0)) next
+    effect <- c(effect, p)
+    kind <- c(kind, k)
+    target <- c(target, as.integer(setup$row[rows[1]]))
+    slope <- c(slope, sl[1])
+    pred <- c(pred, if (k == 4L) as.integer(setup$col[rows[1]]) else 0L)
+  }
+  if (!length(effect)) return(NULL)
+  # The cost rule, from dev1's measurements (review/FITTING-filter-effects-
+  # 2026-10-24.md): beside the level's other effects a single effect costs
+  # more in the filter than as a coordinate, 8-27 per cent an evaluation --
+  # the filter's work for one coordinate fewer -- where three cost a quarter
+  # to a third less, and with no coordinate left the filter is three to four
+  # times cheaper. Either way the objective is the same.
+  if (block && length(effect) == 1L && length(lv$re_index) > 1L) return(NULL)
+  list(effect = effect, kind = kind, target = target, slope = slope, pred = pred,
+    block = block)
+}
+
+# Whether the model's calculations leave the filter linear and Gaussian with
+# covariances and gains that do not depend on the integrated deviations, as
+# the hybrid needs (`.ctJuliaLaplaceHybrid`). The deviations enter only through
+# MANIFESTMEANS, T0MEANS and CINT, and the state estimates through the
+# residual, so a calculation is out when it reads a state (gains through the
+# state) or one of those vectors, or is itself a cell of one. Anything else
+# -- a measurement error written
+# in parameters and a time dependent predictor, say, as for a study's known
+# response rounding -- is a fixed matrix for each row, and the filter integrates
+# the deviations exactly through it.
+# Whether every unit's inner problem is a concave quadratic in its effects, so
+# that it has exactly one maximum and the engine's mode probes
+# (`_laplace_probe_modes`), which look for a better one, cannot find anything.
+# The hybrid's test for own variances (`.ctJuliaLaplaceHybrid()`), applied to
+# every effect at every level: every indicator Gaussian, no cell referencing a
+# state, every matsetup cell an effect moves in a mean vector (T0MEANS, CINT,
+# MANIFESTMEANS, TDPREDEFFECT) with the affine transform (code 0), and no
+# calculation that reads a state, a mean vector or PARS, any of which could
+# carry an effect into a covariance or a gain. Then each predicted mean is
+# affine in the effects and no covariance depends on them, so the log
+# likelihood is quadratic in them; loadings onto the effects are population
+# parameters and keep it so. Where the probes are needed -- a person's
+# loadings whose sign the data leave open, a person's persistence -- an effect
+# sits in LAMBDA or DRIFT, and this is FALSE. An effect on a PARS cell counts
+# where only mean-vector cells read it, each affine in it
+# (`.ctJuliaParsAffine()`): a drift-scaled intercept, `PARS[k,1] * a /
+# expm1(a)`, is one.
+.ctJuliaLaplaceQuadratic <- function(model, setup, levels) {
+  affine <- .ctJuliaLaplaceAffine(model, setup, levels)
+  !is.null(affine) && all(unlist(affine))
+}
+
+# That test effect by effect: per level, whether each effect is one of its
+# mean effects, or NULL where a condition on the whole model fails (an
+# indicator not Gaussian, a cell or calculation reading a state, a
+# calculation reading a mean vector). Where some effects pass and others do
+# not, a unit is concave in the passing ones given the rest, so its second
+# maxima differ in the rest, and the engine probes only their span
+# (`_laplace_probe_span`).
+.ctJuliaLaplaceAffine <- function(model, setup, levels) {
+  if (is.null(setup) || !nrow(setup) || !length(levels)) return(NULL)
+  if (length(model$manifesttype) && any(as.integer(model$manifesttype) != 0L)) return(NULL)
+  if ("stateref" %in% names(setup) && any(as.integer(setup$stateref) > 0L)) return(NULL)
+  base <- .ctMatricesList()$base
+  means <- base[c("T0MEANS", "CINT", "MANIFESTMEANS", "TDPREDEFFECT")]
+  param <- as.integer(setup$param)
+  # A calculation is out where it reads a state or a mean vector. An effect
+  # is out where a cell that is no mean reads a PARS cell carrying it, which
+  # takes it into a covariance or a gain. A mean computed from a PARS effect
+  # is the loop's question below.
+  effects <- unique(unlist(lapply(levels, function(lv) as.integer(lv$re_index))))
+  pars <- as.integer(setup$matrix) == base[["PARS"]] & param %in% effects
+  carried <- sprintf("PARS[%d,%d]", as.integer(setup$row[pars]), as.integer(setup$col[pars]))
+  leaked <- integer()
+  calcs <- unlist(model$modelmats$calcs)
+  if (length(calcs)) {
+    lhs <- sub("=.*$", "", calcs)
+    rhs <- gsub("\\s+", "", sub("^[^=]*=", "", calcs))
+    meanlhs <- grepl("^\\s*(T0MEANS|CINT|MANIFESTMEANS|TDPREDEFFECT)\\[", lhs)
+    if (any(grepl("state[", rhs, fixed = TRUE) |
+        grepl("\\b(T0MEANS|CINT|MANIFESTMEANS|TDPREDEFFECT)\\[", rhs))) return(NULL)
+    for (j in seq_along(carried)) {
+      if (any(grepl(carried[j], rhs[!meanlhs], fixed = TRUE))) leaked <- c(leaked, param[pars][j])
+    }
+  }
+  lapply(levels, function(lv) vapply(as.integer(lv$re_index), function(p) {
+    rows <- which(param == p)
+    if (!length(rows) || p %in% leaked ||
+        !all(as.integer(setup$transform[rows]) == 0L)) return(FALSE)
+    inmean <- as.integer(setup$matrix[rows]) %in% means
+    all(inmean) || .ctJuliaParsAffine(model, setup[rows[!inmean], , drop = FALSE])
+  }, logical(1)))
+}
+
+# Whether the PARS cells in `cells` (matsetup rows) reach the model only through
+# mean-vector cells that are affine in them: every cell whose expression reads
+# one is a T0MEANS, CINT, MANIFESTMEANS or TDPREDEFFECT cell, its derivative in
+# that PARS cell no longer reads it, and every other cell it reads is free of
+# effects and no expression itself. Then for fixed population parameters each
+# such mean is affine in the effect, as it is for an effect in the mean.
+.ctJuliaParsAffine <- function(model, cells) {
+  base <- .ctMatricesList()$base
+  if (!all(as.integer(cells$matrix) == base[["PARS"]])) return(FALSE)
+  pars <- model$pars
+  if (is.null(pars) || !nrow(pars)) return(FALSE)
+  varying <- .ctVaryingRows(model)
+  means <- c("T0MEANS", "CINT", "MANIFESTMEANS", "TDPREDEFFECT")
+  text <- as.character(pars$param)
+  ref <- "\\b([A-Z][A-Z0-9]*)\\[\\s*([0-9]+)\\s*,\\s*([0-9]+)\\s*\\]"
+  for (i in seq_len(nrow(cells))) {
+    at <- sprintf("PARS\\[\\s*%d\\s*,\\s*%d\\s*\\]", as.integer(cells$row[i]),
+      as.integer(cells$col[i]))
+    readers <- which(grepl(at, text) & !(pars$matrix %in% "PARS"))
+    if (any(grepl(at, text[pars$matrix %in% "PARS"]))) return(FALSE)
+    for (r in readers) {
+      if (!pars$matrix[r] %in% means || grepl("state[", text[r], fixed = TRUE)) return(FALSE)
+      f <- tryCatch(str2lang(gsub(at, "x__affine", text[r])), error = function(e) NULL)
+      if (is.null(f)) return(FALSE)
+      d1 <- tryCatch(.ctWithStableDerivRules(Deriv::Deriv(f, "x__affine",
+        cache.exp = FALSE)), error = function(e) NULL)
+      if (is.null(d1) || "x__affine" %in% all.vars(d1)) return(FALSE)
+      others <- regmatches(text[r], gregexpr(ref, text[r]))[[1]]
+      for (o in others) {
+        m <- regmatches(o, regexec(ref, o))[[1]]
+        if (identical(m[2], "PARS") && as.integer(m[3]) == as.integer(cells$row[i]) &&
+            as.integer(m[4]) == as.integer(cells$col[i])) next
+        hit <- which(pars$matrix == m[2] & pars$row == as.integer(m[3]) &
+          pars$col == as.integer(m[4]))
+        if (length(hit) && (any(varying[hit]) || any(grepl("[", text[hit], fixed = TRUE))))
+          return(FALSE)
+      }
+    }
+  }
+  TRUE
+}
+
+.ctJuliaHybridCalcsOk <- function(model) {
+  calcs <- unlist(model$modelmats$calcs)
+  if (!length(calcs)) return(TRUE)
+  lhs <- sub("=.*$", "", calcs)
+  rhs <- sub("^[^=]*=", "", calcs)
+  means <- "\\b(MANIFESTMEANS|T0MEANS|CINT|TDPREDEFFECT)\\["
+  !any(grepl("state[", rhs, fixed = TRUE) | grepl(means, rhs) | grepl(means, lhs))
+}
+
+# Which random effects cannot reach which groups' data: a matrix of (level,
+# group, effect) rows, effect indexing the level's `re_index`, or NULL.
+#
+# An effect is inert for a group when nothing it moves can reach a manifest
+# any of the group's subjects observes -- an item a study did not ask, say --
+# and the engine then skips the coordinates that move only inert effects,
+# which is exact (`CTSEMLaplaceUnits`). What each of its cells reaches is read
+# off the model (`.ctJuliaCellReach()`), and an effect reaches the union.
+.ctJuliaLaplaceInert <- function(model, setup, levels, dat) {
+  if (is.null(setup) || !nrow(setup) || !length(levels)) return(NULL)
+  manifests <- model$manifestNames
+  id <- model$subjectIDname
+  if (!length(manifests) || !all(c(id, manifests) %in% colnames(dat))) return(NULL)
+  cellreach <- .ctJuliaCellReach(model, setup)
+  codes <- .ctMatricesList()$all
+  matrixname <- names(codes)[match(as.integer(setup$matrix), codes)]
+  subjects <- factor(dat[[id]], levels = unique(dat[[id]]))
+  # Subjects by manifests: whether that subject observes it at all.
+  observed <- vapply(manifests, function(m)
+    as.vector(tapply(!is.na(dat[[m]]), subjects, any)), logical(nlevels(subjects)))
+  observed <- matrix(observed, nrow = nlevels(subjects))
+  param <- as.integer(setup$param)
+  out <- list()
+  for (l in seq_along(levels)) {
+    lv <- levels[[l]]
+    reach <- lapply(as.integer(lv$re_index), function(p) {
+      rows <- which(param == p)
+      if (!length(rows)) return(NULL)
+      hit <- integer()
+      for (ri in rows) {
+        more <- cellreach(matrixname[ri], as.integer(setup$row[ri]),
+          as.integer(setup$col[ri]))
+        if (is.null(more)) return(NULL)
+        hit <- c(hit, more)
+      }
+      if (length(hit)) unique(hit) else NULL
+    })
+    candidates <- which(!vapply(reach, is.null, logical(1)))
+    if (!length(candidates) || length(lv$group) != nrow(observed)) next
+    # Groups by manifests: whether any of the group's subjects observes it.
+    seen <- rowsum(observed * 1, as.integer(lv$group), reorder = TRUE) > 0
+    if (nrow(seen) != lv$ngroups) next
+    for (j in candidates) {
+      g <- which(!apply(seen[, reach[[j]], drop = FALSE], 1, any))
+      if (length(g)) out[[length(out) + 1L]] <- cbind(level = l, group = g, effect = j)
+    }
+  }
+  if (!length(out)) return(NULL)
+  do.call(rbind, out)
+}
+
+# What a cell of the model reaches: a function of (matrix name, row, col)
+# returning the manifests whose part of the likelihood the cell can move, or
+# NULL for every manifest. Read off matsetup and the calculations, as the
+# engine's filter would see them.
+#
+#  * Measurement cells. LAMBDA, MANIFESTMEANS, Jy, THRESHOLDS, RESPONSE: row
+#    `i` belongs to manifest `i`, and the filter's update reads only the
+#    observed manifests' rows. ASYMPTOTES likewise, but its row `i` is the
+#    `i`th binary indicator. A MANIFESTVAR cell reaches the manifests coupled
+#    with it: the covariance is built from the whole matrix -- a matrix
+#    exponential under covmattransform 'z' -- and the update reads its observed
+#    block, so a cell reaches every manifest joined to its row or column
+#    through nonzero off-diagonal cells.
+#  * Dynamics cells. DRIFT, CINT, JAx, TDPREDEFFECT, Jtd and T0MEANS row `k`
+#    move state `k`; a DIFFUSION or T0VAR cell moves the states coupled with
+#    it, as for MANIFESTVAR. What a moved state reaches is every manifest that
+#    reads it or any state downstream of it. State `i` is upstream of state `k`
+#    when a nonzero cell of `k`'s dynamics reads `i`: a DRIFT, JAx or Jtd cell
+#    in column `i`, or any of `k`'s cells whose expression reads `state[i]`.
+#    The Jacobians make the first exact for a state dependent drift. A
+#    manifest reads state `k` through a nonzero LAMBDA or Jy cell in column
+#    `k`, or any of its measurement cells whose expression reads `state[k]`.
+#    So a process measured by one item, and feeding no process another item
+#    measures, reaches that item alone. That is exact for the filter: with
+#    nothing feeding back, the states the observed items read evolve and
+#    update by their own blocks of the drift, covariance and loadings.
+#  * PARS: nothing of its own, only through what reads it.
+#  * Anything else is used in a way not known here, and reaches every
+#    manifest.
+#
+# A cell whose expression -- matsetup's `parname`, or a calculation in
+# `model$modelmats$calcs` -- references another cell carries that cell on to
+# itself, so a cell also reaches what every cell reading it reaches, through
+# any number of PARS cells: an intercept written `mm_a + lam_a * lev` with
+# `mm_a` in PARS reaches item a alone, as a plain intercept cell does. The same
+# references pass state reads on: a cell reading a PARS cell that reads
+# `state[i]` reads state `i`. A PARS cell nothing reads is used somewhere this
+# cannot see, and reaches every manifest.
+.ctJuliaCellReach <- function(model, setup) {
+  codes <- .ctMatricesList()$all
+  setupname <- names(codes)[match(as.integer(setup$matrix), codes)]
+  setuprow <- as.integer(setup$row)
+  setupcol <- as.integer(setup$col)
+  keyof <- function(matrix, row, col) paste0(matrix, "[", row, ",", col, "]")
+  cellpattern <- "\\b([A-Za-z][A-Za-z0-9]*)\\s*\\[\\s*([0-9]+)\\s*,\\s*([0-9]+)\\s*\\]"
+  parsekey <- function(key) {
+    parts <- regmatches(key, regexec(cellpattern, key, perl = TRUE))[[1L]]
+    if (length(parts) != 4L) return(NULL)
+    list(matrix = parts[2L], row = as.integer(parts[3L]), col = as.integer(parts[4L]))
+  }
+  # Every cell with its expressions, matsetup's and the calculations'.
+  calcs <- unlist(model$modelmats$calcs)
+  calcs <- calcs[!is.na(calcs) & grepl("=", calcs, fixed = TRUE)]
+  calcat <- lapply(trimws(sub("=.*$", "", calcs)), parsekey)
+  calcok <- !vapply(calcat, is.null, logical(1))
+  calckey <- vapply(calcat[calcok], function(at) keyof(at$matrix, at$row, at$col),
+    character(1))
+  calcrhs <- sub("^[^=]*=", "", calcs[calcok])
+  setupkey <- keyof(setupname, setuprow, setupcol)
+  parname <- if (is.null(setup$parname)) rep(NA_character_, nrow(setup)) else
+    as.character(setup$parname)
+  keys <- unique(c(setupkey, calckey))
+  expressions <- lapply(keys, function(k) {
+    e <- c(parname[setupkey == k], calcrhs[calckey == k])
+    e[!is.na(e) & nzchar(e)]
+  })
+  names(expressions) <- keys
+  values <- model$modelmats$matvalues
+  value <- if (is.null(values)) rep(NA_real_, nrow(setup)) else
+    suppressWarnings(as.numeric(values$value))
+  stateref <- if (is.null(setup$stateref)) integer(nrow(setup)) else
+    as.integer(setup$stateref)
+  # Structurally nonzero: free, from a state, fixed away from zero, or written
+  # by a calculation. A free or computed cell carries 99999 in `matvalues`.
+  nonzero <- setNames(keys %in% calckey, keys)
+  setnz <- as.integer(setup$param) > 0L | stateref > 0L | (!is.na(value) & value != 0)
+  nonzero[setupkey[setnz]] <- TRUE
+  # The cells each expression references, other than states and predictors.
+  referenced <- lapply(expressions, function(e) {
+    hits <- unlist(regmatches(e, gregexpr(cellpattern, e, perl = TRUE)))
+    if (!length(hits)) return(character())
+    unique(vapply(hits, function(h) {
+      at <- parsekey(h)
+      keyof(at$matrix, at$row, at$col)
+    }, character(1), USE.NAMES = FALSE))
+  })
+  readers <- if (!length(unlist(referenced))) list() else
+    split(rep(keys, lengths(referenced)), unlist(referenced))
+  # States a cell reads, directly or through the cells it references.
+  statesread <- function(k, seen = character()) {
+    if (k %in% seen) return(integer())
+    seen <- c(seen, k)
+    out <- c(stateref[setupkey == k],
+      unlist(lapply(expressions[[k]], .ctExpressionIndices, name = "state")))
+    for (r in referenced[[k]]) {
+      if (r %in% keys) out <- c(out, statesread(r, seen))
+    }
+    out <- unique(as.integer(out))
+    out[out > 0L]
+  }
+
+  # Coupled blocks of a covariance matrix, by its nonzero off-diagonal cells.
+  blocks <- function(matrix) {
+    on <- keys[startsWith(keys, paste0(matrix, "[")) & nonzero]
+    at <- lapply(on, parsekey)
+    n <- max(0L, unlist(lapply(at, function(a) c(a$row, a$col))))
+    group <- seq_len(n)
+    root <- function(i) {
+      while (group[i] != i) i <- group[i]
+      i
+    }
+    for (a in at) {
+      if (a$row == a$col) next
+      x <- root(a$row); y <- root(a$col)
+      if (x != y) group[max(x, y)] <- min(x, y)
+    }
+    function(i) {
+      if (i > n) return(as.integer(i))
+      roots <- vapply(seq_len(n), root, integer(1))
+      which(roots == root(i))
+    }
+  }
+  manifestvar <- blocks("MANIFESTVAR")
+  diffusion <- blocks("DIFFUSION")
+  t0var <- blocks("T0VAR")
+
+  nm <- length(model$manifestNames)
+  binary <- which(model$manifesttype %in% 1L)
+  rowlocal <- c("LAMBDA", "MANIFESTMEANS", "Jy", "THRESHOLDS", "RESPONSE")
+  # The states a dynamics cell moves, NULL for a cell that is not one.
+  moves <- function(at) {
+    if (at$matrix %in% c("DRIFT", "CINT", "JAx", "TDPREDEFFECT", "Jtd", "T0MEANS")) {
+      return(at$row)
+    }
+    if (identical(at$matrix, "DIFFUSION")) return(unique(c(diffusion(at$row), diffusion(at$col))))
+    if (identical(at$matrix, "T0VAR")) return(unique(c(t0var(at$row), t0var(at$col))))
+    NULL
+  }
+  # The manifests a measurement cell belongs to, NULL for a cell that is not one.
+  belongs <- function(at) {
+    if (at$matrix %in% rowlocal) return(if (at$row <= nm) at$row else integer())
+    if (identical(at$matrix, "ASYMPTOTES")) {
+      return(if (at$row <= length(binary)) binary[at$row] else integer())
+    }
+    if (identical(at$matrix, "MANIFESTVAR")) {
+      return(intersect(unique(c(manifestvar(at$row), manifestvar(at$col))), seq_len(nm)))
+    }
+    NULL
+  }
+  # Edges between states, and the states each manifest reads.
+  upstream <- list()
+  manifestreads <- rep(list(integer()), nm)
+  for (k in keys[nonzero]) {
+    at <- parsekey(k)
+    if (is.null(at)) next
+    read <- statesread(k)
+    if (!is.null(to <- moves(at))) {
+      if (at$matrix %in% c("DRIFT", "JAx", "Jtd")) read <- c(read, at$col)
+      for (s in to) upstream[[as.character(s)]] <- unique(c(upstream[[as.character(s)]], read))
+    } else if (!is.null(m <- belongs(at))) {
+      if (at$matrix %in% c("LAMBDA", "Jy")) read <- c(read, at$col)
+      for (i in m) manifestreads[[i]] <- unique(c(manifestreads[[i]], read))
+    }
+  }
+  # The states downstream of a set, the set included.
+  downstream <- function(states) {
+    out <- unique(as.integer(states))
+    repeat {
+      more <- as.integer(names(upstream))[vapply(upstream, function(u) any(u %in% out),
+        logical(1))]
+      more <- setdiff(more, out)
+      if (!length(more)) return(out)
+      out <- c(out, more)
+    }
+  }
+
+  reach <- function(matrix, row, col, seen = character()) {
+    key <- keyof(matrix, row, col)
+    if (key %in% seen) return(integer())
+    seen <- c(seen, key)
+    at <- list(matrix = matrix, row = as.integer(row), col = as.integer(col))
+    own <- belongs(at)
+    if (is.null(own)) {
+      moved <- moves(at)
+      if (!is.null(moved)) {
+        down <- downstream(moved)
+        own <- which(vapply(manifestreads, function(r) any(r %in% down), logical(1)))
+      } else if (identical(matrix, "PARS")) {
+        own <- integer()
+      } else return(NULL)
+    }
+    those <- readers[[key]]
+    if (identical(matrix, "PARS") && !length(those)) return(NULL)
+    for (r in those) {
+      to <- parsekey(r)
+      if (is.null(to)) return(NULL)
+      more <- reach(to$matrix, to$row, to$col, seen)
+      if (is.null(more)) return(NULL)
+      own <- c(own, more)
+    }
+    unique(as.integer(own))
+  }
+  reach
+}
+
+# The raw entry for a population sd, as the engine's `_laplace_popchol` reads
+# it: `sd = log1p_exp(2 raw - 1) * sdscale + 1e-10`, inverted, floor included,
+# so a stated sd is held exactly.
+.ctJuliaRawPopSd <- function(target, scale) {
+  (log(expm1((target - 1e-10) / scale)) + 1) / 2
+}
+
+# The model's own name for each varying parameter, so every later report can
+# say which parameter a random effect belongs to without re-deriving it.
+.ctJuliaLaplaceNames <- function(table, varying) {
+  vapply(as.integer(varying), function(parameter) {
+    hit <- which(!is.na(table$parnumber) & table$parnumber == parameter &
+      !is.na(table$param))
+    if (!length(hit)) NA_character_ else as.character(table$param[hit[1L]])
+  }, character(1L))
+}
+
+# Stan's `derrind` (ctData.R:310-315) reduction, ported: among the states in
+# `1:span` (the augmented layout when there is one, else just the original
+# states), which ones need their own row/column in the diffusion covariance
+# and Lyapunov solve. Two steps, matching Stan exactly:
+#
+#  1. A state has "structurally zero" diffusion only when every DIFFUSION cell
+#     in its row and column is a *fixed* value of exactly zero -- `table$value`
+#     is NA for every free parameter and for every state-dependent transform
+#     (see `.ctJuliaParameterTable`/`.ctJuliaCanonicalModel`, which leave
+#     `value` NA whenever the cell is anything but a literal constant), so
+#     testing `!is.na(value) && value == 0` never misclassifies a parameter
+#     that merely *evaluates* to zero at the current draw. This mirrors
+#     `listOfMatrices(ctm$pars)$DIFFUSION` where a free cell holds a parameter
+#     name (never equal to the string "0") and only a literal fixed zero
+#     prints as "0".
+#  2. Zero own diffusion is not enough to drop a state: if its drift/Jacobian
+#     (`JAx`, or `DRIFT` when no JAx rows exist -- both padded to `span` by
+#     the caller) structurally couples it to a diffusing state, covariance
+#     still reaches it through the transition, exactly as a matrix
+#     exponential of a coupled-but-noise-free block is not itself block
+#     diagonal. This is computed as the graph-connected-component closure
+#     Stan gets via `JAxsubsets` (`expmGetSubsets`, ctData.R:1-23): coupling
+#     is treated as undirected (`JAx[i,j]` nonzero links i and j both ways),
+#     because that is what `expmGetSubsets` does -- a row-only edge still
+#     grows the same connected component there.
+#
+# Indices beyond `nlatent` (augmented random-effect carriers) are dropped at
+# the end, same as Stan's `derrind[derrind <= standata$nlatent]`; carrier
+# states are never diffusing themselves, so they only ever enter as
+# intermediate coupling nodes on the way to another original state, and this
+# still finds them because the closure runs over the full `span`.
+.ctJuliaDerrind <- function(table, nlatent, span) {
+  if (span <= 0L) return(integer())
+  structurally_nonzero <- function(matrix_name) {
+    m <- matrix(FALSE, span, span)
+    rows <- which(table$matrix == matrix_name & !is.na(table$row) & !is.na(table$col) &
+      table$row >= 1L & table$row <= span & table$col >= 1L & table$col <= span)
+    for (i in rows) {
+      zero <- !is.na(table$value[i]) && isTRUE(as.numeric(table$value[i]) == 0)
+      if (!zero) m[table$row[i], table$col[i]] <- TRUE
+    }
+    m
+  }
+  diffusion <- structurally_nonzero("DIFFUSION")
+  coupling <- if (any(table$matrix == "JAx")) structurally_nonzero("JAx") else structurally_nonzero("DRIFT")
+  reach <- apply(diffusion, 1L, any) | apply(diffusion, 2L, any)
+  if (!any(reach)) return(integer())
+  repeat {
+    grown <- reach
+    for (state in which(reach)) grown <- grown | coupling[state, ] | coupling[, state]
+    if (!any(grown & !reach)) break
+    reach <- grown
+  }
+  sort(which(reach)[which(reach) <= nlatent])
+}
+
+.ctJuliaAugmentRandomEffects <- function(model) {
+  original_nlatent <- model$n.latent
+  prepared_augmentation <- !is.null(model$intoverpopindvaryingindex)
+  has_random_effects <- prepared_augmentation || any(model$pars$indvarying %in% TRUE &
+    is.na(suppressWarnings(as.numeric(model$pars$value))), na.rm = TRUE)
+  if (!has_random_effects) {
+    no_re_table <- .ctJuliaParameterTable(model)
+    return(list(parameter_table = no_re_table,
+      nlatent = original_nlatent, nlatent_augmented = original_nlatent,
+      dynamic_state_indices = .ctJuliaDerrind(no_re_table, original_nlatent, original_nlatent),
+      random_effects = data.frame(), rewritten_cells = data.frame()))
+  }
+
+  # A model no fit has set up, augmented as a fit augments it
+  # (`.ctFitModelSetup()`, the same code ctFit() runs), the caller's random
+  # stream put back as `.ctJuliaCanonicalModel()` puts it.
+  expanded <- if (prepared_augmentation) model else {
+    keep <- .ctStreamKeep()
+    tryCatch(.ctFitModelSetup(model, intoverpop = "augmented", checks = FALSE)$ctm,
+      finally = keep())
+  }
+  # Everything below reads the model as set up, as a fit hands it here: read
+  # as written, a reduced-rank population's loading form was missed and its
+  # scales looked for in a matsetup that has none.
+  model <- expanded
+  augmented_indices <- as.integer(expanded$intoverpopindvaryingindex)
+  nlatent_augmented <- max(expanded$pars$row[expanded$pars$matrix == "T0MEANS"])
+  table <- .ctJuliaParameterTable(expanded)
+
+  # The rows DRIFT genuinely has, before padding invents any. Everything past
+  # this is a static coordinate the augmentation added.
+  drift_rows <- suppressWarnings(max(table$row[table$matrix == "DRIFT"], na.rm = TRUE))
+  for (matrix in c("DRIFT", "DIFFUSION", "JAx", "Jtd")) {
+    table <- .ctJuliaPadMatrix(table, matrix, nlatent_augmented, nlatent_augmented)
+  }
+  # `.ctJuliaPadMatrix` pads with zeros, which is right for a continuous-time
+  # model -- a static coordinate has zero derivative -- and wrong for a
+  # discrete-time one, where DRIFT is the one-step transition itself and a
+  # static coordinate carries forward whole: the diagonal is 1, not 0.
+  # `ctJacobian()` (R/ctJacobian.R) already does exactly this to the padded
+  # copy of DRIFT it builds JAx from, so leaving DRIFT at 0 here made the two
+  # disagree on those rows by 1, and the engine forms the local affine offset
+  # from their difference: `dINT[i] = CINT[i] + sum_j (DRIFT[i,j] -
+  # JAx[i,j]) x[j]` came out as `-x[i]`, which cancelled the state the
+  # transition had just carried and zeroed every random effect at every step.
+  # A subject's deviation reached the first transition and nothing after it,
+  # with a finite likelihood and plausible estimates throughout.
+  if (!isTRUE(expanded$continuoustime) && is.finite(drift_rows) &&
+    nlatent_augmented > drift_rows) {
+    static_rows <- (drift_rows + 1L):nlatent_augmented
+    diagonal <- table$matrix == "DRIFT" & table$row %in% static_rows &
+      table$row == table$col
+    if (!identical(sum(diagonal), length(static_rows))) {
+      stop("Augmented DRIFT diagonal is not the shape the padding just made; ",
+        "please report this model shape.", call. = FALSE)
+    }
+    table$value[diagonal] <- 1
+  }
+  for (matrix in c("CINT", "T0MEANS")) {
+    table <- .ctJuliaPadMatrix(table, matrix, nlatent_augmented, 1L)
+  }
+  for (matrix in c("LAMBDA", "Jy")) {
+    if (matrix %in% table$matrix) {
+      table <- .ctJuliaPadMatrix(table, matrix,
+        max(table$row[table$matrix == matrix]), nlatent_augmented)
+    }
+  }
+  if ("TDPREDEFFECT" %in% table$matrix) {
+    table <- .ctJuliaPadMatrix(table, "TDPREDEFFECT", nlatent_augmented,
+      max(table$col[table$matrix == "TDPREDEFFECT"]))
+  }
+  table <- .ctJuliaPadMatrix(table, "T0VAR", nlatent_augmented, nlatent_augmented)
+
+  next_parameter <- max(table$parnumber, na.rm = TRUE)
+  # A reduced rank builds this block as a factor, and the loading form makes it
+  # the fixed identity. Both are needed below, before the scales are derived:
+  # a standardised carrier has no T0MEANS label, so the scale derivation cannot
+  # find it and has nothing to find -- the block carries no parameters for a
+  # scale to apply to.
+  population_factor <- .ctPopFactorConstruction(model)
+  population_standardised <- isTRUE(model[["popregression"]]$standardised)
+  random_sd_scale <- rep(1, length(augmented_indices))
+  # Stan's population covariance is built entirely in raw-parameter units
+  # (`rawpopcovbase`/`rawpopsd`, via `sdscale`), then explicitly rescaled to
+  # state units: for every indvarying T0MEANS row, `ctModelWriter.R` multiplies
+  # T0cov's corresponding row *and* column by that row's `multiplier*meanscale`
+  # (see `T0cov[matsetup[ri,1], ] *= matvalues[ri,2] * matvalues[ri,3]` and the
+  # matching column update, ctModelWriter.R:903-910). That doubles-up to a
+  # `k_i*k_j` scaling of every population-covariance entry, where
+  # `k_i = multiplier_i*meanscale_i` comes from state i's own T0MEANS
+  # transform. Without it, a state whose T0MEANS uses a non-unit
+  # multiplier/meanscale (e.g. the default `10*param` for T0MEANS/CINT-type
+  # customs pars) gets a population SD that's wrong by a factor of `k_i`
+  # relative to Stan -- exactly the T0VAR population-SD mismatch seen for
+  # ctsemTutorial.qmd's individual-differences model. Folding `k_i` into the
+  # diagonal (SD) transform here reproduces Stan's row+column rescaling
+  # exactly, since sdcovsqrt2cov later builds T0cov[i,j] = sd_i*sd_j*corr_ij:
+  # scaling sd_i by k_i and sd_j by k_j automatically scales every entry
+  # (including off-diagonals) by k_i*k_j, with no separate adjustment needed
+  # for the correlation parameters themselves (they stay dimensionless).
+  t0means_state_scale <- rep(1, length(augmented_indices))
+  # Skipped entirely when the block is the standardised identity: there is no
+  # population sd for `sdscale` to scale (the loadings carry it, applied in
+  # `.ctPopRegressionRewrite()`), and a dimension is dimensionless so its
+  # state scale is 1. Deriving them would also fail rather than mislead -- a
+  # standardised carrier has no T0MEANS parameter, so the lookup comes back
+  # short and trips the layout check below.
+  if (population_standardised) {
+    # nothing to derive
+  } else if (!is.null(expanded$modelmats$matsetup)) {
+    setup <- as.data.frame(expanded$modelmats$matsetup)
+    values <- as.data.frame(expanded$modelmats$matvalues)
+    varying_parameters <- unique(setup$param[setup$indvarying > 0L])
+    varying_parameters <- varying_parameters[varying_parameters > 0L]
+    random_sd_scale <- values$sdscale[match(varying_parameters, setup$param)]
+    random_sd_scale[is.na(random_sd_scale)] <- 1
+    t0means_code <- .ctMatricesList()$all[["T0MEANS"]]
+    t0means_rows <- setup$matrix == t0means_code & setup$col == 1L
+    match_position <- match(augmented_indices, setup$row[t0means_rows])
+    t0means_setup_rows <- which(t0means_rows)[match_position]
+    t0means_state_scale <- values$multiplier[t0means_setup_rows] * values$meanscale[t0means_setup_rows]
+    t0means_state_scale[is.na(t0means_state_scale)] <- 1
+  } else if (!is.null(expanded$pars$sdscale)) {
+    # `modelmats` is built by ctFit on its way to a backend, so the branch above
+    # covers every fit. It is *not* built when a specification is prepared
+    # directly -- which is what generation does -- and the fallback of 1 then
+    # discarded `sdscale` without saying so: a model asking for a population
+    # spread a fifth of the default generated data with the default spread.
+    #
+    # Reading it from `pars` costs a name lookup and makes the two routes agree.
+    scale <- vapply(augmented_indices, function(row) {
+      entry <- which(table$matrix == "T0MEANS" & table$row == row & table$col == 1L)
+      if (!length(entry) || is.na(table$param[entry[1L]])) return(1)
+      match_row <- which(!is.na(expanded$pars$param) &
+        as.character(expanded$pars$param) == as.character(table$param[entry[1L]]))
+      if (!length(match_row)) return(1)
+      value <- suppressWarnings(as.numeric(expanded$pars$sdscale[match_row[1L]]))
+      if (!is.finite(value)) 1 else value
+    }, numeric(1L))
+    random_sd_scale <- scale
+  }
+  if (length(random_sd_scale) != length(augmented_indices)) {
+    stop("Prepared random-effect covariance metadata does not match the augmented state layout.", call. = FALSE)
+  }
+  # The population SD and correlation cells below carry no TI-predictor
+  # effects, and their flags are cleared there rather than trusted. They once
+  # reused the T0VAR cells `T0VARredundancies()` (R/ctFit.R) fixes, and a stale
+  # flag made `.ctJuliaTIEffects()` mint a TI-predictor coefficient for every
+  # population parameter -- something the generated Stan model has no
+  # counterpart for, since its population block is `rawpopsdbase`/`sqrtpcov`
+  # and takes no TI effects. The consequences were one per backend: the engine
+  # silently estimated those extra coefficients, and `.ctBackendPriorSpec()`
+  # refused the fit outright because its Stan-derived layout was that many
+  # parameters short. They are RAWPOPVAR's own cells now, and T0VAR keeps what
+  # `T0VARredundancies()` wrote, which the engine adds the block to.
+  effect_columns <- grep("_effect$", names(table), value = TRUE)
+  covariance_rows <- list()
+  # The name of the parameter each varying state carries, read from its T0MEANS
+  # cell before that cell is rewritten below. Everything downstream that has to
+  # say which parameter a random effect belongs to -- the summary's popsd and
+  # rawpopcorr rows, the carrier state names in ctKalman output, ctSubjectPars
+  # -- gets it from here rather than re-deriving the augmentation.
+  varying_names <- vapply(augmented_indices, function(row) {
+    entry <- which(table$matrix == "T0MEANS" & table$row == row & table$col == 1L)
+    if (!length(entry) || is.na(table$param[entry[1L]])) NA_character_ else
+      as.character(table$param[entry[1L]])
+  }, character(1L))
+  # A standardised carrier has no T0MEANS label: its mean is fixed to zero and
+  # the effect's mean has moved to a PARS parameter of its own. The names come
+  # from the popregression spec, which is where the basis is decided, and they
+  # are in carrier order because `.ctPopRegressionRewrite()` reads the carrier
+  # states in that same order.
+  if (isTRUE(model[["popregression"]]$standardised)) {
+    basis <- model[["popregression"]]$basis
+    if (length(basis) == length(varying_names)) {
+      varying_names <- as.character(basis)
+    }
+  }
+  # The population covariance is its own matrix, sized by the number of random
+  # effects rather than by the augmented state dimension. Its row `i` is
+  # population position `i`; which state that is lives in `population_indices`,
+  # sent to the engine separately, because the two are not the same mapping --
+  # an individually varying T0MEANS gets no carrier state, so its population
+  # row refers to a main latent.
+  table <- .ctJuliaAddMatrix(table, "RAWPOPVAR", length(augmented_indices),
+    length(augmented_indices))
+  # A reduced rank builds this block as a factor, which changes what its cells
+  # mean as well as how they are transformed.
+  # A statement about one of these cells is refused in
+  # `.ctPopRegressionSpec()` rather than here, so that the explicit/defaulted
+  # convention this feature already has -- an asked-for rank errors, a
+  # defaulted one backs off -- applies to it too.
+
+  # Match Stan's unconstrained parameter order exactly: all population scales,
+  # then lower-triangular correlation coordinates column by column.
+  for (position in seq_along(augmented_indices)) {
+    row <- augmented_indices[position]
+    col <- row
+    index <- which(table$matrix == "RAWPOPVAR" & table$row == position &
+      table$col == position)
+    length(index) == 1L ||
+      stop("Internal Julia augmentation error: missing RAWPOPVAR entry.",
+        call. = FALSE)
+    # What the model says about this population sd, if anything. RAWPOPVAR is the
+    # specification surface (see R/ctModelRawPopVar.R); a number there fixes the
+    # cell and a label names the parameter, in place of the positional
+    # `julia_popcov_i_j` this used to invent.
+    spec <- .ctModelRawPopVarEntry(model, varying_names[position])
+    fixedvalue <- .ctModelRawPopVarValue(spec)
+    # A standardised dimension has unit variance by definition, so the
+    # diagonal is fixed at 1 and no RAWPOPVAR statement can apply: the basis
+    # loadings carry the spread now, and a reduced rank is refused outright
+    # for any stated cell, so nothing reaches here that meant otherwise.
+    if (population_standardised) {
+      spec <- NA_character_
+      fixedvalue <- 1
+    }
+    if (is.finite(fixedvalue)) {
+      if (fixedvalue < 0) {
+        stop("RAWPOPVAR['", varying_names[position], "', '",
+          varying_names[position], "'] is ", fixedvalue,
+          ". A population standard deviation cannot be negative.",
+          call. = FALSE)
+      }
+      # Written as stated, with no conversion: the number a user puts in
+      # RAWPOPVAR is the raw population sd, and it is the raw population sd on
+      # the Laplace route too, which reads it directly. The state-unit
+      # conversion happens once, where the engine places the block.
+      #
+      # It used to be divided by the derivative of the parameter's own
+      # transform as well, making the entry a spread on the parameter's
+      # *natural* scale. That was exact only for a linear transform and a
+      # first-order match otherwise, and it meant the specification surface and
+      # the fit disagreed about what the number was: a fit reports the raw
+      # population sd (see `.ctBackendRawPopCov`), so a model with a nonlinear
+      # transform could not be generated from and fitted with one number.
+      table$param[index] <- NA_character_
+      table$parnumber[index] <- NA_integer_
+      # Raw, as stated. The engine multiplies row and column by the
+      # state-unit conversion where it places the block, which is the same
+      # point the stan program applies it.
+      table$value[index] <- fixedvalue
+      table$transform[index] <- NA_character_
+    } else {
+      next_parameter <- next_parameter + 1L
+      table$param[index] <- if (is.na(spec) || !nzchar(spec))
+        sprintf("julia_popcov_%d_%d", row, col) else spec
+      table$parnumber[index] <- next_parameter
+      table$value[index] <- NA_real_
+      table$transform[index] <- if (population_factor) {
+        # Linear and signed, with no floor. A factor diagonal must be free to
+        # pass through zero -- `M M'` is positive semi-definite whatever the
+        # signs -- and a softplus here costs most of the reparameterisation's
+        # benefit, because its saturation reintroduces the flat boundary the
+        # factor form exists to remove.
+        sprintf("%.17g * param[%d]", random_sd_scale[position],
+          next_parameter)
+      } else {
+        sprintf("1e-10 + %.17g * log1p_exp(2 * param[%d] - 1)",
+          random_sd_scale[position], next_parameter)
+      }
+    }
+    # Whether the sd is fixed by RAWPOPVAR or free, this row is a population
+    # covariance cell and carries no TI predictor effect of its own.
+    if (length(effect_columns)) table[index, effect_columns] <- "FALSE"
+    covariance_rows[[length(covariance_rows) + 1L]] <- data.frame(
+      row = row, col = col,
+      parameter = if (is.finite(fixedvalue)) NA_integer_ else next_parameter,
+      type = "sd", param = varying_names[position],
+      # The factor folded into the sd transform above, kept so the summary can
+      # divide it back out: T0cov is in state units, and the random-effects
+      # summary needs the raw-parameter sd to perturb the raw vector by (see
+      # .ctBackendRandomEffectSummary).
+      scale = t0means_state_scale[position]
+    )
+  }
+  if (length(augmented_indices) > 1L) for (column_position in seq_len(length(augmented_indices) - 1L)) {
+    for (row_position in (column_position + 1L):length(augmented_indices)) {
+      row <- augmented_indices[row_position]
+      col <- augmented_indices[column_position]
+      index <- which(table$matrix == "RAWPOPVAR" & table$row == row_position &
+        table$col == column_position)
+      length(index) == 1L ||
+        stop("Internal Julia augmentation error: missing RAWPOPVAR entry.",
+          call. = FALSE)
+      spec <- .ctModelRawPopVarEntry(model, varying_names[row_position],
+        varying_names[column_position])
+      fixedvalue <- .ctModelRawPopVarValue(spec)
+      # Orthogonal dimensions, so every off-diagonal is a fixed zero.
+      if (population_standardised) {
+        spec <- NA_character_
+        fixedvalue <- 0
+      }
+      if (is.finite(fixedvalue)) {
+        table$param[index] <- NA_character_
+        table$parnumber[index] <- NA_integer_
+        table$value[index] <- fixedvalue
+        table$transform[index] <- NA_character_
+      } else {
+        next_parameter <- next_parameter + 1L
+        table$param[index] <- if (is.na(spec) || !nzchar(spec))
+          sprintf("julia_popcov_%d_%d", row, col) else spec
+        table$parnumber[index] <- next_parameter
+        table$value[index] <- NA_real_
+        # Identity, like every other covariance off-diagonal now: the
+        # (-1, 1) map lives in `constraincorsqrt1`, which this cell reaches
+        # through T0VAR. Leaving the squash here applied it twice and moved a
+        # fitted likelihood by 0.88 on a two-latent model.
+        table$transform[index] <- sprintf("param[%d]", next_parameter)
+      }
+      # As for the sd cells above: a population correlation carries no TI
+      # predictor effect of its own, fixed by RAWPOPVAR or not.
+      if (length(effect_columns)) table[index, effect_columns] <- "FALSE"
+      covariance_rows[[length(covariance_rows) + 1L]] <- data.frame(
+        row = row, col = col,
+        parameter = if (is.finite(fixedvalue)) NA_integer_ else next_parameter,
+        type = "correlation",
+        param = paste0(varying_names[row_position], "__", varying_names[column_position]),
+        scale = 1
+      )
+    }
+  }
+  rewritten <- .ctJuliaRewrittenCells(table)
+  # `augmented_indices` (= Stan's `intoverpopindvaryingindex`) is every state
+  # with population-varying T0VAR: both the newly-created carrier states for
+  # non-T0MEANS random effects (DRIFT/CINT/etc., always appended contiguously
+  # after the original states -- see `extralatents` in
+  # ctModelWriter.R::.ctModelIntOverPop) AND any *original* state whose
+  # own T0MEANS is directly indvarying (e.g. a random initial value). Only the
+  # former are static/no-own-dynamics carriers; the latter are still genuine
+  # dynamic states that need their own diffusion/Lyapunov treatment, exactly
+  # like Stan's own `derrind` (ctData.R) explicitly excludes only indices
+  # beyond `standata$nlatent` ("stable individual differences"), not every
+  # index with population-varying T0VAR. `setdiff(seq_len(nlatent_augmented),
+  # augmented_indices)` conflated these two groups, silently emptying
+  # dynamic_state_indices (and forcing the Lyapunov solve over the *entire*
+  # augmented state space, including static carriers with structurally zero
+  # diffusion) for any model combining T0MEANS random effects with other
+  # (DRIFT/CINT/etc.) random effects -- exactly the combination in
+  # ctsemTutorial.qmd's individual-differences example, which failed with a
+  # LAPACKException from the Schur-based Lyapunov solver once the augmented
+  # dimension exceeded 4. `table` has already been padded to
+  # `nlatent_augmented` for DRIFT/DIFFUSION/JAx/Jtd above, so
+  # `.ctJuliaDerrind` now applies Stan's further reduction (`derrind`'s first
+  # two steps: drop original states with structurally zero, drift-uncoupled
+  # diffusion) on top of this exclusion rather than instead of it -- see that
+  # function's comment for what "structurally zero" must mean and why the
+  # drift-coupling closure cannot be skipped.
+  list(parameter_table = table, nlatent = original_nlatent,
+    nlatent_augmented = nlatent_augmented,
+    dynamic_state_indices = .ctJuliaDerrind(table, original_nlatent, nlatent_augmented),
+    random_effects = do.call(rbind, covariance_rows), rewritten_cells = rewritten)
+}
+
+# The subject-level TI predictor matrix, a subject's first observed value of
+# each predictor, and `NA` where a subject has none: what is missing is read
+# here, from the data, and handled by `.ctJuliaPrepare()` (imputed or
+# sampled). Constancy within subject is `.ctJuliaValidateTIConstancy()`'s.
+.ctJuliaTIDataAllowMissing <- function(dat, model) {
+  subject_ids <- unique(dat[[model$subjectIDname]])
+  if (!model$n.TIpred) return(matrix(numeric(), nrow = length(subject_ids), ncol = 0L))
+  values <- matrix(NA_real_, nrow = length(subject_ids), ncol = model$n.TIpred,
+    dimnames = list(NULL, model$TIpredNames))
+  for (i in seq_along(subject_ids)) {
+    rows <- dat[[model$subjectIDname]] == subject_ids[i]
+    subject_values <- as.matrix(dat[rows, model$TIpredNames, drop = FALSE])
+    for (j in seq_len(ncol(subject_values))) {
+      observed <- subject_values[!is.na(subject_values[, j]), j]
+      if (length(observed)) values[i, j] <- observed[1L]
+    }
+  }
+  values
+}
+
+# Placeholder written into a missing TI predictor cell before the base
+# predictor matrix is sent to the engine. Never read as data: every cell
+# holding it is overwritten by the sampled parameter's current value on
+# every evaluation (`_ctsem_tipred_vector`, parameter_transforms.jl). This is
+# the same finite, absurd-on-sight value the engine already uses for exactly
+# this "must be overwritten before read" role (`UNSET_PARAMETER`,
+# inst/julia/.../parameters.jl) -- reused for the same reason there, not
+# introduced as a new sentinel, and never tested for by the engine (which
+# would be the mistake SPEC-tipred-sampling.md warns against; the engine is
+# told the missing positions explicitly instead).
+.ctJuliaTIMissingPlaceholder <- 99999
+
+# Per-subject means and SDs of the manifest variables, from the observed
+# rows only. A subject with zero (mean) or one (SD) observation of a given
+# manifest gets `NA` for that cell, which is what makes it drop out of that
+# subject's imputation model rather than contribute a fabricated value
+# (Charles's 2026-09-03 decision: manifest means *and* SDs join the
+# predictor terms, with the same per-subject dropout rule).
+.ctJuliaTISubjectManifestSummary <- function(dat, model) {
+  subject_ids <- unique(dat[[model$subjectIDname]])
+  ybar <- matrix(NA_real_, length(subject_ids), model$n.manifest,
+    dimnames = list(NULL, paste0("ybar_", model$manifestNames)))
+  ysd <- matrix(NA_real_, length(subject_ids), model$n.manifest,
+    dimnames = list(NULL, paste0("ysd_", model$manifestNames)))
+  for (i in seq_along(subject_ids)) {
+    rows <- dat[[model$subjectIDname]] == subject_ids[i]
+    for (m in seq_len(model$n.manifest)) {
+      y <- dat[rows, model$manifestNames[m]]
+      y <- y[!is.na(y)]
+      if (length(y)) ybar[i, m] <- mean(y)
+      if (length(y) > 1L) ysd[i, m] <- stats::sd(y)
+    }
+  }
+  list(ybar = ybar, ysd = ysd)
+}
+
+# Roughly five complete cases per coefficient (Charles's 2026-09-03 decision):
+# an imputation regression with more terms than this ratio supports is not
+# trustworthy, so it falls back to a simpler one instead.
+.ctJuliaTIMinCasesPerCoef <- 5
+
+# A person-level variable's imputation model, for every person missing it:
+# each person's own conditional mean and sd given everything known about them.
+#
+# A regression on the person's available inputs -- the other TI predictors
+# and smooth covariates, and with `includeOutcome` the person's manifest means
+# and sds -- fitted on the complete cases for exactly those inputs, so a person
+# missing an input loses that input and nothing else (one fit per pattern of
+# available inputs, cached). Where a pattern's complete cases are too few for
+# its terms (`.ctJuliaTIMinCasesPerCoef` per coefficient) it drops the outcome
+# summaries, then the predictors, down to the mean; a column the data cannot
+# separate from the others is dropped too. Then the person's group, at the
+# first level above the person: the residuals' between-group variance by
+# one-way moments, and the group's mean residual shrunk by it, so a group with
+# many complete cases moves its members' imputations to its own level and a
+# group with none adds its variance to their sd. The mean is held within the
+# variable's observed range.
+#
+# Coefficients and scales are fitted once and held fixed: the missing value
+# is still a sampled parameter with a proper conditional distribution when
+# sampling (Charles's 2026-09-03 decision).
+#
+# Warns, once per variable, when a pattern's complete cases could not support
+# its fullest model, naming the model taken.
+.ctTIImpute <- function(name, target, inputs, ybar = NULL, ysd = NULL,
+  includeOutcome = TRUE, group = NULL) {
+  target <- as.numeric(target)
+  missing <- which(is.na(target))
+  empty <- data.frame(person = integer(), mu = numeric(), sigma = numeric())
+  if (!length(missing)) return(empty)
+  observed <- target[!is.na(target)]
+  outcome <- if (isTRUE(includeOutcome)) cbind(ybar, ysd) else NULL
+  usable <- function(m) {
+    if (is.null(m) || !ncol(m)) return(matrix(numeric(), length(target), 0L))
+    m <- as.matrix(m)
+    keep <- apply(m, 2L, function(x) sum(!is.na(x)) > 1L &&
+      stats::var(x, na.rm = TRUE) > 0)
+    m[, keep, drop = FALSE]
+  }
+  inputs <- usable(inputs)
+  outcome <- usable(outcome)
+  named <- function(m, prefix) {
+    if (!ncol(m)) return(m)
+    if (is.null(colnames(m))) colnames(m) <- paste0(prefix, seq_len(ncol(m)))
+    colnames(m) <- make.names(colnames(m), unique = TRUE)
+    m
+  }
+  inputs <- named(inputs, "x")
+  outcome <- named(outcome, "y")
+  all <- cbind(inputs, outcome)
+
+  cache <- list()
+  fitted <- function(columns) {
+    key <- paste(columns, collapse = "|")
+    if (!is.null(cache[[key]])) return(cache[[key]])
+    repeat {
+      d <- if (length(columns)) data.frame(.y = target, all[, columns, drop = FALSE],
+        check.names = FALSE) else data.frame(.y = target)
+      cc <- stats::complete.cases(d)
+      if ((length(columns) &&
+          sum(cc) < .ctJuliaTIMinCasesPerCoef * (length(columns) + 1L)) ||
+          sum(cc) < 2L) {
+        cache[[key]] <<- list(fit = NULL)
+        return(cache[[key]])
+      }
+      fit <- stats::lm(.y ~ ., data = d[cc, , drop = FALSE])
+      aliased <- names(which(is.na(stats::coef(fit))))
+      aliased <- setdiff(gsub("`", "", aliased), "(Intercept)")
+      if (!length(aliased)) break
+      columns <- setdiff(columns, aliased)
+    }
+    out <- list(fit = fit, columns = columns, cc = which(cc))
+    cache[[key]] <<- out
+    out
+  }
+  # The fullest model a person's available inputs and the data support.
+  tiers <- function(i) {
+    have <- colnames(all)[!is.na(all[i, ])]
+    list(full = have, predictors = intersect(have, colnames(inputs)),
+      marginal = character())
+  }
+  best <- if (ncol(outcome)) "full" else if (ncol(inputs)) "predictors" else
+    "marginal"
+  fallback <- character()
+
+  # Group effects on one fit's residuals, by one-way moments.
+  groupterms <- function(model) {
+    if (is.null(group)) return(NULL)
+    r <- stats::residuals(model$fit)
+    g <- as.character(group[model$cc])
+    n <- table(g)
+    if (length(n) < 2L) return(NULL)
+    rbar <- tapply(r, g, mean)
+    within <- sum((r - rbar[g])^2)
+    dfw <- length(r) - length(n)
+    if (dfw < 1L) return(NULL)
+    sw <- within / dfw
+    N <- length(r)
+    msb <- sum(n * (rbar - mean(r))^2) / (length(n) - 1L)
+    n0 <- (N - sum(n^2) / N) / (length(n) - 1L)
+    tau2 <- max(0, (msb - sw) / n0)
+    if (tau2 <= 0) return(NULL)
+    list(n = n, rbar = rbar, sw = sw, tau2 = tau2)
+  }
+
+  rows <- lapply(missing, function(i) {
+    options <- tiers(i)
+    model <- NULL
+    tier <- "marginal"
+    for (t in c("full", "predictors", "marginal")) {
+      if (t == "full" && best != "full") next
+      if (t == "predictors" && best == "marginal") next
+      if (t != "marginal" && !length(options[[t]])) next
+      model <- fitted(options[[t]])
+      if (!is.null(model$fit)) { tier <- t; break }
+    }
+    # A tier this person's inputs allowed but the data could not support.
+    wanted <- if (best == "full" && length(options$full)) "full" else
+      if (best != "marginal" && length(options$predictors)) "predictors" else
+        "marginal"
+    if (tier != wanted) fallback <<- c(fallback, paste(wanted, tier))
+    mu <- if (length(model$columns)) {
+      newdata <- as.data.frame(as.list(all[i, model$columns, drop = TRUE]),
+        check.names = FALSE)
+      names(newdata) <- model$columns
+      as.numeric(stats::predict(model$fit, newdata = newdata))
+    } else unname(stats::coef(model$fit)[["(Intercept)"]])
+    sigma <- stats::sigma(model$fit)
+    terms <- groupterms(model)
+    if (!is.null(terms)) {
+      g <- as.character(group[i])
+      ng <- if (g %in% names(terms$n)) as.numeric(terms$n[[g]]) else 0
+      shrink <- ng * terms$tau2 / (ng * terms$tau2 + terms$sw)
+      if (ng > 0) mu <- mu + shrink * terms$rbar[[g]]
+      sigma <- sqrt(terms$sw + terms$tau2 * (1 - shrink))
+    }
+    mu <- min(max(mu, min(observed)), max(observed))
+    if (!is.finite(sigma) || sigma <= 0) sigma <- 1e-8 * max(1, stats::sd(observed))
+    data.frame(person = as.integer(i), mu = mu, sigma = sigma)
+  })
+  if (length(fallback)) {
+    worst <- utils::tail(unique(fallback), 1L)
+    parts <- strsplit(worst, " ", fixed = TRUE)[[1L]]
+    warning(sprintf(paste0("TI predictor '%s': not enough complete cases for the %s ",
+      "imputation model (roughly %d complete cases needed per coefficient) -- ",
+      "using the %s fallback instead."), name, parts[1L],
+      .ctJuliaTIMinCasesPerCoef, parts[2L]), call. = FALSE)
+  }
+  do.call(rbind, rows)
+}
+
+# Each subject's group at the first level above it, in subject order, or NULL
+# without grouping levels.
+.ctTISubjectGroup <- function(dat, model) {
+  if (!length(model$groupIDnames)) return(NULL)
+  ids <- dat[[model$subjectIDname]]
+  first <- !duplicated(ids)
+  as.character(dat[[model$groupIDnames[1L]]][first])
+}
+
+# The person-level inputs an imputation model reads: the TI predictors with a
+# smooth's columns replaced by its covariate, as observed (NA where missing),
+# and each time dependent predictor's mean over the person's rows; one row per
+# subject in subject order.
+.ctTISubjectInputs <- function(dat, model, tipred) {
+  smooth <- .ctTIsmoothColumns(model)
+  keep <- !colnames(tipred) %in% smooth
+  out <- as.data.frame(tipred[, keep, drop = FALSE])
+  ids <- dat[[model$subjectIDname]]
+  subjects <- unique(ids)
+  for (td in intersect(model$TDpredNames, names(dat))) {
+    x <- suppressWarnings(as.numeric(dat[[td]]))
+    means <- vapply(subjects, function(i) {
+      v <- x[ids == i]
+      if (any(!is.na(v))) mean(v, na.rm = TRUE) else NA_real_
+    }, numeric(1))
+    out[[paste0("tdmean_", td)]] <- means
+  }
+  for (s in model$TIsmooths) {
+    x <- suppressWarnings(as.numeric(dat[[s$covariate]]))
+    value <- vapply(subjects, function(i) {
+      v <- x[ids == i]
+      v <- v[!is.na(v)]
+      if (length(v)) v[1L] else NA_real_
+    }, numeric(1))
+    out <- cbind(out, stats::setNames(data.frame(value), s$covariate))
+  }
+  as.matrix(out)
+}
+
+# The sampling path's imputation spec: one row per missing TI predictor cell,
+# with a pre-computed conditional mean and SD (`parameter`, the raw index
+# that will sample it, is assigned later in `.ctJuliaPrepare`, once the rest
+# of the raw vector's length is known). Empty when nothing is missing.
+.ctJuliaTIMissingSpec <- function(dat, model, raw_tipred, includeOutcome = TRUE) {
+  missing_mask <- is.na(raw_tipred)
+  empty <- data.frame(subject = integer(), predictor = integer(),
+    mu = numeric(), sigma = numeric())
+  if (!any(missing_mask)) return(empty)
+
+  manifest_summary <- .ctJuliaTISubjectManifestSummary(dat, model)
+  colnames(raw_tipred) <- model$TIpredNames
+  inputs <- .ctTISubjectInputs(dat, model, raw_tipred)
+  group <- .ctTISubjectGroup(dat, model)
+  rows <- list()
+  for (j in seq_len(model$n.TIpred)) {
+    if (!any(missing_mask[, j])) next
+    # Fewer than two observed values leave nothing to impute from: `NA` here,
+    # which a rebuild fills from the fit it was rebuilt from
+    # (`.ctJuliaCarryTIMissing()`) and anything else refuses
+    # (`.ctJuliaTIMissingCheck()`).
+    if (sum(!missing_mask[, j]) < 2L) {
+      rows[[length(rows) + 1L]] <- data.frame(subject = which(missing_mask[, j]),
+        predictor = as.integer(j), mu = NA_real_, sigma = NA_real_)
+      next
+    }
+    imputed <- .ctTIImpute(model$TIpredNames[j], raw_tipred[, j],
+      inputs[, colnames(inputs) != model$TIpredNames[j], drop = FALSE],
+      manifest_summary$ybar, manifest_summary$ysd, includeOutcome, group)
+    rows[[length(rows) + 1L]] <- data.frame(subject = imputed$person,
+      predictor = as.integer(j), mu = imputed$mu, sigma = imputed$sigma)
+  }
+  if (!length(rows)) return(empty)
+  do.call(rbind, rows)
+}
+
+# `optimcontrol$tipredMissing`, or `control$tipredMissing` for a sample:
+# 'impute' holds a missing TI predictor value at its imputed mean, 'sample'
+# makes it a parameter with its imputation as prior, and 'auto' imputes when
+# optimizing and samples when sampling.
+.ctJuliaTIMissingRequest <- function(x, name = "optimcontrol$tipredMissing") {
+  if (is.null(x)) return("auto")
+  if (!is.character(x) || length(x) != 1L || !x %in% c("auto", "impute", "sample")) {
+    stop(name, " must be 'auto', 'impute' or 'sample'.", call. = FALSE)
+  }
+  x
+}
+
+# The cells, imputed or sampled, as one frame of `subject` and `predictor`.
+.ctJuliaTIMissingCells <- function(spec) {
+  cols <- c("subject", "predictor", "mu", "sigma")
+  rbind(if (NROW(spec$ti_imputed)) spec$ti_imputed[, cols, drop = FALSE],
+    if (NROW(spec$ti_missing)) spec$ti_missing[, cols, drop = FALSE])
+}
+
+# A predictor observed for too few subjects to be imputed, refused by name.
+.ctJuliaTIMissingCheck <- function(spec) {
+  cells <- .ctJuliaTIMissingCells(spec)
+  if (!NROW(cells) || !anyNA(cells$mu)) return(invisible(spec))
+  names <- spec$model$TIpredNames[sort(unique(cells$predictor[is.na(cells$mu)]))]
+  stop("The TI predictor ", paste0('"', names, '"', collapse = ", "),
+    " is observed for fewer than two subjects, so its missing values cannot ",
+    "be imputed or sampled. Drop it, or supply its values.", call. = FALSE)
+}
+
+# Once per fit, what became of the missing values.
+.ctJuliaTIMissingWarn <- function(spec, sampled, optimize) {
+  cells <- .ctJuliaTIMissingCells(spec)
+  if (!NROW(cells)) return(invisible(NULL))
+  which <- paste(spec$model$TIpredNames[sort(unique(cells$predictor))], collapse = ", ")
+  warning("NA's in TIpreds (", nrow(cells), " in ", which, ") - ",
+    if (!sampled) paste0("imputed from the other variables -- TIpred effect ",
+      "estimates may be overly confident; optimcontrol$tipredMissing = ",
+      "'sample' samples them.")
+    else if (isTRUE(optimize)) "estimated as parameters, with their imputation from the other variables as prior."
+    else "sampled, with their imputation from the other variables as prior.",
+    call. = FALSE)
+}
+
+# Missing TI predictor values held at their imputed means (`ti_imputed`), made
+# parameters of the posterior: each cell a raw index past every other, its
+# imputation its prior (`_ctsem_log_prior` in the engine). A spec with nothing
+# imputed comes back unchanged. A cell that reads such a predictor reads the
+# sampled value, and the reverse pass carries its derivative back to it
+# (`_ctsem_tipred_scatter!`).
+.ctJuliaTIMissingSampled <- function(spec) {
+  cells <- spec$ti_imputed
+  if (!NROW(cells)) return(spec)
+  cells$parameter <- .ctBackendNpar(spec) + seq_len(nrow(cells))
+  spec$tipred_data[cbind(cells$subject, cells$predictor)] <- .ctJuliaTIMissingPlaceholder
+  spec$ti_missing <- rbind(spec$ti_missing, cells)
+  spec["ti_imputed"] <- list(NULL)
+  spec
+}
+
+# Whether a sample of `fit` samples its missing TI predictor values, from the
+# fit's own setting and `control$tipredMissing`. A fit that estimated them as
+# parameters cannot be sampled with them imputed.
+.ctJuliaTIMissingSamples <- function(spec, requested = NULL) {
+  request <- if (is.null(requested)) .ctJuliaTIMissingRequest(spec[["tipredMissing"]]) else
+    .ctJuliaTIMissingRequest(requested, "control$tipredMissing")
+  if (identical(request, "impute") && NROW(spec$ti_missing)) {
+    stop("control$tipredMissing = 'impute': this fit estimated its missing TI ",
+      "predictor values as parameters (optimcontrol$tipredMissing = 'sample'). ",
+      "Refit with 'impute' to hold them at imputed values.", call. = FALSE)
+  }
+  !identical(request, "impute")
+}
+
+# A fit about to be sampled, with its imputed TI predictor values made
+# parameters: the estimate gains the imputed means, and the Hessian -- the
+# sampler's metric where the fit places the chains -- the cells' rows and
+# columns at that point (`ctsem_hessian_columns`, two gradients a cell on the
+# Laplace route where a unit holds a coordinate): their likelihood's curvature
+# and their coupling to the effects that read them, not their prior's alone.
+# The prior's diagonal stands in only where those columns cannot be had.
+.ctJuliaTIMissingSampleFit <- function(fit) {
+  cells <- fit$model_spec$ti_imputed
+  if (!NROW(cells)) return(fit)
+  npar <- length(fit$estimate$raw)
+  if (npar != .ctBackendNpar(fit$model_spec)) {
+    stop("The fit's estimate does not match its specification.", call. = FALSE)
+  }
+  fit$model_spec <- .ctJuliaTIMissingSampled(fit$model_spec)
+  fit$estimate$raw <- c(as.numeric(fit$estimate$raw), cells$mu)
+  H <- fit$uncertainty$hessian
+  if (!is.null(H)) {
+    k <- nrow(cells)
+    cols <- npar + seq_len(k)
+    out <- matrix(0, npar + k, npar + k)
+    out[seq_len(npar), seq_len(npar)] <- H
+    added <- .ctBackendHessianColumns(fit$model_spec, fit$estimate$raw, cols)
+    if (all(is.finite(added))) {
+      out[, cols] <- added
+      out[cols, ] <- t(added)
+      out[cols, cols] <- (added[cols, ] + t(added[cols, ])) / 2
+    } else {
+      out[cbind(cols, cols)] <- -1 / cells$sigma^2
+    }
+    fit$uncertainty$hessian <- out
+  }
+  fit
+}
+
+# The fit's TI predictor values, carried onto `spec`, a rebuild over its
+# subjects or some of them, where `spec` is missing them too: a value the fit
+# imputed is the value it imputed, and one it sampled is the same raw
+# parameter, so the fit's raw vectors apply unchanged. A subject the fit did
+# not have keeps what `spec` made of it.
+.ctJuliaCarryTIMissing <- function(spec, fitted) {
+  spec$tipredMissing <- fitted[["tipredMissing"]]
+  own <- spec$ti_imputed
+  if (NROW(own)) {
+    idname <- spec$model$subjectIDname
+    newids <- as.character(unique(spec$data[[idname]]))
+    oldids <- as.character(unique(fitted$data[[idname]]))
+    key <- function(cells, ids) paste(ids[cells$subject], cells$predictor, sep = "\r")
+    ownkey <- key(own, newids)
+    if (NROW(fitted$ti_imputed)) {
+      at <- match(ownkey, key(fitted$ti_imputed, oldids))
+      hit <- !is.na(at)
+      own$mu[hit] <- fitted$ti_imputed$mu[at[hit]]
+      own$sigma[hit] <- fitted$ti_imputed$sigma[at[hit]]
+      spec$tipred_data[cbind(own$subject, own$predictor)[hit, , drop = FALSE]] <- own$mu[hit]
+    }
+    if (NROW(fitted$ti_missing)) {
+      at <- match(ownkey, key(fitted$ti_missing, oldids))
+      hit <- !is.na(at)
+      if (any(hit)) {
+        cells <- fitted$ti_missing[at[hit], , drop = FALSE]
+        cells$subject <- own$subject[hit]
+        spec$tipred_data[cbind(cells$subject, cells$predictor)] <- .ctJuliaTIMissingPlaceholder
+        spec$ti_missing <- rbind(spec$ti_missing, cells)
+        own <- own[!hit, , drop = FALSE]
+      }
+    }
+    spec["ti_imputed"] <- list(if (NROW(own)) own)
+  }
+  .ctJuliaTIMissingCheck(spec)
+  spec
+}
+
+# What a rebuild over other rows takes from the fit it was rebuilt from: its TI
+# predictor values where they were missing, then its integration step.
+.ctJuliaCarryFit <- function(spec, fitted, values) {
+  .ctJuliaCarrySubsteps(.ctJuliaCarryTIMissing(spec, fitted), fitted, values)
+}
+
+.ctJuliaValidateTIConstancy <- function(dat, model) {
+  if (!model$n.TIpred) return(invisible(NULL))
+  for (subject in unique(dat[[model$subjectIDname]])) {
+    rows <- dat[[model$subjectIDname]] == subject
+    values <- dat[rows, model$TIpredNames, drop = FALSE]
+    for (name in model$TIpredNames) {
+      observed <- unique(values[[name]][!is.na(values[[name]])])
+      if (length(observed) > 1L) {
+        stop("Julia backend requires TI predictors to be constant within subject.", call. = FALSE)
+      }
+    }
+  }
+  invisible(NULL)
+}
+
+# `offset` is where the TI-predictor coefficients start in the raw vector. It
+# defaults to the last parameter the table itself uses, which is right for the
+# augmented route because that route puts its population-covariance parameters
+# *in* the table. The Laplace route's population parameters are not in any
+# matrix cell, so it passes the end of its own block instead; without that the
+# coefficients would silently alias the population scales.
+.ctJuliaTIEffects <- function(table, model, offset = NULL) {
+  if (!model$n.TIpred) {
+    return(data.frame(parameter = integer(), predictor = integer(), coefficient = integer()))
+  }
+  effect_columns <- paste0(model$TIpredNames, "_effect")
+  available <- intersect(effect_columns, names(table))
+  if (!length(available)) {
+    return(data.frame(parameter = integer(), predictor = integer(), coefficient = integer()))
+  }
+  direct <- !is.na(table$parnumber) & !grepl("[", table$param, fixed = TRUE)
+  entries <- list()
+  # The leading zero is the count of a model with nothing free, and it is not
+  # hypothetical: `ctGenerate` resolves every free parameter to a value before
+  # preparing, so on the generation path every `parnumber` is NA and `max` had
+  # nothing to take a maximum over -- it warned and returned -Inf, on an
+  # ordinary call. Same guard as `.ctBackendNpar()` and `.ctGenerateJulia()`
+  # already use for the same reason.
+  coefficient <- if (is.null(offset)) max(c(0L, table$parnumber), na.rm = TRUE) else
+    as.integer(offset)
+  # Coefficient index by `.ctTipredEffectKey()`: two parameters given the same
+  # effect name share one. The stan path keeps the same map in
+  # R/ctModelWriter.R. The indices themselves differ between the two -- stan
+  # allocates as it walks the cells, this walks predictors then parameters --
+  # but which effects are *the same coefficient* has to match, or the two
+  # backends fit different models from one specification.
+  for (predictor in seq_along(model$TIpredNames)) {
+    column <- effect_columns[predictor]
+    if (!column %in% available) next
+    # `Free`, not `Active`: an effect fixed to a value carries the value and
+    # needs no coefficient, so counting it would claim a parameter that is not
+    # estimated. R/ctModelWriter.R has always used `Free` here; this used
+    # `Active` and was inert only because nothing reached it with a fixed
+    # effect -- measured, on the fitting path `.ctJuliaUnsupported()` refuses
+    # a fixed effect before this runs, and on the generation path every
+    # `parnumber` is NA so `direct` excludes every row and this returns
+    # nothing. Both of those are other functions' behaviour, and the julia
+    # refusal says only that it is not supported yet, so the day it is the
+    # wrong test here would silently free an effect the user fixed.
+    freeeffects <- which(direct & .ctTipredEffectFree(table[[column]]))
+    # Cells sharing a parameter are required to state the same effects
+    # (R/ctModelSpecCheck.R), so the first of them carries the label.
+    first <- freeeffects[!duplicated(table$parnumber[freeeffects])]
+    first <- first[order(table$parnumber[first])]
+    if (!length(first)) next
+    key <- .ctTipredEffectKey(table[[column]][first], predictor, table$parnumber[first])
+    # A key holds its predictor, so a predictor's coefficients are new to it.
+    entries[[length(entries) + 1L]] <- data.frame(
+      parameter = as.integer(table$parnumber[first]), predictor = as.integer(predictor),
+      coefficient = as.integer(coefficient + match(key, unique(key)))
+    )
+    coefficient <- coefficient + length(unique(key))
+  }
+  if (!length(entries)) return(data.frame(parameter = integer(), predictor = integer(), coefficient = integer()))
+  do.call(rbind, entries)
+}
+
+# TI effects fixed to a value ('TI1=4.3'): `(parameter, predictor, value)`,
+# one row each. They need no coefficient -- the engine adds the value times the
+# subject's predictor to the raw parameter (`_materialize_subject_values!`) --
+# so they are kept apart from `.ctJuliaTIEffects()`, whose rows are
+# coefficients the optimiser moves.
+.ctJuliaTIFixed <- function(table, model) {
+  none <- data.frame(parameter = integer(), predictor = integer(), value = numeric())
+  if (!model$n.TIpred) return(none)
+  direct <- !is.na(table$parnumber) & !grepl("[", table$param, fixed = TRUE)
+  out <- list()
+  for (predictor in seq_along(model$TIpredNames)) {
+    column <- paste0(model$TIpredNames[predictor], "_effect")
+    if (!column %in% names(table)) next
+    value <- .ctTipredEffectValue(table[[column]])
+    rows <- which(direct & is.finite(value))
+    for (parameter in sort(unique(table$parnumber[rows]))) {
+      # Cells sharing a parameter state the same effects
+      # (R/ctModelSpecCheck.R), so the first carries the value.
+      first <- rows[table$parnumber[rows] %in% parameter][1L]
+      out[[length(out) + 1L]] <- data.frame(parameter = as.integer(parameter),
+        predictor = as.integer(predictor), value = as.numeric(value[first]))
+    }
+  }
+  if (!length(out)) return(none)
+  do.call(rbind, out)
+}
+
+# The inner-solve settings, checked here rather than where they are used.
+#
+# They reach the engine as keyword arguments to `ctsem_laplace_objective`, and a
+# keyword the bridge marshals wrongly is a silent wrong answer rather than an
+# error -- `inner_maxiter` is an `Integer` on the Julia side and a bare R
+# numeric arrives as a Float64, which no method accepts.
+.ctJuliaLaplaceInner <- function(laplacecontrol) {
+  if (is.null(laplacecontrol) || !length(laplacecontrol)) return(list())
+  out <- list()
+  maxiter <- laplacecontrol$inner_maxiter
+  if (!is.null(maxiter)) {
+    maxiter <- suppressWarnings(as.integer(maxiter)[1L])
+    if (is.na(maxiter) || maxiter < 1L) {
+      stop("optimcontrol$laplace_inner_maxiter must be a positive integer.",
+        call. = FALSE)
+    }
+    out$inner_maxiter <- maxiter
+  }
+  tol <- laplacecontrol$inner_tol
+  if (!is.null(tol)) {
+    tol <- suppressWarnings(as.numeric(tol)[1L])
+    # Zero is refused rather than treated as "off": `f_reltol = 0` is exact
+    # equality on the outer side and that is what ends julia fits, so a zero
+    # here would be a tolerance no gradient reaches rather than no tolerance.
+    if (is.na(tol) || tol <= 0) {
+      stop("optimcontrol$laplace_inner_tol must be a positive number.",
+        call. = FALSE)
+    }
+    out$inner_tol <- tol
+  }
+  # How soft directions are scored, recorded whenever it is given, default
+  # included. An absent rule is the historical meaning, 'logdet_floor': a
+  # specification written before the default became the quadrature carries
+  # none, and every route that rebuilds an objective from it must keep scoring
+  # it the way it was fitted. So the default is resolved at the fit's entry
+  # point (`.ctFitJuliaBackendImpl`), never here -- the rebuild sites pass
+  # `spec$laplace$inner` back through this function, and a default filled in
+  # here would silently move a stored fit to the quadrature.
+  if (!is.null(laplacecontrol[["soft_directions"]]) ||
+      !is.null(laplacecontrol[["floor"]])) {
+    rule <- .ctJuliaSoftDirections(laplacecontrol)
+    if (is.na(rule) || !rule %in% c("quadrature", "logdet_floor")) {
+      stop("optimcontrol$laplace_soft_directions must be 'quadrature' or ",
+        "'logdet_floor'.", call. = FALSE)
+    }
+    out$soft_directions <- rule
+  }
+  out
+}
+
+# How a unit whose curvature has a direction softer than the prior's is
+# scored, as a specification's `laplace$inner` records it: 'quadrature' (the
+# soft-direction quadrature) or 'logdet_floor'. A specification written before
+# the rename (juliaFit, 2026-10-31) records `floor` = 'gated' or 'total'
+# instead, and one written before either was recorded carries neither, which
+# is the 'logdet_floor' it was fitted under.
+.ctJuliaSoftDirections <- function(inner) {
+  rule <- inner[["soft_directions"]]
+  if (!is.null(rule)) return(as.character(rule)[1L])
+  old <- inner[["floor"]]
+  if (is.null(old)) return("logdet_floor")
+  old <- as.character(old)[1L]
+  if (identical(old, "gated")) "quadrature" else if (identical(old, "total"))
+    "logdet_floor" else old
+}
+
+# The rule a new intoverpop='laplace' or 'none' fit uses when none is asked
+# for.
+.ctJuliaSoftDirectionsDefault <- "quadrature"
+
+# `optimcontrol$saem`: how many SAEM iterations the first optimisation stage
+# may run before L-BFGS (`ctsem_saem` in the engine), 0 for none. TRUE is the
+# default cap, a positive number another. Refused by name where there are no
+# Laplace random effects to sample -- 'augmented' carries them as latent
+# states, and the state-explicit route has its own joint objective -- since
+# accepting it there and running the plain optimiser would say SAEM ran.
+.ctJuliaSaemDefaultIterations <- 10000L
+.ctJuliaSaemIterations <- function(optimcontrol, intoverpop = "laplace",
+  intoverstates = TRUE) {
+  # `[[`: `$` falls back to `saem_proposal` when this is absent, and a
+  # proposal given alone stopped the fit as an invalid iteration count.
+  v <- optimcontrol[["saem"]]
+  if (is.null(v) || isFALSE(v)) return(0L)
+  n <- if (isTRUE(v)) .ctJuliaSaemDefaultIterations else
+    suppressWarnings(as.integer(v)[1L])
+  if (length(v) != 1L || is.na(n) || n < 1L) {
+    stop("optimcontrol$saem must be TRUE, FALSE or a positive number of ",
+      "iterations.", call. = FALSE)
+  }
+  if (!as.character(intoverpop)[1L] %in% c("laplace", "none")) {
+    stop("optimcontrol$saem samples the random effects that ",
+      "intoverpop='laplace' integrates; with intoverpop='",
+      as.character(intoverpop)[1L], "' they are latent states and there is ",
+      "nothing for it to sample. Use intoverpop='laplace', or drop it.",
+      call. = FALSE)
+  }
+  if (!isTRUE(intoverstates)) {
+    stop("optimcontrol$saem applies to the marginal Laplace objective; ",
+      "intoverstates=FALSE samples the states and the random effects ",
+      "together already. Drop it.", call. = FALSE)
+  }
+  n
+}
+
+# `intoverpop` deliberately has no default. It selects which *model* is
+# prepared -- random effects as latent states, or integrated by Laplace -- and a
+# default meant a caller could omit it and silently get the other one. That is
+# what happened to prediction and to cross-validation, both of which rebuild a
+# specification from a fit and neither of which said which kind of fit it was.
+# Making it mandatory turns that from a silent wrong answer into a stop at the
+# call site.
+# `tipredMissing` is what this specification does with a missing TI predictor
+# value: 'impute' holds it at its imputed mean, 'sample' makes it a parameter.
+# Imputing is the default, for rebuilds as well as fits: a rebuild then takes
+# the fit's own values (`.ctJuliaCarryTIMissing()`).
+.ctJuliaPrepare <- function(datalong, model, prepared_data = NULL, project = NULL,
+  priors = FALSE, intoverpop, tipredMissing = "impute", tipredMissingIncludeOutcome = TRUE,
+  laplacecontrol = NULL, priorscope = NULL) {
+  # "none" prepares exactly as "laplace" does. The Laplace specification is what
+  # *describes* the random effects -- which raw parameters vary, at which level,
+  # with which population scale -- and that description is needed whether they
+  # are integrated out or sampled. The two differ only in what the fit then does
+  # with it, so they must not differ in how the model is built.
+  intoverpop <- match.arg(as.character(intoverpop)[1L],
+    c("augmented", "laplace", "none"))
+  # Generation hands a user's model straight here, so the per-level columns
+  # are made here as well as in ctFit(); see .ctResolveLevels().
+  model <- .ctResolveLevels(model)
+  # The floor is a property of the Laplace term, so a route without one refuses
+  # it by name rather than accepting it and doing something else. Either value:
+  # 'total' is no longer what every fit does, so it is not inert elsewhere.
+  # 'none' has a Laplace term even though it samples the effects: its sampler
+  # is placed, and its metric built, by optimising the Laplace objective.
+  if (!is.null(laplacecontrol[["soft_directions"]]) &&
+      !intoverpop %in% c("laplace", "none")) {
+    stop("optimcontrol$laplace_soft_directions applies to intoverpop='laplace', ",
+      "and to sampling with intoverpop=FALSE, which places its sampler on the ",
+      "Laplace fit; with intoverpop='", intoverpop, "' there is no Laplace term ",
+      "to score them in. Drop it.", call. = FALSE)
+  }
+  dat <- data.frame(datalong)
+  dat <- dat[order(dat[[model$subjectIDname]], dat[[model$timeName]]), , drop = FALSE]
+  .ctJuliaValidateTIConstancy(dat, model)
+  subject_starts <- .ctJuliaSubjectStarts(dat[[model$subjectIDname]])
+  tdpred_data <- if (is.null(prepared_data)) {
+    if (model$n.TDpred) as.matrix(dat[, model$TDpredNames, drop = FALSE]) else matrix(numeric(), nrow(dat), 0L)
+  } else prepared_data$tdpreds
+  # From the data rather than `prepared_data`, whose missing cells are stan's
+  # business (`.ctPrepareData()`); handled below.
+  tipred_data <- .ctJuliaTIDataAllowMissing(dat, model)
+  if (is.null(tdpred_data)) tdpred_data <- matrix(numeric(), nrow(dat), 0L)
+  if (is.null(tipred_data)) tipred_data <- matrix(numeric(), nrow = length(unique(dat[[model$subjectIDname]])), ncol = 0L)
+  tipred_data <- as.matrix(tipred_data)
+  if (!ncol(tipred_data)) tipred_data <- matrix(numeric(), nrow = length(subject_starts), ncol = 0L)
+  if (nrow(tdpred_data) != nrow(dat)) stop("Prepared TD predictor rows do not match the fitted data.", call. = FALSE)
+  if (nrow(tipred_data) != length(subject_starts)) stop("Prepared TI predictor rows do not match the fitted subjects.", call. = FALSE)
+  # A missing TI predictor value gets a normal distribution from a regression
+  # on what is observed (`.ctJuliaTIMissingSpec()`, SPEC-tipred-sampling.md),
+  # and is then held at its mean ('impute', `ti_imputed`) or made a parameter
+  # with that distribution as its prior ('sample', `ti_missing`; the raw index
+  # is assigned below, once the rest of the vector is laid out).
+  ti_missing <- ti_imputed <- NULL
+  missing_mask <- is.na(tipred_data)
+  if (any(missing_mask)) {
+    if (!tipredMissing %in% c("impute", "sample")) {
+      stop("tipredMissing must be 'impute' or 'sample' here.", call. = FALSE)
+    }
+    cells <- .ctJuliaTIMissingSpec(dat, model, tipred_data,
+      includeOutcome = tipredMissingIncludeOutcome)
+    if (identical(tipredMissing, "sample")) {
+      ti_missing <- cells
+      tipred_data[missing_mask] <- .ctJuliaTIMissingPlaceholder
+    } else {
+      ti_imputed <- cells
+      tipred_data[cbind(cells$subject, cells$predictor)] <- cells$mu
+    }
+  }
+  max_timestep <- if (!is.null(prepared_data$maxtimestep)) {
+    as.numeric(prepared_data$maxtimestep)[1L]
+  } else if (!is.null(model$nlcontrol$maxtimestep)) {
+    as.numeric(model$nlcontrol$maxtimestep)[1L]
+  } else 999999
+  if (!is.finite(max_timestep) || max_timestep <= 0) stop("Julia maxtimestep must be a positive finite number.", call. = FALSE)
+  # The automatic substep policy, when asked for. The mesh itself is decided
+  # later by `.ctJuliaAutoSubsteps` at the starting values and replaces
+  # `max_timestep` on the spec, so every objective built from the spec -- the
+  # fit, prediction, the state-explicit target -- integrates the same way.
+  # `floor` is the maxtimestep rule the mesh never goes below.
+  substeps <- if (identical(model$nlcontrol$nsubsteps, "auto")) list(
+    tol = as.numeric(.ctJuliaOr(model$nlcontrol$substeptol, 0.01))[1L],
+    max = as.integer(.ctJuliaOr(model$nlcontrol$maxsubsteps, 64L))[1L],
+    floor = max_timestep) else NULL
+  # The state-explicit path's step between substeps; see `_ctsem_transition`.
+  transition <- as.character(.ctJuliaOr(model$nlcontrol$transition, "exponential"))[1L]
+  laplace <- NULL
+  if (intoverpop %in% c("laplace", "none")) {
+    # No state augmentation at all: the model the engine filters is the plain
+    # per-subject one, and the random effects are described alongside it.
+    parameter_table <- .ctJuliaParameterTable(model)
+    laplace <- .ctJuliaLaplaceSpec(model, parameter_table, prepared_data, dat)
+    # SAEM samples every effect of a full-rank level to step its covariance,
+    # so a fit that runs it keeps a block's effects in the layer.
+    if (isTRUE(laplace$hybrid$block) && isTRUE(laplacecontrol$saem)) laplace$hybrid <- NULL
+    # On the specification rather than passed at optimise time, because the
+    # inner tolerance changes the *value* the objective returns: two fits
+    # differing only in it are not the same function, and `.ctJuliaObjectiveKey`
+    # hashes what the objective is built from, so putting them here is what
+    # stops the second one being handed the first one's cached objective.
+    # Absent unless a caller asked, so every existing model hashes exactly as
+    # it did.
+    inner <- .ctJuliaLaplaceInner(laplacecontrol)
+    if (length(inner)) laplace$inner <- inner
+    if (!laplace$nrandom) {
+      stop("intoverpop='", intoverpop, "' was requested but no parameters are marked ",
+        "indvarying, so there is nothing to integrate over. Mark parameters as ",
+        "varying in the model, or leave intoverpop at its default.", call. = FALSE)
+    }
+    augmented <- list(nlatent = model$n.latent, nlatent_augmented = model$n.latent,
+      dynamic_state_indices = .ctJuliaDerrind(parameter_table, model$n.latent, model$n.latent),
+      random_effects = data.frame(),
+      rewritten_cells = .ctJuliaRewrittenCells(parameter_table))
+    ti_effects <- .ctJuliaTIEffects(parameter_table, model, offset = laplace$npar)
+  } else {
+    augmented <- .ctJuliaAugmentRandomEffects(model)
+    parameter_table <- augmented$parameter_table
+    ti_effects <- .ctJuliaTIEffects(parameter_table, model)
+  }
+  ti_fixed <- .ctJuliaTIFixed(parameter_table, model)
+  if (isTRUE(as.logical(model$stationary))) {
+    .ctJuliaStationaryCheck(parameter_table, augmented$nlatent)
+  } else if (!is.null(model$t0stationary)) {
+    .ctJuliaStationaryCheck(parameter_table, augmented$nlatent,
+      which(model$t0stationary$closure))
+  }
+  # `laplace$npar` already counts every level's scales and correlations. Taking
+  # the maximum over the *level-one* index vectors instead sized the raw vector
+  # to the subject level alone, so an outer level's scale sat past the end of
+  # it: every evaluation threw a bounds error, was swallowed by the optimizer's
+  # invalid-point guard, and the level stayed pinned at its starting value while
+  # reporting a plausible-looking number.
+  # `laplace$npar` counts the model parameters and every level's scales and
+  # correlations; the TI-predictor coefficients sit after all of that, so the
+  # raw vector is as long as whichever reaches furthest. Taking `laplace$npar`
+  # alone left the coefficients past the end of it -- the same failure the
+  # level scales had, one block further along.
+  # The leading zero is the count of a model with nothing free. Every index
+  # vector here is NA-filled for a fixed cell, so a fully fixed model -- what
+  # `ctGenerate` prepares, having resolved every free parameter to a value --
+  # leaves `max` nothing to take a maximum over: it warns and returns -Inf.
+  # The pieces are still loose here -- this is where the spec is assembled --
+  # so they are handed over as one rather than the count being written out a
+  # sixth time.
+  # Sampled TI-predictor values get the last block of the raw vector, one
+  # new index per missing cell, past everything above -- the same "reserve N
+  # indices past the current end" move `.ctJuliaTIEffects()`'s `offset` makes
+  # for TI-effect coefficients, and for the same reason: nothing here is a
+  # matrix cell, so nothing places it automatically.
+  if (!is.null(ti_missing) && nrow(ti_missing)) {
+    offset <- .ctBackendNpar(list(parameter_table = parameter_table,
+      laplace = laplace, ti_effects = ti_effects))
+    ti_missing$parameter <- offset + seq_len(nrow(ti_missing))
+  }
+  npar <- .ctBackendNpar(list(parameter_table = parameter_table,
+    laplace = laplace, ti_effects = ti_effects, ti_missing = ti_missing))
+  .ctJuliaCheckLayout(parameter_table, laplace, ti_effects, npar, ti_missing = ti_missing)
+  # `priors` is TRUE/FALSE for every coordinate; `priorscope` narrows it. The
+  # two are separate because everything downstream of here, and the stan path
+  # beside it, reads `priors` as a logical.
+  prior_spec <- if (identical(priorscope, "randomCorr")) {
+    .ctBackendRandomCorrPriorSpec(prepared_data, laplace, npar)
+  } else if (!isTRUE(priors)) NULL else if (!is.null(laplace)) {
+    .ctBackendLaplacePriorSpec(prepared_data, laplace, npar)
+  } else .ctBackendPriorSpec(prepared_data, npar,
+    nextra = if (is.null(ti_missing)) 0L else nrow(ti_missing))
+  # Stated population means (R/ctFixedPopMeans.R): each one's raw position
+  # moved past the free parameters, and every index renumbered to match.
+  anchors <- NULL
+  means <- .ctFixedPopMeans(model)
+  if (!is.null(means)) {
+    moved <- .ctJuliaAnchorLayout(means, npar, parameter_table, laplace,
+      ti_effects, ti_fixed, ti_missing, augmented$random_effects, prior_spec)
+    parameter_table <- moved$parameter_table
+    laplace <- moved$laplace
+    ti_effects <- moved$ti_effects
+    ti_fixed <- moved$ti_fixed
+    ti_missing <- moved$ti_missing
+    augmented$random_effects <- moved$random_effects
+    prior_spec <- moved$priors
+    anchors <- moved$anchors
+  }
+  spec <- list(
+    class = "ctJuliaModel",
+    intoverpop = intoverpop,
+    laplace = laplace,
+    model = model,
+    data = dat,
+    parameter_table = parameter_table,
+    subject_starts = as.integer(subject_starts),
+    times = as.numeric(dat[[model$timeName]]),
+    # Doubles with NaN for missing, never a union type.
+    #
+    # `as.matrix` on a data frame of integers with NAs marshals to
+    # `Matrix{Union{Missing,Int64}}`, and on doubles with NAs to
+    # `Matrix{Union{Missing,Float64}}` -- a *different element type per
+    # dataset*, and none of them the `Matrix{Float64}` the precompile workload
+    # built. The filter is specialised on that type, so every real fit
+    # recompiled it however well the model shape matched: in a pure Julia
+    # session the captured shape's first evaluate took 0.017 s, through R it
+    # took twelve seconds.
+    #
+    # `_ctsem_observed` is `!ismissing(x) && isfinite(x)`, so NaN already means
+    # missing to the engine and nothing is lost by saying it that way. A union
+    # element type is also boxed on every access in the hot loop.
+    #
+    # This takes the first evaluation from 12.8 s to 3.5 s. It does not close the
+    # gap: the same shape in a pure Julia session is 0.017 s, so about 3.5 s of
+    # shape compilation survives. That remainder has a separate cause -- the
+    # captured shapes hold unsimplified transform strings (`0 + 10 * (param[1] *
+    # 1 + 0)`) where the fit path sends simplified ones (`10 * param[1]`), so the
+    # cached closure types differ from the ones in the image and the pipeline
+    # specialises again. The fix belongs in tools/generate-precompile-shapes.R.
+    manifest_data = {
+      d <- t(as.matrix(dat[, model$manifestNames, drop = FALSE]))
+      storage.mode(d) <- "double"
+      d[is.na(d)] <- NaN
+      d
+    },
+    tdpred_data = t(tdpred_data),
+    tipred_data = as.matrix(tipred_data),
+    ti_effects = ti_effects,
+    # Smooth terms' penalties, one row per (term, target), with each
+    # smoothing parameter (R/ctTIpredSmooth.R); NULL without smooths.
+    penalty = .ctTIsmoothPenalty(model, ti_effects, parameter_table),
+    # TI effects fixed to a value (`.ctJuliaTIFixed()`); NULL when there are
+    # none, so every other specification is as it was.
+    ti_fixed = if (nrow(ti_fixed)) ti_fixed else NULL,
+    # One row per sampled (missing) TI-predictor cell: `subject`, `predictor`
+    # (both 1-based, matching `tipred_data`'s rows/columns), the raw-parameter
+    # `parameter` that samples it, and its pre-computed conditional `mu`/
+    # `sigma`. `NULL` for every model with nothing missing.
+    ti_missing = ti_missing,
+    # The same frame without `parameter`, for cells held at their imputed
+    # `mu`; NULL when none. `.ctJuliaTIMissingSampled()` turns them into
+    # `ti_missing` rows.
+    ti_imputed = ti_imputed,
+    priors = prior_spec,
+    max_timestep = max_timestep,
+    substeps = substeps,
+    transition = transition,
+    # A discrete-time model is the same filter with a different discretization:
+    # DRIFT, CINT and DIFFUSION are already the one-step quantities, so the
+    # exponential, the Lyapunov solve and the intercept solve all collapse.
+    continuoustime = isTRUE(model$continuoustime),
+    # Whether the latent processes start from their stationary distribution
+    # rather than T0MEANS and T0VAR. On the spec, like `continuoustime`, so a
+    # fit rebuilt from a saved object filters the way it was estimated; NULL on
+    # a model saved before the option worked, which is FALSE.
+    stationary = isTRUE(as.logical(model$stationary)),
+    # Single initial conditions at their stationary values: per latent, its
+    # T0MEANS mark, its T0VAR block and whether its moments are needed
+    # (`.ctStationaryElements`). NULL when the model names none.
+    t0stationary = model$t0stationary,
+    # Which covariance construction to use, as the integer code both backends
+    # share -- 0 for the unconstrained correlation square root, 2 for
+    # covmattransform='z'. Carried on the spec so a fit rebuilt from a saved
+    # object constructs its covariances the way it was estimated.
+    covmatcode = .ctCovMatCode(model),
+    TDpredNames = model$TDpredNames,
+    TIpredNames = model$TIpredNames,
+    # 0 Gaussian, 1 binary, 2 ordinal, with the category count alongside for
+    # the ordinal ones. Carried on the spec so a fit rebuilt from a saved
+    # object knows its own measurement model.
+    manifesttype = if (is.null(model$manifesttype)) integer(0) else
+      as.integer(model$manifesttype),
+    ncategories = if (is.null(model$ncategories)) integer(0) else
+      as.integer(model$ncategories),
+    # Per manifest variable, the ASYMPTOTES row it reads, 0 for none; see
+    # `.ctAsymptoteRows()`.
+    asymptoterow = .ctAsymptoteRows(model$pars, model$manifesttype),
+    censormin = if (is.null(model$censormin)) numeric(0) else
+      as.numeric(model$censormin),
+    censormax = if (is.null(model$censormax)) numeric(0) else
+      as.numeric(model$censormax),
+    nlatent = augmented$nlatent,
+    nlatent_augmented = augmented$nlatent_augmented,
+    dynamic_state_indices = augmented$dynamic_state_indices,
+    random_effects = augmented$random_effects,
+    rewritten_cells = augmented$rewritten_cells,
+    project = project,
+    engine = .ctJuliaEngineVersion()
+  )
+  # Added only when there are any, so every other specification is as it was.
+  if (!is.null(anchors)) spec$anchors <- anchors
+  spec
+}
+
+# Say so, once, when a model shape is about to be compiled for.
+#
+# `ctsem_transforms_cached()` reports whether every transform expression in this
+# model is either data to the engine (`CTSEMExpr`, so the model shares the
+# compiled filter) or already has a closure. If so the first evaluation is
+# immediate; if any needs a new closure -- an expression outside the
+# vocabulary, or every one when the fit asked for `forcerecompile` -- the
+# filter specialises on the first evaluation and takes tens of seconds.
+.ctJuliaAnnounceCompilation <- function(module, table, compile = FALSE) {
+  free <- .ctJuliaNoNA(as.integer(table$parnumber), 0L) > 0L
+  # A free cell with no transform of its own compiles `param[n]`, exactly as
+  # `ekf_from_columns` writes it -- so the query has to say the same thing.
+  regular <- .ctJuliaNoNA(as.character(table$transform), "")[free]
+  numbers <- .ctJuliaNoNA(as.integer(table$parnumber), 0L)[free]
+  regular <- ifelse(nzchar(regular), regular, paste0("param[", numbers, "]"))
+  # A TI predictor a regular transform reads is a parameter-vector position by
+  # the time the engine builds it (`_ctsem_ti_tail_rendering`, past every raw
+  # parameter), and the engine's query refuses `tipreds[j]` as text: asked as
+  # written, every such cell announced a compile that never happened.
+  past <- max(c(0L, numbers))
+  regular <- vapply(regular, function(text) {
+    hits <- regmatches(text, gregexpr(.CT_JULIA_TIPREDREF, text, perl = TRUE))[[1L]]
+    for (hit in unique(hits)) {
+      j <- as.integer(regmatches(hit, regexpr("\\d+", hit)))
+      text <- gsub(hit, paste0("param[", past + j, "]"), text, fixed = TRUE)
+    }
+    text
+  }, character(1), USE.NAMES = FALSE)
+  complex <- c(.ctJuliaNoNA(as.character(table$predicttransform), ""),
+    .ctJuliaNoNA(as.character(table$updatetransform), ""),
+    .ctJuliaNoNA(as.character(table$tdtransform), ""))
+  regular <- unique(regular[nzchar(regular)])
+  complex <- unique(complex[nzchar(complex)])
+  if (!length(regular) && !length(complex)) return(invisible(FALSE))
+  cached <- isTRUE(tryCatch(
+    .ctBackendJuliaValue(module$ctsem_transforms_cached(
+      .ctJuliaVector(if (length(regular)) regular else ""),
+      .ctJuliaVector(if (length(complex)) complex else ""),
+      compile = isTRUE(compile))),
+    error = function(e) FALSE))
+  if (cached) return(invisible(FALSE))
+  # No duration promised. It ranges from a few seconds when the precompiled
+  # image covers the shape to a couple of minutes when it does not, and a
+  # message that says "20-60 seconds" is wrong at both ends -- alarming for the
+  # quick case and misleading for the slow one.
+  message("Compiling the julia engine for this model shape (once per shape ",
+    "per session).")
+  invisible(TRUE)
+}
+
+# How many raw parameters a model has.
+#
+# The parameter table alone undercounts, and that has already caused a bug: the
+# random-effect population scales sit above it in the raw vector and the
+# TI-predictor coefficients above those, so `max(parnumber)` gives a number that
+# looks plausible and is short by however many random effects the model has. The
+# engine then refuses the vector with "level 1 references population scale 17
+# but the parameter vector holds 13".
+#
+# Written out in five places before this, in three variants: some guarded a
+# fully fixed model with a leading `0L` (without which `max` warns and returns
+# -Inf), some omitted it and tested `is.finite` afterwards instead, and only one
+# unwrapped `model_spec` for callers holding a fit rather than a spec. Variants
+# that differ are worse than plain duplication, because the difference is
+# invisible at each site.
+#
+# Accepts a spec, a prepared model, or a fit.
+.ctBackendNpar <- function(x) {
+  spec <- if (!is.null(x$model_spec)) x$model_spec else x
+  n <- suppressWarnings(max(c(0L, spec$parameter_table$parnumber,
+    spec$laplace$npar, spec$ti_effects$coefficient, spec$ti_missing$parameter),
+    na.rm = TRUE))
+  if (!is.finite(n)) return(0L)
+  # Stated population means sit past the free parameters, which are what the
+  # raw vector holds (R/ctFixedPopMeans.R).
+  as.integer(n) - length(spec$anchors$index)
+}
+
+# Is this model's population covariance a factor rather than a scale-and-
+# correlation block?
+#
+# True exactly when a reduced rank is in force. `model$popregression` is
+# attached by `.ctPopRegressionRewrite()` only when there are effects to
+# regress, so `poprank='auto'` on a model whose every effect reaches the
+# observation mean leaves it NULL and nothing here changes -- the default path
+# is only affected where it actually restricts the rank.
+#
+# The reduced-rank set is a non-convex variety, and on it the
+# sd-plus-`constraincorsqrt1` coordinates carry genuine spurious optima: 0 of
+# 40 starts at the best value against 40 of 40 for the factor form, measured at
+# k=12 r=3. At full rank the same substitution is nearly neutral, which is why
+# this is asked of the population block and not of every covariance.
+.ctPopFactorConstruction <- function(model) {
+  !is.null(model[["popregression"]])
+}
+
+# The integer code for a model's covariance construction, shared with the stan
+# path's `standata$choleskymats` (R/ctData.R) so one model means one
+# construction on either backend.
+#
+# A lookup naming every value, and an error on anything else -- not a default
+# with one exception, which is what this was. That form was correct only while
+# every other value was refused upstream, and the moment one of them was
+# allowed through it would have resolved to 0: accepted, and then quietly the
+# wrong construction. That is the same shape as the defect this function's own
+# comment used to describe, so it is refused structurally here rather than
+# remembered.
+#
+# An unknown name arriving means the validation in `.ctJuliaUnsupported` has
+# drifted from this table. Erroring says so; returning 0 would fit a different
+# model and report nothing.
+.ctCovMatCode <- function(model) {
+  codes <- c(rawcorr_indep = -1L, rawcorr = 0L, cholesky = 1L, z = 2L)
+  tf <- if (is.null(model$covmattransform)) "rawcorr" else
+    as.character(model$covmattransform)[1L]
+  if (!tf %in% names(codes)) {
+    stop("Unknown covmattransform '", tf, "'. Expected one of ",
+      paste(names(codes), collapse = ", "), ".", call. = FALSE)
+  }
+  codes[[tf]]
+}
+
+# How an input crosses the bridge, marked on the input so that
+# `.ctJuliaObjectiveInputs` stays pure R and can be hashed without a Julia
+# session. A vector goes through `.ctJuliaVector`, so a length-one one stays a
+# vector; a matrix through `juliaPut`; anything unmarked crosses as it is, which
+# is right for the scalar keywords.
+.ctJuliaAsVector <- function(x) structure(list(x), class = "ctJuliaVectorInput")
+.ctJuliaAsPut <- function(x) structure(list(x), class = "ctJuliaPutInput")
+.ctJuliaMarshal <- function(x) {
+  if (inherits(x, "ctJuliaVectorInput")) return(.ctJuliaVector(x[[1L]]))
+  if (inherits(x, "ctJuliaPutInput")) return(.ctJuliaPut(x[[1L]]))
+  x
+}
+
+# Everything the objective is built from, as R values: the arguments of
+# `ekf_from_columns`, of `ctsem_objective`, and of `ctsem_laplace_objective`
+# without the objective it wraps (NULL when there is no Laplace layer).
+#
+# The objective reads the spec here and nowhere else, and
+# `.ctJuliaObjectiveKey` hashes the result, so the two cannot disagree about
+# what makes one objective different from another. Keep it that way: a spec
+# field that shapes the objective but reaches Julia other than through this
+# list is a field the cache cannot see.
+.ctJuliaObjectiveInputs <- function(spec) {
+  V <- .ctJuliaAsVector
+  # Plain column vectors, not a DataFrame. The engine dropped DataFrames as a
+  # dependency (it was its most expensive one and was used only as a row
+  # container here), so absent entries arrive as sentinels -- 0 for parnumber,
+  # NaN for value, "" for a transform -- rather than as NA/missing. This also
+  # removes two RPC round trips per objective build.
+  table <- as.data.frame(spec$parameter_table, stringsAsFactors = FALSE)
+  effects <- spec$ti_effects
+  if (is.null(effects) || !nrow(effects)) {
+    effects <- data.frame(parameter = integer(), predictor = integer(), coefficient = integer())
+  }
+  # The optional columns are Julia keyword arguments and are passed only when
+  # they have entries: JuliaConnectoR hangs marshalling an empty vector, so a
+  # model with no TI predictors must not send one at all.
+  arguments <- list(
+    V(as.character(table$matrix)),
+    V(as.integer(table$row)),
+    V(as.integer(table$col)),
+    V(.ctJuliaNoNA(as.integer(table$parnumber), 0L)),
+    V(.ctJuliaNoNA(as.numeric(table$value), NaN)),
+    V(.ctJuliaNoNA(as.character(table$transform), "")),
+    V(.ctJuliaNoNA(as.character(table$predicttransform), "")),
+    V(.ctJuliaNoNA(as.character(table$updatetransform), "")),
+    V(.ctJuliaNoNA(as.character(table$tdtransform), "")))
+  # A fixed effect is an entry like any other with no coefficient (0), its
+  # value beside it.
+  fixed <- spec$ti_fixed
+  if (!is.null(fixed) && nrow(fixed)) {
+    effects <- data.frame(
+      parameter = c(as.integer(effects$parameter), as.integer(fixed$parameter)),
+      predictor = c(as.integer(effects$predictor), as.integer(fixed$predictor)),
+      coefficient = c(as.integer(effects$coefficient), integer(nrow(fixed))),
+      value = c(numeric(nrow(effects)), as.numeric(fixed$value)))
+  }
+  # A T0MEANS or T0VAR cell reading a TI predictor reads it from the tail of
+  # the subject's parameter vector, after every raw parameter.
+  if (any(grepl(.CT_JULIA_TIPREDREF, .ctJuliaNoNA(as.character(table$transform), ""),
+      perl = TRUE))) {
+    arguments$ti_tail_offset <- .ctBackendNpar(spec) + length(spec$anchors$index)
+    # From the prepared predictors, which every specification carries: a
+    # fitted one has no `standata`, and reading the count from there sent NA
+    # and stopped every fit of such a model before its first evaluation.
+    arguments$n_tipreds <- as.integer(NCOL(spec$tipred_data))
+  }
+  if (nrow(effects)) {
+    arguments$ti_parameter <- V(as.integer(effects$parameter))
+    arguments$ti_predictor <- V(as.integer(effects$predictor))
+    arguments$ti_coefficient <- V(as.integer(effects$coefficient))
+    if (!is.null(effects$value)) arguments$ti_fixed_value <- V(as.numeric(effects$value))
+  }
+  if (length(spec$dynamic_state_indices)) {
+    arguments$diffusion_state_indices <-
+      V(as.integer(spec$dynamic_state_indices))
+  }
+  # Stated population means (R/ctFixedPopMeans.R), which follow the free
+  # parameters in each subject's vector; sent only when there are any.
+  if (length(spec$anchors$index)) {
+    arguments$nfree <- .ctBackendNpar(spec)
+    arguments$anchor_values <- V(as.numeric(spec$anchors$raw))
+  }
+  arguments$continuous_time <- isTRUE(spec$continuoustime)
+  # Sent only when set, so every other model hashes and builds exactly as it
+  # did.
+  if (isTRUE(spec$stationary)) arguments$stationary <- TRUE
+  if (!is.null(spec$t0stationary)) {
+    arguments$stationary_mean <- V(as.integer(spec$t0stationary$means))
+    arguments$stationary_block <- V(as.integer(spec$t0stationary$block))
+    arguments$stationary_closure <- V(as.integer(spec$t0stationary$closure))
+  }
+  # Transforms compiled per model rather than evaluated as data
+  # (`ctFit(forcerecompile = TRUE)`). Here, so a compiled and an interpreted
+  # objective of one model are different cache entries.
+  if (isTRUE(spec$compiletransforms)) arguments$compile_transforms <- TRUE
+  # How many leading states are genuine dynamics rather than the static
+  # coordinates the random-effect augmentation appended. The engine runs the
+  # continuous form's intercept solve over that block, because JAx is exactly
+  # singular on a static coordinate.
+  #
+  # This is deliberately NOT `dynamic_state_indices` above, which is stan's
+  # `derrind` -- the states with their own diffusion. `derrind` additionally
+  # drops a latent that merely has no diffusion of its own and no coupling to
+  # one that has some, and the affine offset is *not* zero on such a row: using
+  # it there took that state's CINT out of the likelihood altogether, with a
+  # gradient of exactly zero, so the optimiser left the parameter at its
+  # starting value and the summary reported that as an estimate. Stan uses
+  # `1:nlatent` for this and `derrind` for the Lyapunov solve; so does the
+  # engine now.
+  #
+  # Always stated, never left to the engine default. The engine falls back to
+  # the diffusion block for a caller that says nothing, which is right for its
+  # own direct constructions and wrong here: a model whose latent has no
+  # diffusion of its own has a diffusion block one short of the dynamics, and
+  # that is the whole defect this argument exists to fix.
+  affine_dim <- suppressWarnings(as.integer(spec$nlatent)[1L])
+  if (!is.na(affine_dim) && affine_dim > 0L) arguments$affine_dim <- affine_dim
+  # Omitted when zero: the engine defaults to it, and this keeps a spec built
+  # before the setting existed working unchanged.
+  covmatcode <- if (is.null(spec$covmatcode)) 0L else as.integer(spec$covmatcode)
+  if (covmatcode != 0L) arguments$covmatcode <- covmatcode
+  # Which state each population row describes. Sent only when the table
+  # actually carries a RAWPOPVAR matrix, so a spec built before it existed
+  # still reaches an engine that treats an absent block as "T0VAR is the whole
+  # initial covariance". The order is the order the scales were emitted in.
+  # The population block's own construction, when it differs from the model's.
+  # Sent only when it does, so a spec built for an engine that predates the
+  # keyword still works and every ordinary model is byte-for-byte as it was.
+  if (!is.null(spec$model) && .ctPopFactorConstruction(spec$model) &&
+      any(table$matrix %in% "RAWPOPVAR")) {
+    arguments$population_covmatcode <- 1L
+  }
+  # The state-unit conversion, one factor per population row, applied by the
+  # engine where it places the block. Sent only when some row needs one, so an
+  # ordinary model is byte-for-byte as it was and a spec built for an engine
+  # that predates the keyword still works.
+  if (any(table$matrix %in% "RAWPOPVAR")) {
+    popeffects <- spec$random_effects
+    popscale <- if (is.null(popeffects) || !length(popeffects) ||
+        !nrow(popeffects)) numeric() else
+      as.numeric(popeffects$scale[popeffects$type %in% "sd"])
+    if (length(popscale) && any(popscale != 1)) {
+      arguments$population_scale <- V(popscale)
+    }
+  }
+  if (any(table$matrix %in% "RAWPOPVAR")) {
+    popeffects <- spec$random_effects
+    popindices <- if (is.null(popeffects) || !length(popeffects) ||
+        !nrow(popeffects)) integer() else
+      as.integer(popeffects$row[popeffects$type %in% "sd"])
+    if (length(popindices)) {
+      arguments$population_indices <- V(popindices)
+    }
+  }
+  # Only when something is actually binary: an empty vector lets the engine
+  # skip the branch, and a zero-length vector deadlocks the bridge, so the two
+  # reasons to omit it agree.
+  if (any(spec$manifesttype > 0)) {
+    arguments$manifesttype <- V(as.integer(spec$manifesttype))
+  }
+  if (any(spec$manifesttype %in% 2)) {
+    arguments$ncategories <- V(as.integer(spec$ncategories))
+  }
+  if (any(spec$asymptoterow > 0)) {
+    arguments$asymptoterow <- V(as.integer(spec$asymptoterow))
+  }
+  if (any(spec$manifesttype %in% 4)) {
+    arguments$censormin <- V(as.numeric(spec$censormin))
+    arguments$censormax <- V(as.numeric(spec$censormax))
+  }
+  # .ctJuliaVector, not juliaPut, for the vectors: JuliaConnectoR marshals a
+  # length-one R vector as a *scalar*, so a single-subject model would hand the
+  # objective constructor an Int where it wants an AbstractVector. That never
+  # showed up while every caller was a whole fitted dataset; ctPredict() on one
+  # subject is a caller where it does.
+  objective_args <- list(V(spec$subject_starts),
+    V(spec$times), .ctJuliaAsPut(spec$manifest_data),
+    .ctJuliaAsPut(spec$tdpred_data), .ctJuliaAsPut(spec$tipred_data),
+    .ctJuliaSubstepInput(spec$max_timestep))
+  if (!is.null(spec$priors) && length(spec$priors$index)) {
+    objective_args$prior_index <- V(spec$priors$index)
+    objective_args$prior_scale <- V(spec$priors$scale)
+    objective_args$prior_weight <- spec$priors$weight
+  }
+  # Sampling weights (R/ctWeights.R); omitted, not sent empty, without them.
+  if (length(spec$subject_weights)) {
+    objective_args$subject_weights <- V(as.numeric(spec$subject_weights))
+  }
+  # Smoothing penalties (R/ctTIpredSmooth.R), omitted without smooths. Their
+  # precisions change as the fit estimates them, and are part of the cache key
+  # with everything else here.
+  if (!is.null(spec$penalty) && nrow(spec$penalty)) {
+    penalty <- .ctTIsmoothPenaltyVectors(spec$penalty)
+    objective_args$penalty_index <- V(penalty$index)
+    objective_args$penalty_precision <- V(penalty$precision)
+  }
+  # The natural-scale prior (R/ctNaturalPrior.R), which only the objective an
+  # uncertainty method integrates over carries; omitted otherwise.
+  if (!is.null(spec$naturalprior) && nrow(spec$naturalprior)) {
+    objective_args$jacobian_index <- V(as.integer(spec$naturalprior$index))
+    objective_args$jacobian_value <- V(as.character(spec$naturalprior$value))
+    objective_args$jacobian_slope <- V(as.character(spec$naturalprior$slope))
+  }
+  # The bounded population correlation blocks (R/ctCorBound.R), omitted when
+  # there are none.
+  bounds <- .ctCorBoundSpec(spec, table)
+  if (length(bounds)) {
+    objective_args$corbound_k <- V(vapply(bounds, function(b) b$k, integer(1)))
+    objective_args$corbound_code <- V(vapply(bounds, function(b) b$code, integer(1)))
+    objective_args$corbound_index <- V(unlist(lapply(bounds, function(b) b$index)))
+    objective_args$corbound_fixed <- V(unlist(lapply(bounds, function(b) {
+      x <- b$fixed; x[!is.finite(x)] <- 0; x })))
+  }
+  # Sampled TI-predictor values, one entry per missing cell -- omitted
+  # entirely (not sent as empty vectors) for every model with none, which is
+  # what keeps that the zero-cost path on the Julia side too.
+  if (!is.null(spec$ti_missing) && nrow(spec$ti_missing)) {
+    objective_args$ti_missing_subject <- V(as.integer(spec$ti_missing$subject))
+    objective_args$ti_missing_predictor <- V(as.integer(spec$ti_missing$predictor))
+    objective_args$ti_missing_parameter <- V(as.integer(spec$ti_missing$parameter))
+    objective_args$ti_missing_mu <- V(as.numeric(spec$ti_missing$mu))
+    objective_args$ti_missing_sigma <- V(as.numeric(spec$ti_missing$sigma))
+  }
+  # Each row's count of steps for an iterated measurement update, frozen for
+  # the fit (`.ctJuliaRelinPlan()`); without one every row iterates to its mode.
+  if (length(spec$relinsteps)) objective_args$relin_steps <- V(as.integer(spec$relinsteps))
+  # The Laplace route wraps the ordinary objective rather than replacing it:
+  # the process likelihood, the parameter layer and the TI-predictor effects
+  # are all still the same code, evaluated per subject at a shifted parameter
+  # vector. Only zero-length index vectors are withheld, because JuliaConnectoR
+  # deadlocks marshalling one -- `cor_index` is empty whenever a model has a
+  # single random effect.
+  laplace_args <- NULL
+  if (!is.null(spec$laplace)) {
+    levels <- spec$laplace$levels
+    grab <- function(field) unlist(lapply(levels, function(x) x[[field]]), use.names = FALSE)
+    laplace_args <- list(
+      re_index = V(as.integer(grab("re_index"))),
+      sd_scale = V(as.numeric(grab("sd_scale"))))
+    # Guarded like `cor_index`, and for the same reason: a model whose every
+    # level is reduced has no population scales at all, and a zero-length
+    # vector deadlocks the bridge rather than arriving empty.
+    if (length(grab("sd_index"))) {
+      laplace_args$sd_index <- V(as.integer(grab("sd_index")))
+    }
+    if (length(grab("cor_index"))) {
+      laplace_args$cor_index <- V(as.integer(grab("cor_index")))
+    }
+    # Stated scales and correlations, sent only when there are any, so a model
+    # that states none crosses exactly as before. NaN marks a free entry.
+    fixedvalues <- function(field) {
+      x <- as.numeric(grab(field))
+      x[!is.finite(x)] <- NaN
+      x
+    }
+    if (any(is.finite(grab("sd_fixed")))) {
+      laplace_args$sd_fixed <- V(fixedvalues("sd_fixed"))
+    }
+    if (any(is.finite(grab("cor_fixed")))) {
+      laplace_args$cor_fixed <- V(fixedvalues("cor_fixed"))
+    }
+    # Sent only when some level is actually reduced, so a model that asked for
+    # nothing crosses exactly as it did before this existed.
+    ranks <- as.integer(vapply(levels, function(x)
+      if (is.null(x$rank)) x$nrandom else x$rank, integer(1)))
+    patterned <- any(vapply(levels, function(x) length(x$load_row) > 0L, logical(1)))
+    if (patterned ||
+        any(ranks < as.integer(vapply(levels, function(x) x$nrandom, integer(1))))) {
+      laplace_args$level_rank <- V(ranks)
+      # Absent rather than empty when every reduced level has rank 0 (own
+      # variances only): a zero-length vector deadlocks the bridge.
+      if (length(grab("load_index"))) {
+        laplace_args$load_index <- V(as.integer(grab("load_index")))
+      }
+    }
+    # Loading patterns (`popblocks`), sent only when some level has blocks, and
+    # then for every level, the triangle written out where a level has none.
+    if (patterned) {
+      entries <- lapply(levels, function(x) if (length(x$load_index))
+        .ctJuliaLoadingEntries(x) else list(row = integer(), col = integer()))
+      laplace_args$level_nload <- V(as.integer(vapply(levels, function(x)
+        length(x$load_index), integer(1))))
+      laplace_args$load_row <- V(as.integer(unlist(lapply(entries, `[[`, "row"))))
+      laplace_args$load_col <- V(as.integer(unlist(lapply(entries, `[[`, "col"))))
+    }
+    # One entry per random effect, 0 for none, sent only when some level has
+    # an own variance (`popunique`), so every other model crosses as before.
+    owns <- lapply(levels, function(x) {
+      u <- as.integer(x$unique_index)
+      if (length(u)) u else integer(as.integer(x$nrandom))
+    })
+    if (any(unlist(owns) > 0L)) {
+      laplace_args$unique_index <- V(as.integer(unlist(owns)))
+    }
+    # Effects that cannot reach a group's data (`.ctJuliaLaplaceInert`), sent
+    # only when there are some, so every other model crosses as before.
+    inert <- spec$laplace$inert
+    if (!is.null(inert) && nrow(inert)) {
+      laplace_args$inert_level <- V(as.integer(inert[, "level"]))
+      laplace_args$inert_group <- V(as.integer(inert[, "group"]))
+      laplace_args$inert_effect <- V(as.integer(inert[, "effect"]))
+    }
+    # Own variances the subject filter integrates (`.ctJuliaLaplaceHybrid`),
+    # sent only when there are some.
+    hybrid <- spec$laplace$hybrid
+    if (!is.null(hybrid) && length(hybrid$effect)) {
+      laplace_args$hybrid_effect <- V(as.integer(hybrid$effect))
+      laplace_args$hybrid_kind <- V(as.integer(hybrid$kind))
+      laplace_args$hybrid_target <- V(as.integer(hybrid$target))
+      laplace_args$hybrid_slope <- V(as.numeric(hybrid$slope))
+      if (any(hybrid$kind == 4L)) laplace_args$hybrid_pred <- V(as.integer(hybrid$pred))
+    }
+    # Sent only when every unit's inner problem is a concave quadratic
+    # (`.ctJuliaLaplaceQuadratic`), so every other model crosses as before.
+    if (isTRUE(spec$laplace$quadratic)) laplace_args$quadratic <- TRUE
+    # Which effects are mean effects where some are and some not
+    # (`.ctJuliaLaplaceAffine`), as (level, effect) pairs.
+    affine <- spec$laplace$affine
+    if (!is.null(affine)) {
+      on <- unlist(affine)
+      laplace_args$affine_level <- V(rep(seq_along(affine), lengths(affine))[on])
+      laplace_args$affine_effect <- V(sequence(lengths(affine))[on])
+    }
+    # Modes units' inner solves also start from, kept where a fit's line search
+    # or finish saw their terms jump (`.ctJuliaOptimise()`): column `j` of
+    # `values` a mode of unit `units[j]`. Sent only when there are some.
+    known <- spec$laplace$known
+    if (!is.null(known) && length(known$units)) {
+      laplace_args$known_unit <- V(as.integer(known$units))
+      values <- as.matrix(known$values)
+      storage.mode(values) <- "double"
+      laplace_args$known_values <- values
+    }
+    # Absent unless the fit asked for them, so the engine's own defaults stay
+    # the defaults and a spec built before this existed is byte-for-byte as it
+    # was. `inner_maxiter` must cross as an integer; see .ctJuliaLaplaceInner().
+    if (!is.null(spec$laplace$inner$inner_maxiter)) {
+      laplace_args$inner_maxiter <- as.integer(spec$laplace$inner$inner_maxiter)
+    }
+    if (!is.null(spec$laplace$inner$inner_tol)) {
+      laplace_args$inner_tol <- as.numeric(spec$laplace$inner$inner_tol)
+    }
+    # The soft-direction rule goes on the objective, not the session, so a fit
+    # under the quadrature leaves every other objective -- and every later fit
+    # -- as it was. Always sent, so the cache key (a hash of these inputs) sees
+    # the rule the objective is actually built with: the default and the same
+    # rule named hash alike, and an absent rule -- a specification from before
+    # the quadrature was the default -- is built, and keyed, as the
+    # 'logdet_floor' it was fitted under.
+    laplace_args$soft_directions <- .ctJuliaSoftDirections(spec$laplace$inner)
+    if (length(levels) > 1L) {
+      # Concatenated innermost level first, split on the far side by the
+      # per-level counts. Flat vectors because the bridge marshals those and
+      # not nested structures.
+      laplace_args$level_nre <- V(as.integer(vapply(levels,
+        function(x) x$nrandom, integer(1))))
+      laplace_args$group <- V(as.integer(grab("group")))
+      laplace_args$level_ngroups <- V(as.integer(vapply(levels,
+        function(x) x$ngroups, integer(1))))
+    }
+  }
+  list(ekf = arguments, objective = objective_args, laplace = laplace_args)
+}
+
+# Whether a fit's reports read deviations its subject filter integrates from
+# the objective that integrates them: a Laplace fit's do (subject parameters
+# at the conditional modes, population sds, plug-in trajectories); a sampled
+# fit's effects are draws of every coordinate, so its reports keep the layer.
+.ctBackendHybridReports <- function(spec) {
+  !is.null(spec$laplace$hybrid) && !identical(.ctBackendIntOverPop(spec), "none")
+}
+
+.ctJuliaObjective <- function(object, hybrid = FALSE) {
+  stopifnot(inherits(object, "ctJuliaModel") || inherits(object, "ctJuliaFit"))
+  spec <- if (inherits(object, "ctJuliaFit")) object$model_spec else object
+  # Effects the subject filter integrates (`.ctJuliaLaplaceHybrid`: own
+  # variances, and a full-rank level's affine effects as a block) leave the
+  # Laplace layer with no coordinate for them: no mode, no deviation, no
+  # column of the population root. So only the paths that evaluate the
+  # objective a fit optimises ask for it -- the optimiser, evaluation, the
+  # Hessian and scores, the marginal sampler, the quadrature check and
+  # corrections (which integrate the deviations exactly at every node) -- and
+  # the reports that read them back (`.ctBackendHybridReports`). Every other
+  # reader gets the objective with each such effect a coordinate: for a
+  # linear model the same function, so a path that does not ask is slower,
+  # never wrong.
+  if (!isTRUE(hybrid) && !is.null(spec$laplace$hybrid)) spec$laplace$hybrid <- NULL
+  inputs <- .ctJuliaObjectiveInputs(spec)
+  key <- .ctJuliaObjectiveKey(spec, inputs)
+  cached <- .ctJuliaCached(key)
+  if (!is.null(cached)) return(cached)
+  module <- .ctJuliaModule(spec$project)
+  marshal <- function(args) lapply(args, .ctJuliaMarshal)
+  # A transform expression that needs a closure mints a new type, and the
+  # whole filter specialises again for it -- tens of seconds, once, and
+  # indistinguishable from a hang if nothing says so. The engine is asked first
+  # so the message comes before the wait rather than after it.
+  .ctJuliaAnnounceCompilation(module,
+    as.data.frame(spec$parameter_table, stringsAsFactors = FALSE),
+    compile = isTRUE(spec$compiletransforms))
+  params <- do.call(module$ekf_from_columns, marshal(inputs$ekf))
+  objective <- do.call(module$ctsem_objective,
+    c(list(params), marshal(inputs$objective)))
+  if (!is.null(inputs$laplace)) {
+    objective <- do.call(module$ctsem_laplace_objective,
+      c(list(objective), marshal(inputs$laplace)))
+  }
+  .ctJuliaCacheStore(key, objective)
+}
+
+
+# The state-explicit objective ------------------------------------------------
+#
+# `intoverstates=FALSE`: the target is the joint density of the parameters and
+# the innovations that build the latent states, over `x = [theta; z]`. The
+# engine's optimiser and sampler both take it exactly as they take the marginal
+# one -- they ask for a value and a gradient at a vector, and this answers --
+# so nothing about the fit's control flow changes, only which objective it is
+# handed.
+#
+# Cached beside the marginal objective and keyed on the same spec plus the
+# parameter count, because building it walks the design to count innovations.
+
+.ctJuliaJointObjective <- function(object, npar) {
+  # A fit, a classed model, or the bare spec `.ctJuliaPrepare` returns -- the
+  # fit path holds the last of those and classing it at every call site is how
+  # a caller ends up passing the wrong one.
+  spec <- if (inherits(object, "ctJuliaFit")) object$model_spec else object
+  if (!inherits(spec, "ctJuliaModel")) {
+    if (!is.list(spec) || is.null(spec$parameter_table)) {
+      stop("object must be a ctJuliaModel, a ctJuliaFit, or a prepared spec.",
+        call. = FALSE)
+    }
+    spec <- structure(spec, class = c("ctJuliaModel", "ctFitModel"))
+  }
+  if (!is.null(spec$laplace)) {
+    stop("intoverstates=FALSE cannot be combined with intoverpop='laplace' or ",
+      "'none': the Laplace route wraps the likelihood in a per-subject inner ",
+      "problem over the random effects, and the state path replaces the ",
+      "likelihood itself. Use intoverpop='augmented', which carries random ",
+      "effects as augmented states and so is sampled along with them.",
+      call. = FALSE)
+  }
+  npar <- max(1L, as.integer(npar)[1L])
+  transition <- .ctJuliaOr(spec$transition, "exponential")
+  key <- paste0(.ctJuliaObjectiveKey(spec), "|joint|", npar, "|", transition)
+  cached <- .ctJuliaCached(key)
+  if (!is.null(cached)) return(cached)
+  module <- .ctJuliaModule(spec$project)
+  objective <- module$ctsem_joint_objective(.ctJuliaObjective(spec), npar,
+    transition = transition)
+  .ctJuliaCacheStore(key, objective)
+}
+
+# How many innovations this design needs, which is what the parameter vector is
+# extended by.
+.ctJuliaStateDimension <- function(spec) {
+  handle <- structure(spec, class = c("ctJuliaModel", "ctFitModel"))
+  .ctBackendStateDimension(handle)
+}
+
+# The latent trajectory an estimate implies, as rows by latents -- the thing a
+# state-explicit fit has that a marginal one has to run a smoother for.
+.ctJuliaJointStates <- function(spec, joint, x) {
+  module <- .ctJuliaModule(spec$project)
+  states <- .ctBackendJuliaValue(module$ctsem_joint_states(joint,
+    .ctJuliaNumericVector(as.numeric(x))))
+  nlatent <- length(spec$model$latentNames)
+  out <- t(matrix(as.numeric(states), nrow = nlatent))
+  colnames(out) <- spec$model$latentNames
+  out
+}
+
+#' Evaluate a julia model's likelihood and gradient at given parameters
+#'
+#' Evaluates the objective the julia backend optimises -- the log likelihood,
+#' with the random effects integrated as the model's \code{intoverpop} route
+#' integrates them -- at a vector of raw (unconstrained) parameters, and its
+#' gradient. For checking a fit, profiling by hand, or handing ctsem's
+#' likelihood to an optimiser or sampler of your own.
+#'
+#' @param object A fit from \code{ctFit(..., backend = 'julia')}, or a model
+#'   prepared without fitting by \code{ctFit(..., backend = 'julia', fit =
+#'   FALSE)} (class \code{ctJuliaModel}).
+#' @param pars Raw (unconstrained) parameters, in the order of
+#'   \code{coef(fit)}; defaults to a fit's estimate, and must be given for a
+#'   prepared model.
+#' @param gradient Also return the gradient with respect to \code{pars}.
+#' @param contributions Return subject and row contribution details when available.
+#' @param gradient_method Either "adjoint" (reverse mode, the default) or
+#'   "forward" (ForwardDiff). Both compute the same gradient. "adjoint" costs
+#'   the same regardless of how many free parameters a model has, and is
+#'   faster than "forward" at every model size measured, by a margin that
+#'   grows with the parameter count. See \code{optimcontrol$gradient} in
+#'   \code{ctFit}.
+#' @param cores The most engine threads this evaluation uses, restored
+#'   afterwards. \code{NA} leaves the ceiling already in force, for a caller
+#'   that has set one around a run of evaluations.
+#' @return A list containing the log likelihood and, when requested, the
+#'   gradient and the contributions.
+#' @examples
+#' \donttest{
+#' # Needs a working julia backend, so the example is inert where Julia is
+#' # absent -- including on CRAN, whose check machines have none.
+#' if (isTRUE(ctJuliaStatus()$available)) {
+#'   model <- ctModel(type = 'ct', manifestNames = 'Y1', latentNames = 'eta1',
+#'     LAMBDA = matrix(1))
+#'   model$pars$indvarying <- FALSE
+#'   prepared <- ctFit(ctstantestdat, model, backend = 'julia', fit = FALSE)
+#'   start <- ctJuliaEvaluate(prepared, pars = rep(0, 6), cores = 1)
+#'   str(start)
+#'   # Julia keeps running between calls, holding what it has compiled;
+#'   # this ends it.
+#'   ctJuliaKill("session")
+#' }
+#' }
+#' @export
+ctJuliaEvaluate <- function(object, pars = NULL, gradient = TRUE, contributions = FALSE,
+  gradient_method = c("adjoint", "forward"), cores = getOption("mc.cores", 2L)) {
+  gradient_method <- match.arg(gradient_method)
+  if (!inherits(object, c("ctJuliaModel", "ctJuliaFit"))) stop("object must be a ctJuliaModel or ctJuliaFit", call. = FALSE)
+  if (is.null(pars)) {
+    if (inherits(object, "ctJuliaFit")) pars <- object$estimate$raw else stop("pars must be supplied for a prepared ctJuliaModel", call. = FALSE)
+  }
+  module <- .ctJuliaModule(if (inherits(object, "ctJuliaFit")) object$model_spec$project else object$project)
+  result <- .ctBackendWithMaxChunks(cores, module$ctsem_evaluate(
+    .ctJuliaObjective(object, hybrid = TRUE), .ctJuliaNumericVector(pars),
+    gradient = isTRUE(gradient), contributions = isTRUE(contributions),
+    gradient_method = gradient_method))
+  .ctJuliaGet(result)
+}
+
+#' @rdname summary.ctStanFit
+#' @method summary ctJuliaFit
+#' @export
+summary.ctJuliaFit <- function(object, timeinterval = 1, digits = 3, parmatrices = TRUE,
+  priorcheck = TRUE, residualcov = TRUE, ...) {
+  # `priorcheck` reports posterior means and sds against ctsem's normal(0,1) raw
+  # priors, which needs the Stan model's own prior block. This backend does not
+  # carry one, so there is nothing here to report.
+  #
+  # The value decides, which is the rule `.ctOptimcontrolSplit()` already
+  # applies to optimcontrol names. `priorcheck = FALSE` describes what this
+  # backend does and is accepted in silence; so is the default, so a script that
+  # summarises whichever fit it was handed still works, which is why this was
+  # accepted-and-ignored in the first place. `priorcheck = TRUE` written out by
+  # hand asks for a report that will not appear, and used to get silence -- a
+  # summary with no prior check in it and nothing saying one had been asked for.
+  # `missing()` before the argument is touched is what tells a default from a
+  # value that happens to equal it; `ctFit()` does the same for `poprank`.
+  if(!missing(priorcheck) && isTRUE(priorcheck)) stop(
+    "priorcheck compares the posterior against ctsem's raw-scale priors, which ",
+    "needs the stan model's prior block; a backend='julia' fit does not carry ",
+    "one. Drop the argument, or pass priorcheck=FALSE. ctLaplaceCheck() and ",
+    "fit$priorerrors are what this backend reports instead.", call.=FALSE)
+  .ctBackendSummary(object, timeinterval = timeinterval, digits = digits,
+    parmatrices = parmatrices, residualcov = residualcov, ...)
+}
+
+#' @export
+ctExtract.ctJuliaFit <- function(object, subjectMatrices = FALSE, cores = getOption("mc.cores", 2L),
+  nsamples = "all", subjects = "all", state = NULL, realid = TRUE, ...) {
+  if (!"all" %in% subjects)
+    subjects <- sort(as.vector(.ctResolveSubjects(object, subjects, realid)))
+  # `cores` was accepted and dropped. It is the engine's subject-chunk ceiling
+  # here, not a number of R processes -- there is no cluster on this path -- and
+  # it is restored afterwards so an extract does not leave the session
+  # reconfigured. Note that `subjectMatrices=TRUE` is dominated by moving the
+  # filter output back across the bridge rather than by computing it, so this
+  # bounds the work rather than speeding it up much.
+  #
+  # `state` reached the engine raw before, so the shorthands 'mean' and
+  # 'asymptotic' arrived as a string and died in the engine with a Julia
+  # MethodError; only an explicit vector worked, and it came back unlabelled.
+  # Resolve it here, as ctSummaryMatrices does, so both spell the same point the
+  # same way.
+  resolved <- .ctResolveState(object, state)
+  out <- .ctBackendWithMaxChunks(cores,
+    .ctBackendExtract(object, subjectMatrices = subjectMatrices, nsamples = nsamples,
+      subjects = subjects, state = resolved$state, ...))
+  # Recorded, not messaged: see ctExtract.ctStanFit.
+  attr(out, "evaluatedAt") <- resolved$label
+  out
+}
+
+#' @export
+ctSummaryMatrices.ctJuliaFit <- function(fit, calcfunc = quantile,
+  calcfuncargs = list(probs = 0.5), timeinterval = 1, state = NULL, ...) {
+  # 'T0MEANS' (the default), 'mean', 'asymptotic', or a state vector. Resolved
+  # here rather than passed on raw so that the message below can name the point
+  # in the same words whichever form the caller used.
+  resolved <- .ctResolveState(fit, state)
+  out <- .ctBackendSummaryMatrices(fit, calcfunc = calcfunc, calcfuncargs = calcfuncargs,
+    timeinterval = timeinterval, state = resolved$state, ...)
+  .ctContextMessage(fit, resolved$label)
+  .ctContextAttach(out, fit)
+}
+
+# Run `expr` with the engine's subject-chunk ceiling set to `chunks`, and put
+# the previous ceiling back afterwards.
+#
+# `_CTSEM_MAX_CHUNKS` is session-global Julia state, and three call sites wrote
+# it and none restored it: after a `cores=8` fit the session read 8, after a
+# `cores=1` fit it read 1, and every later ctKalman(), ctJuliaEvaluate(),
+# ctExtract() or ctLOO() in that session inherited whichever fit came last. That
+# is performance-only, but it makes a timing depend on history, which is exactly
+# what makes one impossible to reproduce.
+.ctBackendWithMaxChunks <- function(chunks, expr) {
+  # With no Julia here at all there is no engine work to bound, and setting the
+  # ceiling would start the setup only to fail it: a stored julia fit's
+  # extract, summaries and LaTeX are R work on the draws it carries. Anything in
+  # `expr` that does need the engine says Julia is missing itself.
+  if (!isTRUE(.ctJuliaSessionRunning()) &&
+      !isTRUE(tryCatch(.ctJuliaStartable(), error = function(e) FALSE))) return(expr)
+  previous <- .ctBackendSetMaxChunks(chunks)
+  on.exit(.ctBackendRestoreMaxChunks(previous), add = TRUE)
+  expr
+}
+
+# Set the ceiling, and report the one that was there.
+#
+# Three places cap the ceiling for the duration of some work and put it back:
+# the wrapper above, the uncertainty phase, and ctLaplaceCheck. Each had its own
+# copy of read-set-restore and the copies had drifted -- one set only for
+# `chunks >= 1`, one only for `chunks > 1`, one for any non-NULL `cores`; two
+# wrapped the set in `try` and the third let a failure abort the caller. The
+# restore half stays the caller's own `on.exit`, because two of the three cap
+# for the rest of their function rather than for a single expression.
+#
+# NA back means the previous ceiling could not be read, and so that there is
+# nothing to put back. It is read only when there is a ceiling to set, because
+# reading it is a `juliaEval` and `juliaEval` *starts* a session when none is
+# running -- capping nothing must not be the thing that launches the engine.
+#
+# The same read gives the session's thread count, so this is also where a call
+# other than a fit hears that the session is narrower than it asked for
+# (`.ctBackendReportShortfall()`); a fit has heard already, before it began.
+.ctBackendSetMaxChunks <- function(chunks) {
+  chunks <- suppressWarnings(as.integer(chunks)[1L])
+  if (is.na(chunks) || chunks < 1L) return(NA_integer_)
+  # Often the first call of an operation, ahead of anything that asks for the
+  # module, so it is where a session that has died is noticed.
+  .ctJuliaCheckAlive()
+  # And the engine is loaded here rather than by the work inside the region:
+  # loading it sets the default ceiling, which would otherwise replace this one
+  # for the region's duration -- a ctExtract(cores = 8) on a fit restored into a
+  # new session would run at the default.
+  .ctJuliaModule(.ct_julia_cache$project)
+  state <- tryCatch(as.integer(.ctBackendJuliaValue(.ctJuliaEval(paste0(
+    "let s = ContinuousTimeSEM.ctsem_max_chunks(); ",
+    "[s.max_chunks, s.nthreads] end")))), error = function(e) integer())
+  if (length(state) != 2L) state <- c(NA_integer_, NA_integer_)
+  .ctBackendReportShortfall(chunks, threads = state[2L],
+    requested = .ctJuliaCallCores())
+  try(.ctJuliaCall("ContinuousTimeSEM.ctsem_set_max_chunks!", chunks),
+    silent = TRUE)
+  state[1L]
+}
+
+# Say so when a running session has fewer threads than a region would use of
+# what its call asked for. The region runs at up to `chunks`, the call asked
+# for `requested` (`.ctJuliaCallCores()`), and only the lesser of the two can
+# fall short: a region held below its call on purpose -- an inner fit at one
+# core under a wider call -- is short of nothing, and a call that asked for
+# nothing is not told. Only ctFit's `cores` restarts a session
+# (`.ctBackendResolveThreads()`); a call this far in holds Julia objects a
+# restart would end.
+.ctBackendReportShortfall <- function(chunks, threads, requested) {
+  requested <- suppressWarnings(as.integer(requested)[1L])
+  wanted <- min(suppressWarnings(as.integer(chunks)[1L]), requested)
+  threads <- suppressWarnings(as.integer(threads)[1L])
+  if (!is.na(wanted) && !is.na(threads) && threads < wanted) {
+    .ctBackendReportThreads(requested, threads)
+  }
+  invisible(NULL)
+}
+
+.ctBackendRestoreMaxChunks <- function(previous) {
+  previous <- suppressWarnings(as.integer(previous)[1L])
+  if (!is.na(previous)) {
+    # Deferred when Escape left a reply owed: this runs from `on.exit` as the
+    # interrupt unwinds, and must not wait for the interrupted call to end.
+    try(.ctJuliaCall("ContinuousTimeSEM.ctsem_set_max_chunks!",
+      previous, .defer = TRUE), silent = TRUE)
+  }
+  invisible(NULL)
+}
+
+# The Julia session's thread count, or NA -- without starting a session.
+#
+# `juliaEval()` starts a server rather than reporting on one, so a running
+# session is asked directly and a session that has not begun is predicted from
+# the environment instead. Julia also accepts "auto" and "N,M" (worker threads,
+# interactive threads) there; "auto" is never short of anything, and any other
+# spelling this cannot parse is reported as unknown rather than guessed at.
+.ctBackendSessionThreads <- function() {
+  if (.ctJuliaSessionRunning()) {
+    return(tryCatch(as.integer(.ctJuliaEval("Threads.nthreads()")),
+      error = function(e) NA_integer_))
+  }
+  existing <- Sys.getenv("JULIA_NUM_THREADS", unset = "")
+  if (!nzchar(existing)) return(.ctJuliaDefaultCores())
+  suppressWarnings(as.integer(sub(",.*$", "", existing))[1L])
+}
+
+# Say so when `cores` is more than the session can give, once per session per
+# pair.
+.ctBackendReportThreads <- function(cores, threads) {
+  key <- paste0(cores, ":", threads)
+  if (key %in% .ct_julia_cache$threads_reported) return(invisible(NULL))
+  .ct_julia_cache$threads_reported <- c(.ct_julia_cache$threads_reported, key)
+  message("cores = ", cores, " requested, ", threads, " used: Julia's thread ",
+    "count is fixed at session start. ctJuliaSetup(threads = ", cores,
+    ", force = TRUE) restarts it with ", cores, ".")
+  invisible(NULL)
+}
+
+# Resolve `cores` against that thread count, and never do it in silence.
+#
+# Julia fixes `Threads.nthreads()` at process start, so `cores` is a request
+# only an unstarted session can grant. Three situations:
+#
+#   * No session yet and the thread count is ours to set -- provision it
+#     (`.ctJuliaProvision()`) at this call's `cores`.
+#   * No session yet but JULIA_NUM_THREADS was set deliberately, by
+#     ctJuliaSetup(threads=), by the user, or by a cluster scheduler -- that
+#     wins, and it may be narrower than `cores`.
+#   * A session is already running -- its count is fixed and cannot be raised.
+#
+# The third is the common one: a session is started as wide as the call that
+# started it and no wider, because idle threads cost CPU (see "How many threads
+# a session starts with" in R/ctJuliaBridge.R), so a later call asking for more
+# finds it short, and it is said.
+#
+# `options(ctsem.julia.restart = TRUE)` opts in to fixing it rather than saying
+# it. Not the default: a restart discards the session's compiled model shapes
+# -- ~5 s to restart, plus ~15 s of respecialisation on the next fit, on a
+# one-latent model, and minutes on a Laplace model with ordinal indicators.
+#
+# `threads` is a parameter so the gate can be exercised at a count the test
+# machine does not have to be restarted into. `report = FALSE` is `fit = FALSE`:
+# a call that only builds a specification still wants the thread count requested
+# while that is possible, since preparing starts the session, but has nothing to
+# say about cores it was never going to use and no reason to restart anything.
+.ctBackendResolveThreads <- function(cores, threads = NULL, report = TRUE) {
+  cores <- suppressWarnings(as.integer(cores)[1L])
+  # What a session this call starts may build the engine with
+  # (`.ctJuliaBuildWidth()`), one core included.
+  if (!is.na(cores) && cores >= 1L && !.ctJuliaSessionRunning()) {
+    .ct_julia_cache$build_cores <- cores
+  }
+  if (is.na(cores) || cores < 2L) return(invisible(NA_integer_))
+  restart <- isTRUE(report) && isTRUE(getOption("ctsem.julia.restart", FALSE))
+  if (is.null(threads) && !.ctJuliaSessionRunning()) {
+    existing <- Sys.getenv("JULIA_NUM_THREADS", unset = "")
+    # A value from ctJuliaSetup(threads=) or from the user's own environment is
+    # deliberate and wins, unless the restart option says otherwise -- there
+    # is no session to lose here, so honouring `cores` costs nothing.
+    ours <- nzchar(existing) &&
+      identical(existing, .ct_julia_cache$threads_from_cores)
+    if (!nzchar(existing) || ours) return(invisible(.ctJuliaProvision(cores)))
+    if (restart) {
+      Sys.setenv(JULIA_NUM_THREADS = as.character(cores))
+      .ct_julia_cache$threads_from_cores <- as.character(cores)
+      return(invisible(cores))
+    }
+  }
+  if (is.null(threads)) threads <- .ctBackendSessionThreads()
+  threads <- suppressWarnings(as.integer(threads)[1L])
+  if (is.na(threads) || threads >= cores || !isTRUE(report)) {
+    return(invisible(threads))
+  }
+  if (restart) {
+    # Said before it happens, because it takes seconds and ends a process the
+    # caller may have set up. The engine environment is ctJuliaSetup()'s own
+    # `project`, and .ctJuliaClearSession() forgets it, so it is carried over.
+    message("Restarting the Julia session at ", cores, " threads for cores = ",
+      cores, ".")
+    project <- .ct_julia_cache$project
+    got <- tryCatch({
+      suppressWarnings(ctJuliaSetup(project = project, threads = cores,
+        force = TRUE))
+      # ctsem's choice rather than the caller's, so taken back as a provisioned
+      # width is: the next session is sized by the call that starts it.
+      .ct_julia_cache$threads_from_cores <- as.character(cores)
+      .ctJuliaUnprovision()
+      .ctBackendSessionThreads()
+    }, error = function(e) NA_integer_)
+    if (!is.na(got)) {
+      if (got >= cores) return(invisible(got))
+      threads <- got
+    }
+  }
+  .ctBackendReportThreads(cores, threads)
+  invisible(threads)
+}
+
+
+# The engine's per-iteration record, as a data frame.
+#
+# Flat vectors cross the bridge; the shape is rebuilt here. A missing or
+# malformed trace is NULL rather than an error: nothing downstream requires it,
+# and an old cached engine environment predating this will simply not send one.
+#' @keywords internal
+.ctBackendTrace <- function(trace) {
+  if (is.null(trace)) return(NULL)
+  columns <- lapply(trace, as.numeric)
+  columns <- columns[vapply(columns, length, integer(1)) > 0L]
+  if (!length(columns) || is.null(columns$iteration)) return(NULL)
+  n <- length(columns$iteration)
+  if (!all(vapply(columns, length, integer(1)) == n)) return(NULL)
+  out <- as.data.frame(columns, stringsAsFactors = FALSE)
+  out$iteration <- as.integer(out$iteration)
+  out
+}
+
+# The work counters of an engine run, and the counts of runs a fit did not keep
+# added to the one it did: the stage a stall escape replaced, an escape that did
+# not come out ahead, the run before a substep refit. Each did its work, and the
+# fit's counts are the whole of what it ran, as the corrections' totals are
+# (`.ctBackendCorrectResult()`). They were the kept run's alone, which is what
+# the optimiser bench's own tally of engine runs showed. The kept run's own
+# iterations stay readable as `stage_iterations`, since its trace is the one
+# reported and is read against that count. `spent` is a run or its counts.
+.ctJuliaRunCounters <- c("iterations", "f_calls", "g_calls", "newton_steps",
+  "newton_hessians", "newton_subset_hessians", "newton_krylov_models",
+  "newton_krylov_products", "forward_gradients", "explosive_passes")
+
+# The ids of the subjects the engine found explosive at the estimate (its
+# `explosive_subjects`, positions in first-appearance order, `0` for none):
+# predictions growing more than `_CTSEM_EXPLOSIVE_GROWTH` (100) fold between
+# observations. `NULL` for none.
+#' @keywords internal
+.ctJuliaExplosiveIds <- function(result, model_spec, model) {
+  idx <- as.integer(result$explosive_subjects)
+  idx <- idx[!is.na(idx) & idx > 0L]
+  if (!length(idx)) return(NULL)
+  d <- model_spec$data
+  idcol <- if (!is.null(d[[model$subjectIDname]])) model$subjectIDname else "id"
+  ids <- unique(d[[idcol]])
+  if (length(ids) >= max(idx)) ids[idx] else idx
+}
+#' @keywords internal
+.ctJuliaRunCounts <- function(run) vapply(.ctJuliaRunCounters, function(k)
+  as.numeric(.ctJuliaOr(run[[k]], 0))[1L], numeric(1))
+#' @keywords internal
+.ctJuliaAddRunCounts <- function(kept, spent) {
+  if (!is.numeric(spent)) spent <- .ctJuliaRunCounts(spent)
+  if (!any(spent > 0)) return(kept)
+  if (is.null(kept$stage_iterations)) {
+    kept$stage_iterations <- as.integer(.ctJuliaOr(kept$iterations, 0L))[1L]
+  }
+  for (k in .ctJuliaRunCounters) {
+    kept[[k]] <- as.numeric(.ctJuliaOr(kept[[k]], 0))[1L] + spent[[k]]
+  }
+  kept
+}
+
+# Run the engine's optimizer over a prepared specification.
+#
+# Factored out of .ctFitJuliaBackend() because cross-validation re-optimises the
+# same model against held-out data (see .ctBackendLOO) and must do it exactly
+# the way a fit does -- same tolerances, same gradient method, same thread cap.
+# A second copy of this call would be a second set of defaults to keep in step.
+# The engine takes the substep policy in one slot: `maxtimestep` as a number,
+# or a mesh -- one substep count per row of the data -- as an integer vector.
+# `.ctJuliaVector` keeps a one-row mesh a vector rather than the scalar
+# JuliaConnectoR would make of it.
+.ctJuliaSubstepInput <- function(rule) {
+  if (is.integer(rule) || length(rule) > 1L) .ctJuliaAsVector(as.integer(rule)) else as.numeric(rule)[1L]
+}
+
+# Choose the substep mesh for `spec` at the parameter values `values`, and
+# return the spec carrying it together with a summary. The engine measures how
+# nonlinear each interval was (substep_mesh.jl); a linear model comes back with
+# the floor and no filter pass. On the Laplace route each subject is measured
+# at its random-effect modes at `values`, the point the Laplace term evaluates
+# (laplace.jl). A non-finite likelihood at `values` leaves the spec as it was,
+# and the summary says so.
+.ctJuliaAutoSubsteps <- function(spec, values) {
+  module <- .ctJuliaModule(spec$project)
+  objective <- .ctJuliaObjective(structure(spec, class = c("ctJuliaModel", "ctFitModel")))
+  arguments <- list(objective, .ctJuliaNumericVector(values), tol = as.numeric(spec$substeps$tol),
+    max_substeps = as.integer(spec$substeps$max), floor_rule = as.numeric(spec$substeps$floor))
+  # Re-meshing at the optimum: the engine starts from one step per interval and
+  # may find the filter not finite there on a stiff model; the mesh the fit was
+  # found with is then its fallback.
+  if (is.integer(spec$max_timestep)) arguments$fallback <- .ctJuliaVector(spec$max_timestep)
+  chosen <- .ctJuliaGet(do.call(module$ctsem_auto_substeps, arguments))
+  summary <- list(intervals = as.integer(chosen$intervals), refined = as.integer(chosen$refined),
+    max_substeps = as.integer(chosen$max_substeps), total = as.integer(chosen$total),
+    passes = as.integer(chosen$passes), finite = isTRUE(chosen$finite),
+    tol = as.numeric(spec$substeps$tol), refit = FALSE)
+  if (summary$finite) spec$max_timestep <- as.integer(chosen$mesh)
+  list(spec = spec, summary = summary)
+}
+
+# Each row's count of steps for the iterated measurement update, learnt at
+# `values` (`ctsem_relin_plan`, kalman_filters.jl) and held on the spec, so
+# that every objective built from it takes them: frozen within a fit, as the
+# substep mesh is, which keeps the objective smooth at a fraction of the steps
+# iterating each row to its mode takes. On the Laplace route each subject is
+# at its random-effect modes. NULL where no row iterates -- a linear
+# measurement -- which is the same as no plan.
+.ctJuliaRelinPlan <- function(spec, values) {
+  module <- .ctJuliaModule(spec$project)
+  objective <- .ctJuliaObjective(structure(spec, class = c("ctJuliaModel", "ctFitModel")))
+  plan <- module$ctsem_relin_plan(objective, .ctJuliaNumericVector(values))
+  spec$relinsteps <- if (length(plan)) as.integer(plan) else NULL
+  spec
+}
+
+# The fitted specification's integration step, carried onto `spec`: the same
+# model re-prepared over other rows, as prediction and cross-validation do.
+# Re-preparing gives back the maxtimestep rule, which applies to any rows. A
+# mesh from `nsubsteps = 'auto'` does not: it is one count per row of the data
+# it was chosen for. Dropped, the filter went back to the rule on intervals the
+# fit had refined; copied across whole, it handed one subject's counts to
+# another, or failed in the engine when the row counts differed.
+#
+# So when every row here is a row the fit had, each keeps the count the fit
+# used, and the fit's own filter is reproduced exactly. Choosing again need
+# not reproduce it: the fit chose its mesh at an earlier optimum, before a
+# refit or a correction moved the estimate it reports. Anything else gets the
+# mesh the fit would choose for these rows at `values`, its estimate.
+#
+# The iteration plan (`.ctJuliaRelinPlan()`) is one count per row in the same
+# way, and is carried the same way.
+.ctJuliaCarrySubsteps <- function(spec, fitted, values) {
+  values <- as.numeric(values)[seq_len(.ctBackendNpar(spec))]
+  if (length(fitted$relinsteps)) {
+    rows <- .ctJuliaFittedRows(spec, fitted)
+    spec <- if (is.null(rows)) .ctJuliaRelinPlan(spec, values) else {
+      spec$relinsteps <- fitted$relinsteps[rows]
+      spec
+    }
+  }
+  if (!is.integer(fitted$max_timestep)) {
+    spec$max_timestep <- fitted$max_timestep
+    return(spec)
+  }
+  if (is.null(spec$substeps)) return(spec)
+  rows <- .ctJuliaFittedRows(spec, fitted)
+  if (!is.null(rows)) {
+    spec$max_timestep <- fitted$max_timestep[rows]
+    return(spec)
+  }
+  .ctJuliaAutoSubsteps(spec, values)$spec
+}
+
+# For each row of `spec`, the row of `fitted` it is, or NULL unless every row
+# has one. Matched a whole subject at a time: a count belongs to the interval
+# ending at its row, so a row is the fitted one only if the row before it is
+# too, and a subject with a row added or missing matches nowhere.
+.ctJuliaFittedRows <- function(spec, fitted) {
+  idname <- spec$model$subjectIDname
+  bysubject <- function(s) {
+    ids <- as.character(s$data[[idname]])
+    split(seq_along(ids), factor(ids, levels = unique(ids)))
+  }
+  new <- bysubject(spec)
+  old <- bysubject(fitted)
+  if (!length(new) || !all(names(new) %in% names(old))) return(NULL)
+  rows <- lapply(names(new), function(s) {
+    if (identical(as.numeric(fitted$times[old[[s]]]),
+      as.numeric(spec$times[new[[s]]]))) old[[s]]
+  })
+  if (any(vapply(rows, is.null, logical(1L)))) return(NULL)
+  unlist(rows, use.names = FALSE)
+}
+
+.ctJuliaSubstepMessage <- function(s) {
+  if (!isTRUE(s$finite)) return("Substeps: likelihood not finite at the starting values; maxtimestep rule kept.")
+  paste0("Substeps: ", s$refined, " of ", s$intervals, " intervals refined, max ", s$max_substeps,
+    if (isTRUE(s$refit)) "; refit after the mesh moved at the optimum." else ".")
+}
+
+# Whether the L-BFGS stage runs coreset stages (`optimcontrol$coreset`):
+# TRUE and FALSE as given, and 'auto', the default, for data of at least
+# `.ctCoresetAutoUnits` units (`.ctJuliaUnits()`) and `.ctCoresetAutoCells`
+# data cells (rows times manifest variables). The bars were measured on
+# Laplace fits. Below that
+# a full gradient is cheap: on the optimiser bench (25-100 units, at most
+# about 3000 cells) the stages saved no optimiser time, and on its models with
+# several maxima they changed which one a fit reached, twice ending
+# uncertified where the full sum certified. From about 250 units and 12000
+# cells up -- the range's designs and the strong-shell fits -- they cost 1.2 to
+# 3.6 times less (review/OPTIM-coreset-2026-10-21.md). Rough bars, set between
+# the two; a coreset that carries every parameter's information needs tens of
+# units, so with fewer than a couple of hundred it is too large a share to pay.
+.ctCoresetAutoUnits <- 200L
+.ctCoresetAutoCells <- 1e4
+#' @keywords internal
+.ctJuliaCoresetOn <- function(optimcontrol, model_spec) {
+  v <- optimcontrol[["coreset"]]
+  if (!is.null(v) && !identical(v, "auto")) return(isTRUE(v))
+  .ctJuliaUnits(model_spec) >= .ctCoresetAutoUnits &&
+    length(model_spec$manifest_data) >= .ctCoresetAutoCells
+}
+
+# How many units a prepared specification's objective sums, which is what a
+# coreset (the optimiser's stages, `.ctCoresetLpg()`) picks a few of: the
+# outermost level's groups on the Laplace route, the subjects otherwise.
+.ctJuliaUnits <- function(model_spec) {
+  levels <- model_spec$laplace$levels
+  if (length(levels)) {
+    return(as.integer(.ctJuliaOr(levels[[length(levels)]]$ngroups, 0L))[1L])
+  }
+  length(model_spec$subject_starts)
+}
+
+# A fit's checkpoint (`optimcontrol$checkpoint`, a file path): what
+# `.ctJuliaOptimise()` writes there and the start a fit takes from it. NULL
+# where none is asked for. Where the file exists it is read: written for the
+# same parameters (count and names) it gives the start (`start`, the raw point)
+# and the anchored modes (`resume`); written for another model, the fit stops
+# rather than overwrite it. `every` is the seconds between writes
+# (`optimcontrol$checkpoint_every`, default 60). Not on the state-explicit
+# target, whose point includes the states.
+.ctJuliaCheckpoint <- function(optimcontrol, model_spec, npar, intoverstates = TRUE) {
+  # `[[`: `$checkpoint` would read `checkpoint_every` where only it is set.
+  path <- optimcontrol[["checkpoint"]]
+  if (is.null(path)) return(NULL)
+  if (!is.character(path) || length(path) != 1L || !nzchar(path)) {
+    stop("optimcontrol$checkpoint must be a file path.", call. = FALSE)
+  }
+  if (!isTRUE(intoverstates)) {
+    stop("optimcontrol$checkpoint is not available with intoverstates = FALSE.",
+      call. = FALSE)
+  }
+  every <- as.numeric(.ctJuliaOr(optimcontrol$checkpoint_every, 60))[1L]
+  names <- .ctBackendRawParameterNames(list(model_spec = model_spec), npar)
+  out <- list(path = path.expand(path), every = every, npar = npar, names = names)
+  if (!file.exists(out$path)) return(out)
+  saved <- tryCatch(readRDS(out$path), error = function(e) NULL)
+  if (!is.list(saved) || !identical(saved$format, "ctsem checkpoint")) {
+    stop(out$path, " is not a ctsem checkpoint; remove it or name another file.",
+      call. = FALSE)
+  }
+  if (!identical(as.integer(saved$npar), as.integer(npar)) ||
+      !identical(as.character(saved$names), names) ||
+      length(saved$raw) != npar || !all(is.finite(saved$raw))) {
+    stop("The checkpoint at ", out$path, " was written for another model; ",
+      "remove it or name another file.", call. = FALSE)
+  }
+  out$start <- as.numeric(saved$raw)
+  units <- as.integer(saved$modes$units)
+  if (length(units) && any(units > 0L)) out$resume <- saved$modes
+  # What the point was optimised on (`.ctJuliaCheckpointState()`), and the
+  # exact Hessian the run kept there, beside the checkpoint
+  # (`.ctJuliaCheckpointHessian()`); version 1 records have neither.
+  out$state <- saved$state
+  kept <- .ctJuliaCheckpointHessianRead(out$path, saved, npar)
+  if (!is.null(kept)) {
+    out$hessian <- kept$hessian
+    out$hessian_at <- kept$at
+    out$hessian_id <- saved$hessian_id
+  }
+  message("Resuming from the checkpoint at ", out$path, ": iteration ",
+    saved$iteration, ", log posterior ", format(saved$objective, digits = 10),
+    if (!is.null(kept)) ", with the exact Hessian it kept", ".")
+  out
+}
+
+# What a checkpoint's point was optimised on, beyond the parameters: the
+# smoothing parameters (R/ctTIpredSmooth.R), which a fit estimates between
+# stages and a resume goes on from, and the substep mesh and relinearisation
+# plan, which a fit learns at its start and again at its optimum. A Hessian the
+# checkpoint kept is the objective's at these, so a resume uses it only where
+# its own are the same.
+.ctJuliaCheckpointState <- function(model_spec) {
+  list(lambda = if (!is.null(model_spec$penalty))
+      as.numeric(model_spec$penalty$lambda),
+    max_timestep = model_spec$max_timestep, relinsteps = model_spec$relinsteps)
+}
+
+# The file a checkpoint keeps its exact Hessian in, beside it: written once a
+# Hessian, where the checkpoint itself is written every minute and on the
+# affect pilot a 903 x 903 Hessian is 6.5 MB.
+.ctJuliaCheckpointHessianPath <- function(path) paste0(path, ".hessian")
+
+# The Hessian a checkpoint record names (`hessian_id`), from the file beside
+# it: NULL where it names none, or the file holds another, or the matrix is not
+# the parameters'.
+.ctJuliaCheckpointHessianRead <- function(path, saved, npar) {
+  if (is.null(saved$hessian_id)) return(NULL)
+  side <- .ctJuliaCheckpointHessianPath(path)
+  if (!file.exists(side)) return(NULL)
+  kept <- tryCatch(readRDS(side), error = function(e) NULL)
+  if (!is.list(kept) || !identical(kept$id, saved$hessian_id)) return(NULL)
+  if (!is.matrix(kept$hessian) || nrow(kept$hessian) != npar ||
+      ncol(kept$hessian) != npar || !all(is.finite(kept$hessian)) ||
+      length(kept$at) != npar || !all(is.finite(kept$at))) return(NULL)
+  list(hessian = kept$hessian, at = as.numeric(kept$at))
+}
+
+# Saves `object` to `path` through a temporary file moved into place, so an
+# interrupted write leaves the last copy whole.
+.ctJuliaSaveAtomic <- function(object, path, what = "checkpoint") {
+  dir <- dirname(path)
+  if (!dir.exists(dir)) dir.create(dir, recursive = TRUE)
+  temp <- tempfile(paste0(basename(path), "."), tmpdir = dir)
+  saveRDS(object, temp)
+  if (!file.rename(temp, path)) {
+    unlink(temp)
+    stop("could not move the new ", what, " into place")
+  }
+  invisible(TRUE)
+}
+
+# Writes a checkpoint (`.ctJuliaCheckpoint()`): the raw point the engine's
+# callback reported, its log posterior and iteration, the anchored modes
+# (`mode_units`, NaN-padded `mode_values`; unit 0 where the route anchors
+# none), what the point was optimised on (`checkpoint$state`), and the id of
+# the exact Hessian kept beside it (`.ctJuliaCheckpointHessian()`), if any.
+.ctJuliaCheckpointWrite <- function(checkpoint, iteration, objective, parameters,
+  mode_units, mode_values, hessian_id = NULL) {
+  raw <- as.numeric(parameters)
+  if (length(raw) != checkpoint$npar || !all(is.finite(raw))) return(invisible(FALSE))
+  record <- list(format = "ctsem checkpoint", version = 2L,
+    ctsem = as.character(utils::packageVersion("ctsem")),
+    npar = checkpoint$npar, names = checkpoint$names,
+    iteration = as.integer(iteration), objective = as.numeric(objective), raw = raw,
+    modes = list(units = as.integer(mode_units), values = as.matrix(mode_values)),
+    state = checkpoint$state, hessian_id = hessian_id, written = Sys.time())
+  .ctJuliaSaveAtomic(record, checkpoint$path)
+}
+
+# Keeps an exact Hessian of the maximised objective, formed at `at`, beside the
+# checkpoint, and returns the id the checkpoint names it by. The run started on
+# 2026-11-01 on the affect pilot was lost after forming its certification's
+# Hessian, and its resume formed it again at the same point: 8 hours.
+.ctJuliaCheckpointHessian <- function(checkpoint, hessian, at) {
+  hessian <- as.matrix(hessian)
+  at <- as.numeric(at)
+  if (nrow(hessian) != checkpoint$npar || ncol(hessian) != checkpoint$npar ||
+      length(at) != checkpoint$npar || !all(is.finite(hessian)) ||
+      !all(is.finite(at))) return(NULL)
+  id <- paste0(format(Sys.time(), "%Y%m%d%H%M%OS6"), "-", Sys.getpid())
+  .ctJuliaSaveAtomic(list(id = id, hessian = hessian, at = at,
+    state = checkpoint$state), .ctJuliaCheckpointHessianPath(checkpoint$path),
+    what = "kept Hessian")
+  id
+}
+
+# How many times a run resumes with modes kept as starts (`.ctJuliaOptimise()`)
+# -- a jump's, or better ones its closing search found -- before it is left.
+# Whether the closing search's are worth a resume is the engine's call
+# (`anchor_missed_resume`), by the bar its own rounds use.
+.ctJuliaKnownRounds <- 4L
+
+# Whether an engine optimisation ended on a jump the route named.
+.ctJuliaJumped <- function(result) {
+  identical(as.character(.ctJuliaOr(result$stop_reason, ""))[1L], "jump")
+}
+
+# The units a jump named, from an engine result.
+.ctJuliaJumpNamed <- function(result) {
+  named <- as.integer(result$jump_units)
+  named[!is.na(named) & named > 0L]
+}
+
+# The known modes (`spec$laplace$known`: `units`, one per column of `values`)
+# with the modes a jump's result saw for the units it named added, or NULL
+# where it adds none: every column of `jump_point_values` belonging to a named
+# unit (`.ctJuliaKnownAdd()`).
+.ctJuliaKnownModes <- function(known, result) {
+  named <- .ctJuliaJumpNamed(result)
+  if (!length(named)) return(NULL)
+  units <- as.integer(result$jump_point_units)
+  values <- as.matrix(result$jump_point_values)
+  if (length(units) != ncol(values)) return(NULL)
+  take <- units %in% named
+  if (!any(take)) return(NULL)
+  .ctJuliaKnownAdd(known, units[take], values[, take, drop = FALSE])
+}
+
+# The known modes with column `j` of `values`, a mode of unit `units[j]`,
+# added where it is not one already held, or NULL where none is added; rows
+# padded with NaN to the longer of the two matrices. A column's mode is its
+# entries before the first NaN (`_laplace_known_column`), and its length says
+# which objective's layout it is in: the engine passes over one whose length
+# is not the unit's there. A unit of 0 is the engine's "none".
+.ctJuliaKnownAdd <- function(known, units, values) {
+  units <- as.integer(units)
+  values <- as.matrix(values)
+  if (!length(units) || length(units) != ncol(values)) return(NULL)
+  take <- !is.na(units) & units > 0L
+  if (!any(take)) return(NULL)
+  units <- units[take]
+  values <- values[, take, drop = FALSE]
+  old_units <- if (is.null(known)) integer() else as.integer(known$units)
+  old_values <- if (is.null(known)) matrix(0, nrow(values), 0) else as.matrix(known$values)
+  rows <- max(nrow(values), nrow(old_values))
+  pad <- function(m) rbind(m, matrix(NaN, rows - nrow(m), ncol(m)))
+  values <- pad(values)
+  old_values <- pad(old_values)
+  column <- function(v) v[seq_len(match(TRUE, is.nan(c(v, NaN))) - 1L)]
+  held <- function(a, b) {
+    a <- column(a)
+    b <- column(b)
+    length(a) == length(b) && isTRUE(max(abs(a - b), 0) < 1e-8)
+  }
+  fresh <- vapply(seq_along(units), function(j) {
+    same <- which(old_units == units[j])
+    !any(vapply(same, function(k) held(old_values[, k], values[, j]), logical(1)))
+  }, logical(1))
+  if (!any(fresh)) return(NULL)
+  list(units = c(old_units, units[fresh]),
+    values = cbind(old_values, values[, fresh, drop = FALSE]))
+}
+
+.ctJuliaOptimise <- function(model_spec, start, optimcontrol = list(),
+  gradient = "adjoint", cores = 1L, verbose = 0L, maxiter = NULL,
+  callback = NULL, objective = NULL, progress_label = NULL,
+  progress_budget = FALSE, pin = NULL, resumed = FALSE, inverse = NULL,
+  hessian = NULL, hessian_at = NULL, walked = FALSE, checkpoint = NULL) {
+  spec <- structure(model_spec, class = c("ctJuliaModel", "ctFitModel"))
+  # A caller may hand in the objective to maximise. `intoverstates=FALSE` does,
+  # passing the joint one over `[theta; z]`; everything below is unchanged by
+  # that, because `ctsem_optimize` is typed on what the two have in common.
+  # Whether the caller brought its own, recorded *before* the default is
+  # filled in. Two stopping rules below are off for the state-explicit
+  # route and ask this question, and after the next line the argument is
+  # never NULL again -- so both of them read FALSE on every route, and both
+  # were therefore off everywhere rather than there. `gap_tol` was 0 for
+  # every fit in the package, and `stall_window` was 0, which is the whole
+  # check. Found by starting a laplace fit inside a flat transform: it ran
+  # 885 iterations, spent the last 300 of them with a predicted gain of
+  # 1e-8, and stopped 387 nats short with neither rule having fired once.
+  state_explicit <- !is.null(objective)
+  if (is.null(objective)) objective <- .ctJuliaObjective(spec, hybrid = TRUE)
+  # A run the engine anchors (`_ctsem_anchor_start!`) clears its anchors at
+  # its end; one an interrupt ends leaves them on the objective R caches.
+  on.exit(try(.ctJuliaCall("ContinuousTimeSEM.ctsem_laplace_clear_anchors!",
+    objective, .defer = TRUE), silent = TRUE), add = TRUE)
+  module <- .ctJuliaModule(model_spec$project)
+  # The shared optimcontrol vocabulary (see the table at the top of R/ctFit.R).
+  # `tol` is the objective criterion on both backends -- mize's `abs_tol` there,
+  # the engine's `f_tol` here -- and `g_tol` is the gradient norm on both. The
+  # defaults are this backend's own and are the mirror image of stan's: stop on
+  # the gradient, with the objective criterion off unless asked for.
+  # `maxiter` as an argument is the caller overriding the cap for one stage (the
+  # prior warm-up does), and beats the user's setting for that stage only.
+  # Whether anything is reported at all, decided before the list below because
+  # two of its elements need the same answer: `progress` runs the engine's
+  # reporter and `progress_sink` says where its line goes. See the note on
+  # `progress` at the foot of the list for why it is not simply `verbose`.
+  reporting <- isTRUE(.ctJuliaOr(optimcontrol$progress, .ctBackendReporting(verbose)))
+  common <- list(
+    # Not scaled with the parameters. A first stage that is slow but not
+    # stuck has no other end -- the stall watch only cools down there -- and
+    # ten iterations a parameter let a 697-parameter Laplace fit creep on at
+    # 2e-5 log likelihood an iteration for days rather than hours (affint,
+    # 2026-10-17). A fit this stops short is resumed by the certification,
+    # whose stage does stop on progress alone (`CTSEMStallWatch`).
+    maxiter = as.integer(.ctJuliaOr(maxiter, .ctJuliaOr(optimcontrol$maxiter, 1000L))),
+    g_tol = .ctJuliaOr(optimcontrol$g_tol, 1e-8),
+    f_tol = .ctJuliaOr(optimcontrol$tol, 0),
+    x_tol = .ctJuliaOr(optimcontrol$x_tol, 0),
+    # The cheap stopping rule, in objective units: stop once a step is
+    # predicted to gain less than this. The same tolerance the certification
+    # uses, and zero whenever nothing will certify -- see
+    # `.ctBackendInnerGapTol()`, which is where that reasoning lives.
+    # `objective` is supplied only by the state-explicit route, which is
+    # what `intoverstates = FALSE` means here -- that name is not in this
+    # function's scope, and `state_explicit` above is how it is asked.
+    gap_tol = .ctBackendInnerGapTol(optimcontrol, !state_explicit),
+    # The same bar the certification will use, so the optimiser's own verdict
+    # and the curvature's are the same question asked with different metrics
+    # rather than two different questions. `gap_tol` above is the stopping rule
+    # and aims inside it, at a hundredth.
+    converge_tol = .ctBackendConvergeTol(optimcontrol),
+    # Which directions the post-fit overshoot probe pulls back, or "off" to
+    # skip it. See `.ctBackendOvershootProbe()` for what the settings mean and
+    # `_ctsem_overshot` in the engine for what the probe costs.
+    overshoot_probe = .ctBackendOvershootProbe(optimcontrol),
+    # Stop a run that has stopped converging, rather than letting it grind to
+    # the iteration cap. See `.ctBackendStallWindow()` and `_ctsem_stalled`.
+    #
+    # Off on the state-explicit route, where `objective` is the joint target.
+    # Every premise the check rests on fails there: that mode is degenerate --
+    # the innovations re-optimise to absorb almost any parameter change -- so
+    # the objective is nearly flat everywhere, which makes the progress half
+    # meaningless, and a pullback can nearly always find something, which makes
+    # the third condition meaningless too. `.ctBackendInnerGapTol()` excludes
+    # the same route for the same reason, and `test-julia-intoverstates.R`
+    # measured what including it costs: the joint fit stopped somewhere else
+    # and its curvature came back indefinite in a substantial direction.
+    stall_window = if (state_explicit) 0L
+      else .ctBackendStallWindow(optimcontrol),
+    # The hysteresis: a fit that stalls with nothing flat is slow rather than
+    # stuck, so it is left alone for a while before it is asked again.
+    stall_cooldown = as.integer(.ctJuliaOr(optimcontrol$stallcooldown, 30L)),
+    # How much of its live responsiveness a transform has to have lost before
+    # it counts as the reason a fit stopped. Relative, because an absolute
+    # derivative floor means a different thing for every transform.
+    stall_ratio = as.numeric(.ctJuliaOr(optimcontrol$stallratio, 1e-3)),
+    # Start on a subset of the subjects and grow it as the optimiser needs
+    # more data, and finish with the endgame: Newton steps, the final Hessian,
+    # an escape from a saddle and the flat-direction probe, all in the engine
+    # (`_ctsem_newton_finish` in optimiser.jl). Batching decides for itself
+    # whether it applies -- a route without a subset, a sampled TI predictor,
+    # too few subjects -- and is plain L-BFGS otherwise. Off on the
+    # state-explicit route, whose target is not a sum over subjects and whose
+    # joint mode is not an estimate.
+    batch = !state_explicit && !identical(optimcontrol$batch, FALSE),
+    newton = !state_explicit && !identical(optimcontrol$newton, FALSE),
+    # `newton` may also name what the finish's steps are taken against --
+    # 'exact', 'chord', 'subset' or 'krylov'; otherwise the route's own: the
+    # chord, one Hessian walked with SR1 updates and refreshed when its walk
+    # stops paying, or on the Laplace route where that Hessian is dear the
+    # Krylov model, the scores' curvature corrected by Hessian-vector products.
+    # See `_ctsem_newton_finish`.
+    newton_curvature = if (is.character(optimcontrol$newton))
+      as.character(optimcontrol$newton)[1L] else "auto",
+    # Whether a certification will read what the endgame returns. It adds the
+    # flat-direction probe, and on the Laplace route, whose Hessian costs `2
+    # npar` gradients, it is what the endgame runs for at all: the finish's
+    # Hessian is then the certification's, not an extra one. Not on a budget
+    # stage (the prior warm-up, whose verdict nobody reads), nor where nothing
+    # certifies -- `estonly`, `certify = FALSE`, the state-explicit route.
+    #
+    # A certificate without the Hessian for the doors that need no standard
+    # errors (conjugate gradients on Hessian-vector products, plan P8) was
+    # considered and not built, because those doors form no Hessian to save:
+    # profile points pass `certify = FALSE`, which zeroes `gap_tol` and with it
+    # the finish, and ctLOO's folds set a gap rule of their own, start L-BFGS
+    # from the fit's covariance and leave the finish off (`.ctBackendLOOFold()`);
+    # `estonly` forms none on the Laplace route and on
+    # the augmented only the finish's exact ones, which its Newton steps need
+    # (optimiser bench at juliaFit 908b068d, dev1: no Hessian in any Laplace
+    # estonly cell). Restarts form one each, as the finish's metric; they are
+    # opt-in and run only for a fit that did not certify.
+    certify = !state_explicit && !isTRUE(optimcontrol$estonly) &&
+      !identical(optimcontrol$certify, FALSE) && !isTRUE(progress_budget),
+    # The endgame's two rules, passed from here so one number serves the
+    # engine and R: how far a Hessian may have been taken from the estimate and
+    # still be its curvature (`.ctBackendHessianReuse()`), and the relative
+    # curvature below which a direction is flat (`.ctFlatDirectionRtol()`).
+    newton_reuse = .ctBackendHessianReuse(optimcontrol),
+    flat_rtol = .ctFlatDirectionRtol(),
+    # The transform metric (`.ctJuliaParameterScale()`, `_ctsem_metric` in the
+    # engine), off unless asked for: L-BFGS's initial inverse Hessian is learnt
+    # per coordinate from the curvature pairs (`lbfgs_diagonal`), and the
+    # first step is short, which together do what the metric was added for
+    # (2026-09-12, when L-BFGS had one scalar scale): a count model with
+    # `meanscale = 10` reached its optimum 10/10 on both routes without it.
+    # On the default, a `10 * param` intercept's metric made it the slow
+    # coordinate early on, so variances, correlations and drift adapted to
+    # intercepts still far from the data and settled in a worse basin: on the
+    # ctsem book's measurement models the RI-CLPM's Laplace route ended 660
+    # -2LL short from every start and the FE-DPM reached its maximum from 1
+    # start in 6; without the metric 3/3 and 6/6, and the trends chapter's RC
+    # linear model its best maximum 3/3 where the metric's fits stopped 9-14
+    # short. Without it they need no data-based start either.
+    precondition = if (!isTRUE(optimcontrol$precondition)) NULL else
+      .ctJuliaVector(.ctJuliaParameterScale(model_spec,
+        at = as.numeric(start), npar = length(as.numeric(start)))),
+    # The line search's first step, in the metric's own norm (see
+    # `_ctsem_lbfgs` in optimiser.jl). Guards against a first step landing deep
+    # inside a flat transform before any curvature has been learned -- a full
+    # unit step from a cold start is what walks a saturating coordinate straight
+    # to its plateau. One of the seven constants that move where a fit ends
+    # (`review/OPTIM-consolidation-plan-2026-09-25.md` Appendix B), measured on
+    # flat-transform starts and recorded in
+    # `review/LAPLACE-optimise-heuristics-survey-2026-09-25.md` section 3. On
+    # the bench's 70 default cells, categorical and nested among them, 0.03, 0.3
+    # and 1 each moved fits between basins both ways and none was better across
+    # them; a unit step lost 6.8 nats on both AnomAuth fits
+    # (`review/bench/2026-10-31-defaults-jf-f979c331.md`).
+    initial_alpha = if (is.null(optimcontrol$initial_alpha)) .1 else
+      as.numeric(optimcontrol$initial_alpha)[1L],
+    verbose = verbose > 0L,
+    # Overwrite one line in place when someone is watching, and print
+    # occasional separate lines when the output is going to a file or a knitr
+    # chunk, where a carriage return is not a cursor movement. `verbose = 2`
+    # keeps the history too, because at that point the point is the history.
+    progress_overwrite = .ctProgressOverwrite(verbose),
+    # Delivered as an R message rather than printed by the engine; see
+    # `.ctProgressSink()`. Only when something is being reported at all -- a
+    # silent fit should not pay a bridge callback per iteration.
+    progress_sink = if (reporting) .ctProgressSink(
+      .ctProgressOverwrite(verbose)) else NULL,
+    # Names the stage on the progress line, defaulting to the engine's own
+    # "optimise" when unset. `carefulfit` runs an optimisation before the fit's
+    # and both carried that same label, so the counter ran up to the warm-up's
+    # cap and then restarted from one -- which reads as a run that finished and
+    # began again. The callback had the same fault, fixed separately; this is
+    # its printed twin.
+    progress_label = if (is.null(progress_label)) "optimise" else
+      as.character(progress_label)[1L],
+    # Whether `maxiter` is the plan or a safety limit, which decides whether
+    # the counter carries a denominator at all. The warm-up's cap of 10 is
+    # always reached, so "7/10" is honest there; the fit's cap of 1000 is not a
+    # target and showing "297/1000" invited reading a completion fraction that
+    # meant nothing. See `_progress_optimise` in progress.jl. A cap of zero is
+    # the plan too -- `ctFit(optimize = FALSE)`'s SAEM placement asks for the
+    # start and warm-up alone -- and was reported as ITERATION CAP REACHED.
+    progress_budget = isTRUE(progress_budget) ||
+      identical(as.integer(.ctJuliaOr(maxiter, optimcontrol$maxiter)), 0L),
+    # `verbose = 2` asks for the history, and the engine's non-overwriting
+    # cadence is 5s against 0.4s for the overwriting one -- so raising the
+    # level printed *fewer* progress lines than leaving it alone, and on any
+    # fit shorter than five seconds it printed none at all. Asking for more
+    # detail must not give less of it.
+    # Keyed on the level, not on `!.ctProgressOverwrite()`: that is also FALSE
+    # for a `verbose = 1` run whose output goes to a log file, where the slow
+    # cadence is right and hundreds of lines are not.
+    progress_every = if (is.numeric(verbose) && length(verbose) == 1L &&
+      !is.na(verbose) && verbose >= 2) 0.4 else 0,
+    # On when someone is watching, which is not the same question as how
+    # verbose to be. A default fit used to print two lines and then nothing at
+    # all however long it ran, because progress was tied to `verbose` and
+    # `verbose` defaults to 0 -- so the reporting existed and almost nobody
+    # saw it. Keyed on the same console detection the overwriting uses, so a
+    # script or a knitr chunk still gets nothing, and overridable with
+    # `optimcontrol$progress`.
+    progress = reporting)
+  # A live callback into R, for a front end that wants to draw the trace as it
+  # happens rather than read it afterwards. The engine calls it on the same time
+  # cadence as the printed line, not once per iteration: measured through
+  # JuliaConnectoR a callback costs 0.5 ms, which is nothing occasionally and
+  # 17% of a three-second fit at every iteration.
+  failure <- NULL
+  # A checkpoint (`optimcontrol$checkpoint`, read by `.ctJuliaCheckpoint()`):
+  # the engine forces the callback every `every` seconds and at a run's end,
+  # handing it the anchored modes beside the point, and the file is written
+  # then. The modes a resume brings (`resume`) are further starts for each
+  # run's opening search (`_ctsem_anchor_start!`).
+  #
+  # Each exact Hessian the finish forms is kept beside the checkpoint as it
+  # comes (`hessian_callback`, `.ctJuliaCheckpointHessian()`), and the
+  # checkpoint names the latest; one a resume brought (`checkpoint$hessian_id`,
+  # the caller's `hessian`) stays named until another replaces it. A resume
+  # walks on it where its objective is the one the Hessian was formed on
+  # (`.ctJuliaCheckpointState()`), and keeps it where the walk ends within
+  # `hessianreuse` standard errors of where it was formed.
+  hessian_id <- NULL
+  last_write <- NULL
+  if (!is.null(checkpoint)) {
+    common$checkpoint_every <- as.numeric(checkpoint$every)
+    checkpoint$state <- .ctJuliaCheckpointState(model_spec)
+    hessian_id <- checkpoint$hessian_id
+    if (!is.null(checkpoint$resume)) {
+      values <- as.matrix(checkpoint$resume$values)
+      storage.mode(values) <- "double"
+      common$resume_units <- .ctJuliaVector(as.integer(checkpoint$resume$units))
+      common$resume_values <- values
+    }
+    common$hessian_callback <- function(at, hessian) {
+      kept <- tryCatch(list(id = .ctJuliaCheckpointHessian(checkpoint, hessian, at)),
+        error = function(e) list(failed = conditionMessage(e)))
+      if (!is.null(kept$failed)) {
+        if (is.null(checkpoint$failed)) {
+          checkpoint$failed <<- kept$failed
+          warning("The Hessian could not be kept beside the checkpoint at ",
+            checkpoint$path, ": ", kept$failed, call. = FALSE)
+        }
+      } else if (!is.null(kept$id)) {
+        hessian_id <<- kept$id
+        # The checkpoint names it at once: the finish's probe can run for
+        # hours after its Hessian, and a write on the callback's cadence
+        # waits for the probe's end.
+        if (!is.null(last_write)) try(do.call(.ctJuliaCheckpointWrite,
+          c(list(checkpoint), last_write, list(hessian_id = hessian_id))),
+          silent = TRUE)
+      }
+      NULL
+    }
+    if (is.null(callback)) callback <- function(iteration, total, objective,
+      gradient_norm) NULL
+  }
+  if (!is.null(callback)) {
+    if (!is.function(callback)) {
+      stop("optimcontrol$callback must be a function of (iteration, total, ",
+        "objective, gradient_norm), optionally taking the current point as a ",
+        "fifth argument.", call. = FALSE)
+    }
+    # Caught here rather than in the engine, because an error thrown out of an
+    # R callback does not reach the engine at all: it aborts before a reply is
+    # sent, JuliaConnectoR reports "Message type not supported (yet)", and the
+    # bridge is left desynchronised -- the fit is lost to a fault in a
+    # *reporting* function. A callback is a convenience and must never be able
+    # to do that, so it is wrapped to swallow everything and disable itself.
+    #
+    # The message is stored rather than warned immediately: `options(warn = 2)`
+    # would turn the warning into exactly the error this exists to prevent.
+    alive <- TRUE
+    # The engine always sends the current point as a fifth value. A callback
+    # written before that existed takes four arguments, so it is called with
+    # four: handing it a fifth would turn an addition into a breaking change.
+    # `...` counts as accepting it, since such a function can ask for it.
+    fmls <- names(formals(callback))
+    wants_pars <- length(fmls) >= 5L || "..." %in% fmls
+    common$progress_callback <- function(iteration, total, objective,
+      gradient_norm, parameters, mode_units = NULL, mode_values = NULL) {
+      if (alive) {
+        tryCatch(if (wants_pars)
+            callback(iteration, total, objective, gradient_norm, parameters)
+          else callback(iteration, total, objective, gradient_norm),
+          error = function(e) {
+            alive <<- FALSE
+            failure <<- conditionMessage(e)
+          })
+      }
+      # Not swallowed with the callback's errors: a checkpoint that cannot be
+      # written says so once, and the fit goes on.
+      if (!is.null(checkpoint) && !is.null(mode_units)) {
+        point <- list(iteration = iteration, objective = objective,
+          parameters = parameters, mode_units = mode_units,
+          mode_values = mode_values)
+        written <- tryCatch(do.call(.ctJuliaCheckpointWrite, c(list(checkpoint),
+          point, list(hessian_id = hessian_id))), error = function(e)
+          conditionMessage(e))
+        if (isTRUE(written)) last_write <<- point
+        if (is.character(written) && is.null(checkpoint$failed)) {
+          checkpoint$failed <<- written
+          warning("The checkpoint could not be written to ", checkpoint$path,
+            ": ", written, call. = FALSE)
+        }
+      }
+      NULL
+    }
+  }
+  # Exposed because it is the one optimiser knob that measurably changed both
+  # speed and whether the gradient criterion was met; the engine's default is
+  # documented at `_CTSEM_LBFGS_MEMORY`.
+  if (!is.null(optimcontrol$lbfgs_memory)) {
+    common$lbfgs_memory <- as.integer(optimcontrol$lbfgs_memory)[1L]
+  }
+  # A second model of the curvature beside L-BFGS's, from the per-unit score
+  # outer products (`CTSEMStructured`); on unless asked not to. Off, the
+  # bench's 70 default cells ended the same but one, 8.2 nats lower.
+  if (!isFALSE(optimcontrol$lbfgs_scores)) common$lbfgs_scores <- TRUE
+  # L-BFGS's initial curvature exact where parameters are read by few units
+  # (`CTSEMLocalCurvature`); on unless asked not to. It never builds on the
+  # bench's cells, whose runs are short and parameters widely read; the case
+  # for it is the affect pilot's (CLAUDE.md).
+  if (!isFALSE(optimcontrol$lbfgs_local)) common$lbfgs_local <- TRUE
+  # L-BFGS's initial inverse Hessian per coordinate, and a non-monotone line
+  # search (see `_ctsem_lbfgs` in optimiser.jl).
+  if (!is.null(optimcontrol$lbfgs_diagonal)) {
+    common$lbfgs_diagonal <- isTRUE(optimcontrol$lbfgs_diagonal)
+  }
+  if (!is.null(optimcontrol$lbfgs_nonmonotone)) {
+    common$lbfgs_nonmonotone <- as.numeric(optimcontrol$lbfgs_nonmonotone)[1L]
+  }
+  # Grippo-Lampariello-Lucidi acceptance over the last `lbfgs_gll` values.
+  if (!is.null(optimcontrol$lbfgs_gll)) {
+    common$lbfgs_gll <- as.integer(optimcontrol$lbfgs_gll)[1L]
+  }
+  # `coreset`: stretches of the L-BFGS stage on a weighted few of the units,
+  # each checked by a full gradient (`_ctsem_coreset_plan` in the engine),
+  # where `.ctJuliaCoresetOn()` says. Sent only when on, so
+  # that a small fit's call keeps the shape the package image recorded.
+  if (.ctJuliaCoresetOn(optimcontrol, model_spec)) common$coreset <- TRUE
+  # `stochastic`, as on stan: TRUE runs the sgd phase (`_ctsem_sgd`) before
+  # L-BFGS, 'auto' runs it above 50 parameters -- stan's own rule -- and FALSE,
+  # the julia default, does not. Only on a stage that starts away from the
+  # optimum: not a stage resumed after certification (`resumed`), the prior
+  # warm-up's fixed budget, or a profile point, which all start near one.
+  stochastic <- optimcontrol$stochastic
+  if (!is.null(stochastic) && !resumed && !isTRUE(progress_budget) &&
+      is.null(pin)) {
+    common$sgd <- if (identical(stochastic, "auto"))
+      length(as.numeric(start)) > 50L else isTRUE(stochastic)
+  }
+  # `saem`: SAEM before L-BFGS on a Laplace objective (`ctsem_saem`), on the
+  # same stages as `stochastic` and for the same reason. Its seed comes from
+  # R's generator, so `set.seed()` reproduces the fit at a given `cores`.
+  saem <- .ctJuliaSaemIterations(optimcontrol)
+  if (saem > 0L && !resumed && !isTRUE(progress_budget) &&
+      is.null(pin) && !is.null(model_spec$laplace) && !state_explicit) {
+    common$saem <- TRUE
+    common$saem_maxiter <- saem
+    common$saem_seed <- sample.int(.Machine$integer.max, 1L)
+    # 'laplace': each subject also takes f-SAEM's independence move from its
+    # conditional Laplace approximation (`_saem_independence_move!`).
+    if (!is.null(optimcontrol$saem_proposal)) {
+      proposal <- as.character(optimcontrol$saem_proposal)[1L]
+      if (!proposal %in% c("rw", "laplace")) {
+        stop("optimcontrol$saem_proposal must be 'rw' or 'laplace'.", call. = FALSE)
+      }
+      common$saem_proposal <- proposal
+    }
+  }
+  # A stage resumed after a certification found the point short of a maximum
+  # (`.ctBackendCorrectResult()`) may stop on progress alone, once a window
+  # gains nothing the certification could use. Every other rule is the first
+  # stage's. See `CTSEMStallWatch` in the engine.
+  if (isTRUE(resumed)) common$stall_alone <- TRUE
+  # `cores` is the ceiling the subject loop runs at, and the fit records it.
+  # Restored afterwards so the session does not carry this fit's ceiling into
+  # the next thing that runs.
+  # `pin` holds coordinates still while the rest of the model re-optimises
+  # around them -- `list(index = , value = )`, or NULL for an ordinary stage.
+  # See `ctsem_pin` in the engine for why that is not the same as resuming from
+  # a displaced point, and `.ctBackendStallEscape()` for what uses it.
+  #
+  # `pin` is also this function's own top-level argument, for a caller that
+  # wants every stage pinned -- `ctFitProfile()` fixes one coordinate at a
+  # profile point and needs the batching, the metric and the stall escapes the
+  # fit itself gets around it, not a bare call to the engine's optimiser.
+  # `default_pin` carries that value in rather than writing `pin = pin` below:
+  # a formal argument cannot default to a same-named enclosing variable of the
+  # same name without evaluating itself, which raises "promise already under
+  # evaluation". Every internal call below that does not name its own `pin`
+  # -- the first stage and an ordinary resume alike -- inherits it this way.
+  default_pin <- pin
+  # A curvature the caller already holds near `start`, as L-BFGS's initial
+  # inverse Hessian (`_ctsem_lbfgs`'s `inverse`): a fit's covariance, for a
+  # refit to part of its data (ctLOO's folds). Sent only when there is one:
+  # the keywords are part of the call's type, and an always-present
+  # `lbfgs_inverse = nothing` made every fit's call differ from the ones the
+  # package image recorded (tools/generate-precompile-shapes.R), so every
+  # first fit compiled the optimiser's entry again.
+  if (!is.null(inverse)) {
+    inverse <- as.matrix(inverse)
+    storage.mode(inverse) <- "double"
+    common$lbfgs_inverse <- inverse
+  }
+  # A Hessian the caller holds at `hessian_at` (of the maximised objective),
+  # for the finish to walk on where Hessians are dear rather than form one
+  # again: the certification's, for the stage it resumes. Sent only when there
+  # is one, for the reason above.
+  if (!is.null(hessian) && !is.null(hessian_at)) {
+    hessian <- as.matrix(hessian)
+    storage.mode(hessian) <- "double"
+    common$newton_hessian <- hessian
+    common$newton_hessian_at <- .ctJuliaVector(as.numeric(hessian_at))
+  }
+  # `walked`: a stage on an objective the caller is about to change again (the
+  # smoothing passes in `.ctJuliaOptimiseFit()`) ends where its finish's walk
+  # ends, with the matrix the walk stepped on as `newton_walked`, and is not
+  # certified: the exact Hessian and the certification are for the stage
+  # after the changes settle. `walked = 'dear'` does so only where the walk
+  # was on the Krylov model, the exact Hessian being dear, and certifies
+  # elsewhere (the first stage of a fit with smoothing parameters to
+  # estimate). Sent only when asked, for the reason above.
+  if (isTRUE(walked)) common$newton_final <- "walked"
+  if (identical(walked, "dear")) common$newton_final <- "dear"
+  # The last run's local curvature (`lbfgs_local`): its inverse, kept here
+  # rather than on the result, where a fit would carry its n x n matrix, and
+  # its builds, for a resume to start from (`local`).
+  local_inverse <- NULL
+  optimise_once <- function(from, pin = default_pin,
+      resumed = FALSE, endgame = NULL, local = NULL) {
+    args <- common
+    if (!is.null(local)) {
+      if (is.matrix(local$inverse) && nrow(local$inverse) == length(from) &&
+          is.null(args$lbfgs_inverse)) {
+        args$lbfgs_inverse <- local$inverse
+      }
+      args$local_builds_carried <- as.integer(local$builds)
+    }
+    # A resumed stage (`.ctBackendCorrectResult()`): on the full data -- it
+    # starts where the full objective already brought the fit, so a first
+    # batch of a few units only walks it away again (on the SNSF pilot, 493
+    # units, every resume began at the 20-unit batch, its log posterior back
+    # at -271148 from -386462) -- with its stall watch left to stop it on
+    # progress alone once it stops gaining; and on
+    # the curvature the verdict was reached on, where there is one: its
+    # covariance as L-BFGS's first metric and the Hessian for the finish to
+    # walk on where Hessians are dear. Every other rule is the first stage's.
+    if (resumed) {
+      args$batch <- FALSE
+      args$stall_alone <- TRUE
+    }
+    if (!is.null(endgame)) {
+      inverse <- .ctBackendResumeInverse(endgame)
+      if (!is.null(inverse)) {
+        storage.mode(inverse) <- "double"
+        args$lbfgs_inverse <- inverse
+      }
+      if (is.matrix(endgame$hessian) && length(endgame$evaluated_at)) {
+        hessian <- endgame$hessian
+        storage.mode(hessian) <- "double"
+        args$newton_hessian <- hessian
+        args$newton_hessian_at <- .ctJuliaVector(as.numeric(endgame$evaluated_at))
+      }
+    }
+    held <- !is.null(pin) && length(pin$index)
+    target <- objective
+    if (held) {
+      target <- module$ctsem_pin(objective,
+        .ctJuliaVector(as.integer(pin$index)),
+        .ctJuliaNumericVector(as.numeric(pin$value)))
+    }
+    out <- .ctBackendWithMaxChunks(cores, {
+      # A pinned objective is a wrapper and not a `CTSEMLaplaceObjective`, so
+      # it goes through the generic entry point. Nothing is lost by that:
+      # `ctsem_laplace_optimize` only picks the gradient method before handing
+      # over, and the wrapper forwards every route-specific method -- including
+      # the trial predicate that refuses a point whose inner Newton did not
+      # converge.
+      if (!is.null(model_spec$laplace) && !held) {
+        # `gradient` selects how the *process* likelihood's gradient is taken
+        # and does not apply here: the Laplace objective's gradient is a forward
+        # sweep over that reverse pass regardless.
+        .ctJuliaGet(do.call(module$ctsem_laplace_optimize,
+          c(list(target, .ctJuliaNumericVector(from)), args)))
+      } else {
+        .ctJuliaGet(do.call(module$ctsem_optimize,
+          c(list(target, .ctJuliaNumericVector(from)), args,
+            list(gradient_method = gradient))))
+      }
+    })
+    # The pinned entries are restored rather than trusted. They cannot move in
+    # exact arithmetic -- their gradient is zero and so is their contribution
+    # to every secant pair -- but that is a different claim from having
+    # verified they did not, and everything downstream reads `minimizer` as the
+    # point the objective was evaluated at.
+    if (held) {
+      values <- as.numeric(out$minimizer)
+      keep <- as.integer(pin$index)
+      inside <- keep >= 1L & keep <= length(values)
+      values[keep[inside]] <- as.numeric(pin$value)[inside]
+      out$minimizer <- values
+    }
+    inverse <- out[["local_inverse"]]
+    out[["local_inverse"]] <- NULL
+    if (is.matrix(inverse) && nrow(inverse) == length(from)) {
+      storage.mode(inverse) <- "double"
+      local_inverse <<- inverse
+    }
+    out
+  }
+  result <- optimise_once(start)
+  # The two early phases belong to the first stage, which is the one that
+  # starts away from the optimum. An escape below resumes from a pulled-back
+  # point beside it, so neither runs again there -- and SAEM's record is the
+  # first stage's, kept for the result whichever run the loop keeps.
+  common$sgd <- NULL
+  common$saem <- NULL
+  common$saem_maxiter <- NULL
+  common$saem_seed <- NULL
+  common$saem_proposal <- NULL
+  saem_record <- lapply(stats::setNames(nm = c("saem_iterations", "saem_settled",
+    "saem_trend", "saem_chains", "saem_acceptance", "saem_trace")),
+    function(nm) result[[nm]])
+  # A run that reached its cap with the estimate still moving: the point the
+  # optimiser continued from is short of where SAEM was going.
+  if (isTRUE(saem_record$saem_iterations > 0) && !isTRUE(saem_record$saem_settled)) {
+    message("SAEM had not settled after ", saem_record$saem_iterations,
+      " iterations; a larger optimcontrol$saem may help.")
+  }
+  # Modes a run puts in the objective (`spec$laplace$known`, the inner solve's
+  # further starts: `_laplace_known_modes` in the engine), so every objective
+  # built for the fit afterwards reaches them. The engine takes most of them
+  # within the run and carries on (`found_mode_*`; `ctsem_optimize`): a
+  # jump's, and a search's where L-BFGS stopped and where the finish ended.
+  # The run is resumed from where it ended here only on what it could not
+  # take itself:
+  # - where it still ended on a jump (`stop_reason == "jump"`: a unit's term
+  #   moved with where its inner solve stopped, at no optimum of anything
+  #   continuous), the modes the watch saw, where they are new. Where the
+  #   solve reached a unit's better mode only at isolated points, that mode
+  #   kept as a start makes its term continuous there: on the affect pilot
+  #   (v3_sub40ns, step 11 of its finish) the objective then moved as its
+  #   gradient said, where every step had lost a person's 3.85 nats
+  #   (`scripts/pilot-curvature-2026-10/known_modes.R`);
+  # - from the engine's closing search, after the probe
+  #   (`_ctsem_anchor_finish!`): modes the anchored run reached that a search
+  #   from the origin misses, kept; and maxima it found that the run missed,
+  #   which resume the run where the engine says they move the objective
+  #   enough (`anchor_missed_resume`, its `_CTSEM_MODE_RESUME_TOL`).
+  # Up to `.ctJuliaKnownRounds` resumes, a unit named again included: its
+  # maxima are combined (`_laplace_mode_sum`), each fading out before the
+  # solve can lose it, and the modes a repeated jump saw are further starts
+  # like any other.
+  rounds <- 0L
+  local_builds <- 0L
+  while (!state_explicit && !is.null(model_spec$laplace)) {
+    known <- model_spec$laplace$known
+    found <- .ctJuliaKnownAdd(known, result[["found_mode_units"]],
+      result[["found_mode_values"]])
+    if (!is.null(found)) known <- found
+    jumpknown <- .ctJuliaKnownModes(known, result)
+    if (!is.null(jumpknown)) known <- jumpknown
+    kept <- .ctJuliaKnownAdd(known, result$anchor_kept_units,
+      result$anchor_kept_values)
+    if (!is.null(kept)) known <- kept
+    missed <- .ctJuliaKnownAdd(known, result$anchor_missed_units,
+      result$anchor_missed_values)
+    if (!is.null(missed)) known <- missed
+    gain <- as.numeric(.ctJuliaOr(result$anchor_missed_gain, 0))[1L]
+    resume <- !is.null(jumpknown) ||
+      (!is.null(missed) && isTRUE(result$anchor_missed_resume))
+    if (!identical(known, model_spec$laplace$known)) {
+      model_spec$laplace$known <- known
+      spec <- structure(model_spec, class = c("ctJuliaModel", "ctFitModel"))
+      objective <- .ctJuliaObjective(spec, hybrid = TRUE)
+    }
+    if (!resume || rounds >= .ctJuliaKnownRounds) break
+    if (!is.null(jumpknown)) {
+      named <- .ctJuliaJumpNamed(result)
+      message(sprintf(paste0("Laplace: the objective jumped at %s %s (its term ",
+        "moved with where the inner solve stopped); its modes there are kept as ",
+        "starts and the fit goes on."), if (length(named) == 1L) "unit" else "units",
+        paste(named, collapse = ", ")))
+    } else {
+      n <- length(unique(as.integer(result$anchor_missed_units)))
+      message(sprintf(paste0("Laplace: a search at the end found other maxima for ",
+        "%d %s, moving the objective by %+.3g; they are kept as starts and the ",
+        "fit goes on."), n, if (n == 1L) "unit" else "units", gain))
+    }
+    rounds <- rounds + 1L
+    # From the run's local curvature, not built again (`local_builds_carried`):
+    # each run reports its own builds.
+    local_builds <- local_builds + as.integer(.ctJuliaOr(result$local_builds, 0L))[1L]
+    local <- list(inverse = local_inverse, builds = local_builds)
+    result <- .ctJuliaAddRunCounts(optimise_once(as.numeric(result$minimizer),
+      resumed = TRUE, local = local), result)
+  }
+  # A run still ended on a jump stops there, at no maximum of anything
+  # continuous, so it is not certified; the fit warns and leaves integrating
+  # the named units to the user (`intoverpop = 'quadrature'`, which flags
+  # them through `fit$laplace$jump` and starts from the modes the watch saw,
+  # kept as the specification's known modes: `.ctLaplaceContinue()`), as it
+  # leaves a flagged check. `jumprecord`, since `$jump` on an engine result would match
+  # its `jump_units`.
+  if (.ctJuliaJumped(result)) {
+    named <- .ctJuliaJumpNamed(result)
+    result$jumprecord <- list(units = named,
+      iterations = as.integer(.ctJuliaOr(result$iterations, NA_integer_))[1L])
+    message(sprintf(paste0("Laplace: the objective jumped at %s %s (its term moved ",
+      "with where the inner solve stopped) after %d %s with modes kept; the fit ",
+      "stops there."), if (length(named) == 1L) "unit" else "units",
+      paste(named, collapse = ", "), rounds, if (rounds == 1L) "resume" else "resumes"))
+  }
+  # A fit that stopped short is tried again under one budget
+  # (`.ctBackendCorrectResult()`, `optimcontrol$stallretries`): from the
+  # better point its probe measured, or from where it stopped when the
+  # certification finds it short, each stage kept only if it came out ahead.
+  # The certification's record rides on the result (`retry`) for the fit to
+  # read. A profile point and the warm-up do not certify (`certify = FALSE`),
+  # and the state-explicit route is never escaped from: its joint mode is
+  # degenerate, so a pullback can nearly always find something
+  # (`.ctBackendStallEscape()`).
+  #
+  # Pin, re-optimise, then release (`optimcontrol$escapepin`): hold the
+  # coordinates an escape moved at their displaced values while the rest of
+  # the model accommodates them, and only then let go. Off by default,
+  # because it was measured and it is worse. From a drift raw of 8 inside its
+  # own flat transform: -2950.5929 pinned against -2939.0339 free, both
+  # converged. The point an escape resumes from is already a *measured*
+  # improvement -- the pullback probe found it by evaluating there -- so the
+  # free resume starts somewhere good and gets the rest of the way on its
+  # own. Pinning adds a constraint that is not needed, and the rest of the
+  # model settles into a configuration adapted to the held value that
+  # releasing does not undo. Kept reachable so the measurement can be
+  # repeated, and because the same primitive under `ctProfile()` is what a
+  # profile point is -- see `ctsem_pin` in the engine. Nor is an escape
+  # damped: holding the freed coordinate back with the metric was measured
+  # and it breaks the escape (-3721.05 against -2950.59 on one fit), since
+  # after zeroing it the refit needs that coordinate to *travel*.
+  stage <- function(from, endgame = NULL) {
+    coordinates <- attr(from, "coordinates")
+    from <- as.numeric(from)
+    if (isTRUE(optimcontrol$escapepin) && length(coordinates)) {
+      inside <- coordinates >= 1L & coordinates <= length(from)
+      coordinates <- coordinates[inside]
+      # Merged with `default_pin` rather than replacing it: a profile point's
+      # fixed coordinate must stay fixed through an escape too.
+      escape_pin <- list(
+        index = c(if (length(default_pin$index)) as.integer(default_pin$index),
+          coordinates),
+        value = c(if (length(default_pin$index)) as.numeric(default_pin$value),
+          from[coordinates]))
+      staged <- optimise_once(from, pin = escape_pin, resumed = TRUE)
+      return(.ctJuliaAddRunCounts(optimise_once(as.numeric(staged$minimizer),
+        resumed = TRUE, endgame = endgame), staged))
+    }
+    optimise_once(from, resumed = TRUE, endgame = endgame)
+  }
+  # Not for a run that ended on a jump: its point is on no continuous
+  # objective, so a certification there has nothing to judge, and a resume
+  # from it meets the same jump.
+  if (is.null(result[["jumprecord"]])) {
+    retried <- .ctBackendCorrectResult(result, model_spec,
+      npar = length(as.numeric(start)),
+      tolerance = .ctBackendConvergeTol(optimcontrol),
+      maxtries = .ctJuliaOr(optimcontrol$stallretries, 2L), gradient = gradient,
+      optimise = stage,
+      escape = function(r) .ctBackendStallEscape(r, optimcontrol, model_spec,
+        verbose, escapes = !state_explicit),
+      certify = isTRUE(common$certify) && !isTRUE(walked) &&
+        is.null(.ctJuliaWalkedHessian(result)), verbose = verbose)
+    result <- retried$result
+    result$stall_escapes <- retried$escapes
+    # The work of every stage the loop did not keep, added to the kept stage's
+    # counts after it (`.ctJuliaAddRunCounts()`), and the certification's
+    # record for the fit.
+    result <- .ctJuliaAddRunCounts(result, retried$totals - .ctJuliaRunCounts(result))
+    result$retry <- retried[setdiff(names(retried), c("result", "escapes", "totals"))]
+    result$retry$totals <- .ctJuliaRunCounts(result)
+  } else {
+    result$stall_escapes <- 0L
+  }
+  for (nm in names(saem_record)) result[nm] <- list(saem_record[[nm]])
+  # The modes kept at jumps, for the fit's specification: every objective
+  # built from it afterwards (certification, curvature, uncertainty, a stored
+  # fit in a later session) is then the one this run optimised.
+  result$laplace_known <- model_spec$laplace$known
+  if (!is.null(failure)) {
+    warning("The progress callback failed and was disabled after the first ",
+      "error; the fit itself is unaffected. The error was: ", failure,
+      call. = FALSE)
+  }
+  result
+}
+
+# What a fit records about a Laplace objective's inner solve.
+#
+# Both routes that build a `ctJuliaFit` need this and it is the same block for
+# each: the spec half (`nrandom`, `param`, `nlevels`, `levels`) describes the
+# model, and the run half (`linesearch`, `inner_converged`, ...) describes the
+# optimisation that produced the reported point -- which the sampled route also
+# has, because sampling begins by optimising to place the sampler and build its
+# metric.
+#
+# The inner solve is part of the objective, so its status is part of whether the
+# fit means anything: a subject whose mode did not converge contributes a term
+# that is not the integral it is supposed to approximate. Kept on the fit rather
+# than printed and discarded, and now kept there whichever route built the fit.
+#' @keywords internal
+.ctJuliaFitLaplaceBlock <- function(model_spec, result) {
+  if (is.null(model_spec$laplace)) return(NULL)
+  list(
+    nrandom = model_spec$laplace$nrandom,
+    param = model_spec$laplace$param,
+    nlevels = model_spec$laplace$nlevels,
+    levels = lapply(model_spec$laplace$levels, function(x)
+      list(name = x$name, param = x$param, nrandom = x$nrandom,
+        ngroups = x$ngroups)),
+    linesearch = if (is.null(result$linesearch)) NA_character_ else
+      as.character(result$linesearch),
+    # What the modes were actually solved with, which is not recoverable from
+    # `args$optimcontrol` alone: an unset name there means the engine default,
+    # and the engine default has changed once already.
+    inner_maxiter = .ctJuliaOr(model_spec$laplace$inner$inner_maxiter, 200L),
+    inner_tol = .ctJuliaOr(model_spec$laplace$inner$inner_tol, 1e-10),
+    # The soft-direction rule the objective was built with; post-fit routes
+    # rebuild the objective from the same specification, so they use it too.
+    soft_directions = .ctJuliaSoftDirections(model_spec$laplace$inner),
+    # The units whose Laplace terms jumped, with the points the line search
+    # saw, where the run ended on a jump; NULL otherwise. `[[`: the engine's
+    # `jump_units` is a prefix `$jump` would match.
+    jump = result[["jumprecord"]],
+    # The modes the run ended with, which every later reader of the fit holds
+    # (R/ctJuliaFitModes.R).
+    modes = .ctJuliaResultModes(result),
+    soft_quadrature_units = if (is.null(result$soft_quadrature_units)) NA_integer_
+      else as.integer(result$soft_quadrature_units),
+    inner_converged = isTRUE(result$inner_converged),
+    gradient_fallbacks = if (is.null(result$gradient_fallbacks)) NA_integer_ else
+      as.integer(result$gradient_fallbacks)[1L],
+    inner_iterations = as.integer(result$inner_iterations),
+    # Two different things. `hessian_repaired` is true if *any* Newton iterate
+    # for that unit needed its curvature shifted, which is ordinary behaviour
+    # for a nonlinear model on the way to a mode. `mode_repaired` is true if
+    # the curvature at the reported mode needed it, which is the one that says
+    # the approximation there is questionable.
+    hessian_repaired = as.logical(result$hessian_repaired),
+    mode_repaired = if (is.null(result$mode_repaired)) NA
+      else as.logical(result$mode_repaired),
+    conditioning = .ctJuliaLaplaceConditioning(result$unit_min_eigenvalue))
+}
+
+# How each unit's inner curvature stands against the prior's, at the estimate.
+# An eigenvalue below one is a direction where the likelihood has gone convex
+# in the random effects; mildly is harmless, but near zero the Laplace term
+# over-credits that unit by several nats and nothing else shows it. `Inf` is a
+# unit whose every eigenvalue exceeds one (not computed), `NaN` one whose
+# curvature is not finite. See ctsem_laplace_conditioning in the engine.
+#' @keywords internal
+.ctJuliaLaplaceConditioning <- function(mins) {
+  if (is.null(mins)) return(NULL)
+  mins <- as.numeric(mins)
+  list(min_eigenvalue = mins,
+    below_one = sum(is.nan(mins) | mins < 1),
+    near_singular = sum(!is.nan(mins) & mins < 0.05))
+}
+
+.ctFitJuliaBackend <- function(datalong, model, prepared_data = NULL, inits = NULL, cores = 1L,
+  optimcontrol = list(), verbose = 0L, fit = TRUE,
+  priors = FALSE, priorscope = NULL,
+  intoverpop = "augmented", optimize = TRUE, chains = 4L,
+  iter = 2000L, control = list(), intoverstates = TRUE, forcerecompile = FALSE,
+  weights = NULL, exactmarginal = FALSE) {
+  .ctJuliaInterruptSafe(.ctFitJuliaBackendImpl(datalong = datalong,
+    model = model, prepared_data = prepared_data, inits = inits, cores = cores,
+    optimcontrol = optimcontrol,
+    verbose = verbose, fit = fit, priors = priors, priorscope = priorscope,
+    intoverpop = intoverpop,
+    optimize = optimize, chains = chains, iter = iter, control = control,
+    intoverstates = intoverstates, forcerecompile = forcerecompile,
+    weights = weights, exactmarginal = exactmarginal))
+}
+
+#' @keywords internal
+.ctFitJuliaBackendImpl <- function(datalong, model, prepared_data = NULL,
+  inits = NULL, cores = 1L,
+  optimcontrol = list(), verbose = 0L, fit = TRUE,
+  priors = FALSE, priorscope = NULL,
+  intoverpop = "augmented", optimize = TRUE, chains = 4L,
+  iter = 2000L, control = list(), intoverstates = TRUE, forcerecompile = FALSE,
+  weights = NULL, exactmarginal = FALSE) {
+  # The engine environment and a session restart are ctJuliaSetup()'s own
+  # `project` and `force = TRUE`; the per-fit copies of both were a second
+  # spelling of an exported function, so a fit uses whatever session is set up.
+  # `cores` splits the engine's subject loop. It is requested as a Julia thread
+  # count before the session starts (which is the only time that can be set),
+  # and capped per fit afterwards, so a session started with more threads is not
+  # forced to use them all. A session started with fewer cannot be widened, and
+  # `.ctBackendResolveThreads()` says so rather than running serially in silence.
+  requested <- cores
+  cores <- suppressWarnings(as.integer(cores)[1L])
+  if (is.na(cores)) {
+    # Silently falling back to one core is how `cores='maxneeded'` went
+    # unnoticed: a fit that should have used the machine used a single thread
+    # and said nothing. ctFit() resolves that keyword now, so anything still
+    # arriving unparseable here is a caller mistake worth hearing about.
+    warning("cores=", deparse(requested)[1L], " is not a number of cores; ",
+      "using 1. Pass an integer.", call. = FALSE)
+    cores <- 1L
+  }
+  cores <- max(1L, cores)
+  # Requested as a Julia thread count while that is still possible, and said
+  # out loud when it is not: a session already running at fewer threads than
+  # `cores` caps the subject loop at its own count, and used to do so silently.
+  # Before `.ctJuliaPrepare()` deliberately -- the opt-in restart ends the
+  # process, and nothing prepared here may be alive across that.
+  .ctBackendResolveThreads(cores, report = isTRUE(fit))
+  # Resolved, and refused by name where it cannot apply, before anything is
+  # prepared or fitted (`.ctLaplaceCorrectResolve()`).
+  correctlaplace <- .ctLaplaceCorrectResolve(optimcontrol, intoverpop = intoverpop,
+    optimize = optimize, intoverstates = intoverstates)
+  .ctJuliaSaemIterations(optimcontrol, intoverpop = intoverpop,
+    intoverstates = intoverstates)
+  gradient <- .ctJuliaOr(optimcontrol$gradient, "adjoint")
+  if (!gradient %in% c("forward", "adjoint")) stop("gradient must be 'forward' or 'adjoint'", call. = FALSE)
+  # 'adjoint' selects the Julia engine's reverse-mode gradient. Its cost is
+  # independent of the free-parameter count (one traced forward sweep plus one
+  # reverse sweep per subject), where 'forward' (ForwardDiff) costs one dual
+  # pass per chunk of parameters. Measured on one gradient evaluation, 20
+  # subjects x 5 waves, default ctsem parameterisation:
+  #
+  #   latents  free pars   forward     adjoint
+  #        2         23    0.009 s     0.006 s
+  #        6        153    0.062 s     0.019 s
+  #       20       1490   39.1   s     0.168 s
+  #
+  # 'adjoint' is faster at every size measured, and the margin grows without
+  # bound with the parameter count, which is why it is the default; 'forward'
+  # stays available by name for anyone who wants ForwardDiff specifically. No
+  # silent fallback between them in either direction.
+  # Missing TI predictor values: an optimisation imputes them unless asked to
+  # estimate them, and so does the optimisation that places a sampler, whose
+  # sample then makes them parameters (`.ctBackendUncertaintySample()`).
+  # `[[`, not `$`: `$` would read `tipredMissingIncludeOutcome` when this is
+  # absent.
+  tipredMissing <- .ctJuliaTIMissingRequest(optimcontrol[["tipredMissing"]])
+  model_spec <- .ctJuliaPrepare(datalong, model, prepared_data = prepared_data,
+    priors = priors, priorscope = priorscope, intoverpop = intoverpop,
+    tipredMissing = if (isTRUE(optimize) && identical(tipredMissing, "sample"))
+      "sample" else "impute",
+    tipredMissingIncludeOutcome = .ctJuliaOr(optimcontrol$tipredMissingIncludeOutcome, TRUE),
+    laplacecontrol = list(inner_maxiter = optimcontrol$laplace_inner_maxiter,
+      inner_tol = optimcontrol$laplace_inner_tol,
+      saem = .ctJuliaSaemIterations(optimcontrol) > 0L,
+      # The default is resolved here, at the one place a *new* fit is
+      # specified, and only for the routes that have a Laplace term: every
+      # rebuild of an existing specification passes its own `inner` instead,
+      # where an absent floor means the 'total' it was fitted under. 'none'
+      # is one of them: it samples the random effects, but places the sampler
+      # and builds its metric by optimising the Laplace objective of this same
+      # specification.
+      soft_directions = if (as.character(intoverpop)[1L] %in% c("laplace", "none"))
+        .ctJuliaOr(optimcontrol$laplace_soft_directions, .ctJuliaSoftDirectionsDefault)
+        else optimcontrol$laplace_soft_directions))
+  model_spec$tipredMissing <- tipredMissing
+  # 'auto' samples the random effects under optimize = FALSE ('none'), but
+  # where the Laplace term is exact -- every unit's integrand Gaussian in its
+  # effects (`laplace$quadratic`) -- the marginal it integrates is the exact
+  # posterior's, so that is sampled, as `ctFitUncertainty()` samples such a fit
+  # (`.ctBackendSampleRoute()`): `npar` dimensions in place of every subject's
+  # effects. 'none' prepares exactly as 'laplace', so only the route changes,
+  # and ctFit() records it from here.
+  if (isTRUE(exactmarginal) && identical(as.character(intoverpop)[1L], "none") &&
+      isTRUE(model_spec$laplace$quadratic)) {
+    intoverpop <- "laplace"
+    model_spec$intoverpop <- "laplace"
+  }
+  # Sampling weights, one per subject in the specification's order and
+  # normalised (R/ctWeights.R); every objective built from the spec takes them.
+  model_spec$subject_weights <- .ctResolveSubjectWeights(model_spec, weights, datalong)
+  # On the spec, so every objective built from it -- this fit's, a saved fit's
+  # prediction, a sampling worker's -- compiles or interprets alike. Set only
+  # when asked, so every other spec hashes as it did.
+  if (isTRUE(forcerecompile)) model_spec$compiletransforms <- TRUE
+  .ctJuliaTIMissingCheck(model_spec)
+  .ctJuliaTIMissingWarn(model_spec, optimize = optimize,
+    sampled = if (isTRUE(optimize)) identical(tipredMissing, "sample") else
+      .ctJuliaTIMissingSamples(model_spec))
+  if (!fit) return(structure(model_spec, class = c("ctJuliaModel", "ctFitModel")))
+
+  # Forward-mode gradients for explosive subjects, when asked for: a session
+  # setting in the engine (`_CTSEM_ADJOINT_GROWTH`), so put back on the way out.
+  # Off by default because the first subject to take it compiles the filter
+  # again; see there.
+  if (isTRUE(optimcontrol$explosive_forward)) {
+    previous <- .ctJuliaEval("ContinuousTimeSEM._CTSEM_ADJOINT_GROWTH[]")
+    .ctJuliaEval(paste0("ContinuousTimeSEM.ctsem_set_adjoint_growth!(",
+      "ContinuousTimeSEM._CTSEM_EXPLOSIVE_GROWTH[])"))
+    on.exit(try(.ctJuliaCall("ContinuousTimeSEM.ctsem_set_adjoint_growth!",
+      as.numeric(previous), .defer = TRUE), silent = TRUE), add = TRUE)
+  }
+
+  # `optimize=FALSE` fits by sampling. Which sampler is decided by
+  # `intoverpop`, which says what has already been integrated out; see
+  # `.ctJuliaSampleFit`.
+  if (!isTRUE(optimize)) {
+    return(.ctJuliaSampleFit(model_spec, datalong = datalong, model = model,
+      prepared_data = prepared_data, inits = inits, cores = cores,
+      optimcontrol = optimcontrol, chains = chains, iter = iter,
+      control = control, priors = priors, priorscope = priorscope,
+      intoverpop = intoverpop,
+      gradient = gradient, verbose = verbose,
+      intoverstates = intoverstates))
+  }
+  return(.ctJuliaOptimiseFit(model_spec = model_spec, datalong = datalong,
+    model = model, prepared_data = prepared_data, inits = inits, cores = cores,
+    optimcontrol = optimcontrol, verbose = verbose, priors = priors,
+    priorscope = priorscope, intoverpop = intoverpop, intoverstates = intoverstates,
+    gradient = gradient, correctlaplace = correctlaplace))
+}
+
+# The matrix a `walked` stage's finish last stepped on (the engine's
+# `newton_walked`, of the maximised objective, at the stage's `minimizer`),
+# or NULL where the stage left none: no finish ran, or it ran without a walk.
+# An approximation of the Hessian there, never the certification's.
+#' @keywords internal
+.ctJuliaWalkedHessian <- function(result) {
+  walked <- result[["newton_walked"]]
+  n <- length(as.numeric(result$minimizer))
+  if (is.null(walked)) return(NULL)
+  walked <- as.matrix(walked)
+  if (!identical(dim(walked), c(n, n)) || !all(is.finite(walked))) return(NULL)
+  (walked + t(walked)) / 2
+}
+
+# The most iterations the prior warm-up (`optimcontrol$carefulfit`) takes by
+# default; it stops by L-BFGS's own rule before that on most models (median 30
+# on the bench, at most 115 on the ctsem book's trend models). Why it runs to
+# convergence is beside `careful` in `.ctJuliaOptimiseFit()`.
+.ctJuliaWarmCap <- 200L
+
+# The optimising route's whole pipeline, from the starting values through the
+# certified estimate, its Hessian and the Laplace correction -- everything
+# `ctFit(backend = 'julia', optimize = TRUE)` does after `model_spec` is
+# prepared. Extracted so the sampler's placement (`.ctJuliaSampleFit()`,
+# R/ctBackendSample.R) can run the *same* pipeline rather than a bare
+# `.ctJuliaOptimise()` call: one fit constructor for both routes, per
+# review/OPTIM-consolidation-plan-2026-09-25.md P5. `intoverstates` here is
+# always TRUE for a placement call -- optimising the joint state density is
+# degenerate (state-explicit-generation.md) -- and `correctlaplace` is always
+# FALSE there, because under `intoverpop = 'laplace'` the fit only places the
+# chains, from its own optimum and curvature, and the quadrature-corrected
+# point answers a question the placement is not asking.
+#' @keywords internal
+.ctJuliaOptimiseFit <- function(model_spec, datalong, model, prepared_data,
+  inits, cores, optimcontrol, verbose, priors, priorscope, intoverpop,
+  intoverstates, gradient, correctlaplace) {
+  npar <- .ctBackendNpar(model_spec)
+  # A fully fixed model has nothing to maximise over. Without the zero above,
+  # `max` warned and returned -Inf, and `rnorm(-Inf, ...)` then failed with
+  # "invalid arguments", which says nothing about the model. Refused rather
+  # than run: a zero-length start would put the engine's L-BFGS on a
+  # zero-dimensional problem, which nothing here tests. Evaluating a fixed
+  # model's likelihood is a fair thing to want, and `fit = FALSE` still
+  # returns the prepared model to evaluate.
+  if (npar < 1L) {
+    stop("This model has no free parameters, so there is nothing to optimise. ",
+      "Free a parameter, or use fit = FALSE to prepare the model without ",
+      "fitting it.", call. = FALSE)
+  }
+  # A checkpoint from an earlier run of this fit is its start, and its modes
+  # the opening search's further starts (`.ctJuliaCheckpoint()`).
+  checkpoint <- .ctJuliaCheckpoint(optimcontrol, model_spec, npar, intoverstates)
+  if (!is.null(checkpoint$start)) inits <- checkpoint$start
+  # The smoothing parameters the checkpoint's point was optimised at, which the
+  # fit goes on from rather than estimating them again from their start, and
+  # the exact Hessian it kept, for the first stage's finish to walk on where
+  # the objective is the one it was formed on.
+  lambda <- as.numeric(checkpoint$state$lambda)
+  if (!is.null(model_spec$penalty) && length(lambda) &&
+      length(lambda) == nrow(model_spec$penalty) && all(is.finite(lambda)) &&
+      all(lambda > 0)) {
+    model_spec$penalty$lambda <- lambda
+  }
+  if (!is.null(checkpoint$hessian) &&
+      !identical(.ctJuliaCheckpointState(model_spec), checkpoint$state)) {
+    checkpoint$hessian <- checkpoint$hessian_at <- checkpoint$hessian_id <- NULL
+  }
+  start <- .ctJuliaInitialValues(npar, inits,
+    initsd = .ctJuliaOr(optimcontrol$initsd, .01), spec = model_spec)
+  # Starting values read off the data, for the diagonals whose defaults are
+  # guesses about the data's scale. See R/ctDataStart.R for what is derived and
+  # why; `optimcontrol$datastart = FALSE` restores the fixed start. Supplied
+  # `inits` are never overridden -- a starting value the caller chose is the
+  # one thing here that is not a guess.
+  datastart <- .ctJuliaOr(optimcontrol$datastart, TRUE)
+  # And a start the caller chose is not batched from, unless
+  # `optimcontrol$batch = TRUE` asks for it. Batching is a device for starting
+  # cold, as the prior warm-up below is (and it is skipped for the same
+  # reason); from a point already chosen -- often where an earlier fit stopped
+  # -- its subset gradients only walk off it. On the SNSF pilot's joint fit,
+  # four batch iterations from its iteration-598 point (log posterior
+  # -1,464,550.02, |g| 1.65) ended 181 below it with |g| 2,514. Only the runs
+  # from `start` take this; random restarts start cold and batch as usual.
+  startcontrol <- .ctJuliaStartControl(optimcontrol, inits)
+  if (isTRUE(datastart) && is.null(inits) && !is.null(datalong)) {
+    derived <- try(.ctDataStart(datalong, model, model_spec, npar), silent = TRUE)
+    if (!inherits(derived, "try-error") && !is.null(derived)) {
+      use <- is.finite(derived)
+      # Exactly, not jittered: where the data decided the value, two runs of
+      # the same fit should start in the same place.
+      candidate <- start
+      candidate[use] <- derived[use]
+      # And only where the optimiser can start from it, which the default
+      # start may allow where a derived one does not (`.ctDataStartUsable()`).
+      # On the state-explicit target the objective is another, built below,
+      # and the start is taken as derived.
+      if (!isTRUE(intoverstates) ||
+          .ctDataStartUsable(model_spec, candidate, gradient, cores)) {
+        start <- candidate
+        if (verbose > 0) message("Starting values derived from the data for ",
+          sum(use), " of ", npar, " parameters.")
+      } else {
+        message("The objective cannot be evaluated at the starting values ",
+          "derived from the data; starting from the default values.")
+      }
+    }
+  }
+  # The state-explicit target, when asked for: the same optimiser over a longer
+  # vector. The innovations start at zero, which is both their prior mode and
+  # the trajectory the parameters alone imply -- there is nothing better to
+  # start them at and nothing arbitrary about it.
+  jointobjective <- NULL
+  nstate <- 0L
+  if (!isTRUE(intoverstates)) {
+    jointobjective <- .ctJuliaJointObjective(model_spec, npar)
+    nstate <- .ctJuliaStateDimension(model_spec)
+    start <- c(start, numeric(nstate))
+  }
+  # The prior-warmed spec, or NULL when priors cannot be mapped onto this
+  # model's raw layout. `.ctBackendLaplacePriorSpec` refuses shapes it cannot
+  # map rather than mis-assigning priors across levels, so this is allowed to
+  # fail and simply leave the fit unwarmed.
+  #
+  # The warm-up has its own prior scope, N(0,1) on every raw coordinate -- the
+  # spec `priors = TRUE` builds -- whatever the fit's own priors are. It used
+  # to borrow the fit's: it ran only when `priors` was FALSE, which was right
+  # while the scopes were all or none, and while `priors = 'randomCorr'` was
+  # the julia default (4b2dbf05, 2026-09-22, to 2026-10-19) resolved to TRUE on
+  # every default fit, so the stage was skipped there while `$optim$carefulfit`
+  # reported that it ran. A prior on the random-effect correlations alone does
+  # nothing to place the rest of the vector, which is what this stage is for.
+  warmspec <- function() {
+    spec <- model_spec
+    spec$priors <- try(.ctJuliaFullPriorSpec(model_spec, prepared_data, npar),
+      silent = TRUE)
+    if (inherits(spec$priors, "try-error") || !length(spec$priors$index))
+      return(NULL)
+    spec
+  }
+  # `carefulfit`, the same argument `stanoptimis` takes and with the same
+  # meaning: a first pass with the priors on, to get starting values, when
+  # priors are otherwise off. It runs on every model by default, to the prior
+  # objective's own convergence, capped at `.ctJuliaWarmCap` (200)
+  # iterations; a number sets the cap, FALSE turns it off.
+  #
+  # What it buys is where the fit lands: the prior holds every coordinate near
+  # the middle of its transform while the rest of the vector finds its place,
+  # so the likelihood starts from a point no boundary has captured -- a
+  # correlation at one, an sd at zero, a drift at white noise. Its history:
+  #
+  # - Until 2026-11-08 the cap was 10 and the warm-up ran only where an
+  #   indicator was not Gaussian (Charles, 2026-09-27). Ten was set when the
+  #   first step was a full unit alpha and the transform metric was on, on a
+  #   simulation study where a cap of 20 left a mixed-indicator model at a
+  #   random-effect sd of 8 (truth 0.5) that 10 removed. That study at today's
+  #   optimiser (dev/simstudies/simstudy-carefulfit.R with caps 0, 10 and 200:
+  #   one latent, random CINT, 60 subjects x 10 occasions, four indicator
+  #   kinds, both routes, 720 fits, dev4 2026-11-08) no longer shows it: 200
+  #   was never below no warm-up, and above it twice (13.4 and 1.9 nats, fits
+  #   that did not converge without); against 10 it rescued three fits that 10
+  #   left unconverged 2.3-10.2 nats short, and lost 0.34-0.45 nats on one
+  #   ordinal data set, on both routes, where 10 reached a second maximum at
+  #   sd 0. The warm-up's own iterations there were at most 38.
+  # - The ctsem book's full-rank quadratic trend model reached 1787.6-1824.5
+  #   (-2LL) from eight seeds with no warm-up and 1785.13 from all eight with
+  #   it run to convergence (70-115 iterations); its FE-DPM with the transform
+  #   metric reached the best maximum from 6 of 6 seeds only so.
+  # - On the bench's 70 default cells (review/bench/2026-11-08-warmup.md) the
+  #   objective each fit maximises was higher in four cells (AnomAuth S1 and
+  #   S2 by 25.2 and 24.3, gB8 by 0.2 and 0.02) and lower in one (gA14 s3,
+  #   0.36); every cell converged and certified either way. The exact log
+  #   likelihood moved the other way on AnomAuth, 4.7 and 4.8 nats down: the
+  #   point the warmed fit reaches is where Laplace over-credits a random
+  #   drift's sd, and the fit's random-effects check reports the gap there.
+  #   The warm-up was 61% of the warmed cells' gradients, the fit after it
+  #   needed 0.80 of the cold fit's, 1.49 times the gradients in all.
+  #
+  # Neither the transform metric (off by default since 2026-11-07) nor the
+  # short first step replaces it: conditioning and basin selection are
+  # different problems.
+  careful <- optimcontrol$carefulfit
+  if (is.null(careful)) careful <- TRUE
+  warmiter <- if (isTRUE(careful)) .ctJuliaWarmCap else
+    if (is.numeric(careful) && length(careful) == 1L && careful >= 1)
+      as.integer(careful) else 0L
+  # What the warm-up did, recorded from what executed rather than from what was
+  # asked for: a stage whose builder returned NULL looks exactly like one that
+  # ran unless the fit says which. `warmskip` is why not, NA when it ran and
+  # its point became the start; `warmran` iterations it took.
+  warmskip <- NA_character_
+  warmran <- 0L
+  # The fit's own prior scope, as `.ctJuliaPrepare()` read it: a NULL scope is
+  # the logical `priors` alone.
+  fitscope <- if (identical(priorscope, "randomCorr")) "randomCorr" else
+    if (isTRUE(priors)) "all" else "none"
+  if (warmiter < 1L) {
+    warmskip <- "switched off by optimcontrol$carefulfit"
+  } else if (!is.null(inits) && !identical(inits, "random")) {
+    # `stanoptimis` turns `carefulfit` off when starting values were supplied,
+    # since the point of the pass is to produce some. Overriding a starting
+    # value the caller chose would be worse than surprising.
+    warmskip <- "starting values were supplied"
+  } else if (!isTRUE(intoverstates)) {
+    # And not at all on the state-explicit target. The warm-up exists to place
+    # the *population* parameters from the priors; the innovations already
+    # start at their own prior mode, and running a second optimisation over
+    # the whole extended vector to rediscover that would cost as much as the
+    # fit it is warming.
+    warmskip <- "intoverstates=FALSE"
+  } else if (identical(fitscope, "all")) {
+    # The fit is the posterior under exactly these priors, so a warm-up under
+    # them would be the first ten iterations of the fit itself.
+    warmskip <- "priors=TRUE: the fit already has these priors"
+  } else if (is.null(prepared_data)) {
+    warmskip <- "no prepared data to build the priors from"
+  } else {
+    spec <- warmspec()
+    if (is.null(spec)) warmskip <- "the priors do not map onto this model's layout"
+    if (!is.null(spec)) {
+      # No callback here, deliberately. This stage is a starting-value device,
+      # not the fit: it optimises a *different* objective (the posterior rather
+      # than the likelihood) and its result is used only as `start` below.
+      #
+      # Passing the user's callback through gave it two runs of iteration
+      # numbers -- 1..10 from here, then 1..N from the fit -- so a front end
+      # drawing a live trace saw the counter restart, and
+      # `max(seen$iterations)` reported this stage's cap rather than the fit's
+      # iteration count. That broke the contract the callback shares with
+      # `fit$optim$trace` and `fit$optim$iterations`, both of which describe the
+      # fit alone. Reported as test-julia-trace.R expecting 8 and seeing 10,
+      # which is exactly `warmiter`.
+      warmed <- try(.ctJuliaOptimise(spec,  start,
+        # No overshoot probe either, and for the same reason as the callback:
+        # this stage is a starting-value device and its convergence verdict is
+        # discarded -- only `minimizer` is read. The probe costs up to
+        # `4 * npar` value-only evaluations, which on a 50-subject laplace fit
+        # is about a fifth of a stage, so paying it for a verdict nobody reads
+        # doubled what the probe costs a default fit.
+        #
+        # Nor the Newton finish, nor batching: L-BFGS over all the data, to its
+        # own stopping rule, which is the stage every measurement above ran.
+        # The finish would polish the prior mode with Hessians -- 18 Newton
+        # steps after 6 L-BFGS iterations on the ten-subject fixture in
+        # test-backend-controlsurface.R -- precision a starting value has no
+        # use for. A batch would make the pass a warm start from a subset of
+        # the subjects, which measured worse than no warm-up at all (116 of 120
+        # converged against 117, and a random-effect sd of 2.3 for a truth of
+        # 0.5).
+        optimcontrol = utils::modifyList(optimcontrol,
+          list(overshoot = "off", newton = FALSE, batch = FALSE)),
+        maxiter = as.integer(warmiter),
+        gradient = gradient, cores = cores, verbose = verbose,
+        callback = NULL, progress_label = "prior warm-up",
+        # A stage with a budget: its counter keeps the cap as denominator, and
+        # no sgd or SAEM phase runs in it.
+        progress_budget = TRUE), silent = TRUE)
+      # A warm start is only a starting value: if it produced numbers the fit
+      # can use, use them, and otherwise start where we would have anyway.
+      if (inherits(warmed, "try-error")) {
+        warmskip <- "the warm-up failed"
+      } else {
+        warmran <- as.integer(.ctJuliaOr(warmed$iterations, 0L))[1L]
+        values <- as.numeric(warmed$minimizer)
+        if (length(values) == npar && all(is.finite(values))) start <- values else
+          warmskip <- "the warm-up returned no usable point"
+      }
+    }
+  }
+  # Automatic substeps: choose the mesh at the starting values, fit, choose
+  # it again at the optimum, and refit once from there if it moved. Frozen
+  # within each fit so the objective stays smooth; see substep_mesh.jl. The
+  # state-explicit target has one innovation per substep, so its objective
+  # and start vector are rebuilt whenever the mesh changes.
+  substeps <- NULL
+  remesh <- function(values) {
+    chosen <- .ctJuliaAutoSubsteps(model_spec, values)
+    model_spec <<- chosen$spec
+    if (!is.null(jointobjective)) {
+      jointobjective <<- .ctJuliaJointObjective(model_spec, npar)
+      nstate <<- .ctJuliaStateDimension(model_spec)
+    }
+    chosen$summary
+  }
+  if (!is.null(model_spec$substeps)) {
+    substeps <- remesh(start[seq_len(npar)])
+    if (!is.null(jointobjective)) start <- c(start[seq_len(npar)], numeric(nstate))
+  }
+  # The iterated measurement update's steps a row, chosen as the mesh is: at
+  # the start, again at the optimum, one refit if they moved
+  # (`.ctJuliaRelinPlan()`). Not on the state-explicit target, which has no
+  # measurement update.
+  replan <- is.null(jointobjective)
+  if (replan) model_spec <- .ctJuliaRelinPlan(model_spec, start[seq_len(npar)])
+  # The engine loaded first, so a first fit's install and compile -- minutes,
+  # once per machine -- is not counted as this fit's own time, which says how
+  # slow work repeating the fit would be (`.ctWorkerFitSeconds`). Counted, it
+  # made a profile on a fresh CI runner start worker sessions for a fit of
+  # seconds.
+  invisible(.ctJuliaModule(model_spec$project))
+  optimise_started <- proc.time()[["elapsed"]]
+  # The modes a kept run held as starts where its terms jumped
+  # (`.ctJuliaOptimise()`'s `laplace_known`) belong to the objective from then
+  # on: every stage and evaluation below, and the fit, build it from
+  # `model_spec`.
+  keepknown <- function(r) {
+    if (!is.null(r$laplace_known)) model_spec$laplace$known <<- r$laplace_known
+    invisible(r)
+  }
+  # Where smoothing parameters are to be estimated, the first stage ends on its
+  # walk too, as the smoothing passes do (below), where that walk is on the
+  # Krylov model (`walked = 'dear'`): its exact Hessian would be formed for
+  # the starting smoothing parameters, which the first pass usually moves, and
+  # on the affect pilot that Hessian was 8.2 hours. Where the walk starts on an
+  # exact Hessian it certifies as before. Nor where a checkpoint brings the
+  # exact Hessian at this point, which certifies there at no cost.
+  walkfirst <- isTRUE(intoverstates) && !isTRUE(optimcontrol$estonly) &&
+    !identical(optimcontrol$certify, FALSE) && !is.null(model_spec$penalty) &&
+    NROW(model_spec$penalty) > 0L && is.null(checkpoint$hessian)
+  result <- keepknown(.ctJuliaOptimise(model_spec, start,
+    optimcontrol = startcontrol, gradient = gradient, cores = cores,
+    verbose = verbose, callback = optimcontrol$callback,
+    objective = jointobjective, checkpoint = checkpoint,
+    hessian = checkpoint$hessian, hessian_at = checkpoint$hessian_at,
+    walked = if (walkfirst) "dear" else FALSE))
+  optimum <- as.numeric(result$minimizer)[seq_len(npar)]
+  # Its modes and Hessian were the first run's; later runs start from their
+  # own (`laplace_known`), and form their own.
+  if (!is.null(checkpoint)) {
+    checkpoint$resume <- NULL
+    checkpoint$hessian <- checkpoint$hessian_at <- checkpoint$hessian_id <- NULL
+  }
+  moved <- FALSE
+  if (!is.null(substeps) && isTRUE(substeps$finite)) {
+    before <- model_spec$max_timestep
+    substeps <- remesh(optimum)
+    if (!identical(model_spec$max_timestep, before)) {
+      substeps$refit <- TRUE
+      moved <- TRUE
+    }
+  }
+  if (replan && length(model_spec$relinsteps)) {
+    before <- model_spec$relinsteps
+    model_spec <- .ctJuliaRelinPlan(model_spec, optimum)
+    moved <- moved || !identical(model_spec$relinsteps, before)
+  }
+  if (moved) {
+    restart <- if (is.null(jointobjective)) optimum else c(optimum, numeric(nstate))
+    first <- result
+    # From the earlier mesh's or plan's optimum, so without the early phases,
+    # which are for a stage that starts away from one.
+    result <- keepknown(.ctJuliaAddRunCounts(.ctJuliaOptimise(
+      model_spec, restart,
+      optimcontrol = utils::modifyList(optimcontrol,
+        list(saem = FALSE, stochastic = FALSE, batch = FALSE)), gradient = gradient,
+      cores = cores,
+      verbose = verbose, callback = optimcontrol$callback,
+      objective = jointobjective, checkpoint = checkpoint,
+      walked = if (walkfirst) "dear" else FALSE), first))
+  }
+  if (!is.null(substeps)) message(.ctJuliaSubstepMessage(substeps))
+  # What the curvature says about the point the optimiser stopped at, and a
+  # corrected one when it says the optimum is materially further on. Here
+  # rather than after the fit is built, because everything below this line is
+  # derived from `result` and a correction applied later would leave all of it
+  # describing a different point. See R/ctBackendOptimGap.R.
+  #
+  # Not on the state-explicit route: its curvature is the profile's, which the
+  # states flatten, so there is nothing to certify against -- the same reason
+  # that route reports no standard errors.
+  # Nor a run that ended on a jump: its point is on no continuous objective
+  # (a refined fit certifies where its rounds end).
+  correction <- NULL
+  certifying <- isTRUE(intoverstates) && !isTRUE(optimcontrol$estonly) &&
+    !identical(optimcontrol$certify, FALSE) && is.null(result[["jumprecord"]])
+  # The certification, and the stages that resumed the fit on its verdict or
+  # on a measured better point, are `.ctJuliaOptimise()`'s
+  # (`.ctBackendCorrectResult()`), and ride on its result.
+  correct <- function(r) c(list(result = r), r$retry)
+  if (certifying) {
+    correction <- correct(result)
+    result <- correction$result
+  }
+  # Random restarts, when asked for, only for a fit still not converged -- see
+  # R/ctBackendRestarts.R for when they run and when they deliberately do not
+  # (supplied inits or a set maxiter: the fit asked for). Not the prior retry
+  # an earlier version had, which carefulfit made redundant; this is for a
+  # likelihood with more than one basin, where the start decides.
+  restarts <- NULL
+  fitseconds <- proc.time()[["elapsed"]] - optimise_started
+  nrestarts <- if (is.null(jointobjective)) .ctBackendRestartsWanted(result,
+    if (is.null(correction)) NULL else correction$certification, optimcontrol,
+    inits, intoverstates) else 0L
+  if (nrestarts > 0L) {
+    reporting <- .ctBackendReporting(verbose)
+    if (reporting) message("Not converged; trying ", nrestarts,
+      " random restarts. Esc or Ctrl-C stops them and keeps this fit.")
+    restarts <- .ctBackendRestarts(model_spec, start[seq_len(npar)], npar,
+      nrestarts, optimcontrol, gradient,
+      # Workers only when each restart is a very slow fit; see
+      # `.ctWorkerFitSeconds`.
+      cores = if (fitseconds > .ctWorkerFitSeconds) cores else 1L,
+      current = as.numeric(result$maximum_loglik)[1L], report = reporting)
+    if (!is.null(restarts$best)) {
+      result <- keepknown(restarts$best)
+      if (certifying) {
+        correction <- correct(result)
+        result <- correction$result
+      }
+    }
+  }
+  # `saem = TRUE`: SAEM's averaged point carries Monte Carlo error, and where
+  # the posterior itself has several maxima that error decides which one the
+  # finish reaches -- on the ?ctFit example with a drift random effect, three
+  # certified maxima 2.3 apart, quadrature agreeing at each, the default fit
+  # reaching the best from every seed and saem one of the three by seed
+  # (review/SAEM-fell-short-2026-10-05.md). So the fit also finishes from its
+  # own start without SAEM and keeps whichever maximum is higher on the
+  # corrected log posterior, by the correction's own screen. Compared there
+  # rather than on the Laplace objective, so that a maximum the approximation
+  # over-credits -- SAEM's reason to exist -- still loses. Ties keep SAEM's.
+  saemguard <- NULL
+  if (.ctJuliaSaemIterations(optimcontrol) > 0L && !is.null(model_spec$laplace) &&
+      is.null(jointobjective) && isTRUE(intoverstates)) {
+    saemrun <- result
+    plain <- try(.ctJuliaOptimise(model_spec, start, optimcontrol =
+      utils::modifyList(startcontrol, list(saem = FALSE)), gradient = gradient,
+      cores = cores, verbose = verbose, callback = optimcontrol$callback,
+      progress_label = "without SAEM"), silent = TRUE)
+    plaincorrection <- NULL
+    if (!inherits(plain, "try-error") && certifying) {
+      plaincorrection <- correct(plain)
+      plain <- plaincorrection$result
+    }
+    if (!inherits(plain, "try-error")) {
+      withsaem <- .ctLaplaceCorrectedValue(model_spec, as.numeric(saemrun$minimizer))
+      without <- .ctLaplaceCorrectedValue(model_spec, as.numeric(plain$minimizer))
+      chosen <- if (all(is.finite(c(withsaem[["corrected"]], without[["corrected"]]))) &&
+          without[["corrected"]] > withsaem[["corrected"]] + 1e-3) "without" else "saem"
+      # Both runs counted, whichever is kept (`.ctJuliaAddRunCounts()`).
+      if (identical(chosen, "saem")) result <- .ctJuliaAddRunCounts(saemrun, plain)
+      saemguard <- list(chosen = chosen,
+        logpost_saem = withsaem[["corrected"]],
+        logpost_without = without[["corrected"]],
+        laplace_saem = withsaem[["laplace"]], laplace_without = without[["laplace"]])
+      if (identical(chosen, "without")) {
+        # The kept run is the plain one, but the SAEM phase that ran stays
+        # recorded, beside the comparison that set it aside.
+        for (nm in grep("^saem_", names(saemrun), value = TRUE)) {
+          plain[nm] <- list(saemrun[[nm]])
+        }
+        result <- keepknown(.ctJuliaAddRunCounts(plain, saemrun))
+        correction <- plaincorrection
+        message(sprintf(paste0("SAEM reached a maximum with log posterior %.2f; ",
+          "finishing without it reached %.2f, which the fit keeps. See ",
+          "fit$optim$saem_guard."), withsaem[["corrected"]],
+          without[["corrected"]]))
+      }
+    }
+  }
+  # Smoothing parameters (R/ctTIpredSmooth.R): the generalised Fellner-Schall
+  # fixed point on the quadratic model the curvature gives, and the fit
+  # re-optimised at it, until the parameters stop moving by more than a per
+  # cent. A pass starts where that quadratic model puts the optimum, with its
+  # Hessian, so it is mostly a finish. Without a certification (`estonly`) the
+  # smoothing parameters stay where they started.
+  #
+  # Each pass changes the objective, so the stages before the parameters
+  # settle are not certified: the first (`walkfirst`) and each pass end where
+  # their finish's walk ends, and the next pass reads the matrix that walk
+  # stepped on (`walked`, `.ctJuliaWalkedHessian()`) rather than an exact
+  # Hessian formed for a point it leaves. Once the parameters settle on that
+  # curvature, one certified stage forms the exact Hessian, and the fixed
+  # point is checked on it. Certified after every pass, each formed its own:
+  # on a large Laplace model 11-16 hours a pass (the affect pilot,
+  # review/PILOT-curvature-coresets-2026-10-25.md); certified after the first
+  # stage alone, the pilot formed one there for starting parameters its first
+  # pass moved (8.2 hours, review/HANDOFF-pilot-fit-2026-11-04.md).
+  if (!is.null(model_spec$penalty) && nrow(model_spec$penalty)) {
+    smoothpasses <- 0L
+    stagecontrol <- utils::modifyList(optimcontrol, list(batch = FALSE,
+      saem = FALSE, stochastic = FALSE))
+    certified_stage <- function(from) {
+      stage <- keepknown(.ctJuliaOptimise(model_spec, from,
+        optimcontrol = stagecontrol, gradient = gradient, cores = cores,
+        verbose = verbose, callback = optimcontrol$callback,
+        checkpoint = checkpoint))
+      correct(.ctJuliaAddRunCounts(stage, result))
+    }
+    curvature <- NULL
+    certified <- TRUE
+    if (certifying) {
+      # The first stage's walk where it ended on one (`walkfirst`), else its
+      # certification's Hessian.
+      curvature <- if (walkfirst) .ctJuliaWalkedHessian(result)
+      certified <- is.null(curvature)
+      if (certified) curvature <- correction$hessian
+    }
+    if (!is.null(curvature)) {
+      for (pass in seq_len(10L)) {
+        theta <- as.numeric(result$minimizer)
+        gfs <- .ctTIsmoothLambda(model_spec$penalty, curvature, theta,
+          gradient = as.numeric(result$gradient))
+        moved <- max(abs(log(gfs$lambda) - log(model_spec$penalty$lambda)))
+        model_spec$penalty$edf <- gfs$edf
+        settled <- moved < 0.01
+        if (settled && certified) break
+        if (!settled) {
+          model_spec$penalty$lambda <- gfs$lambda
+          smoothpasses <- pass
+          # Checkpointed as every stage is: the record carries the smoothing
+          # parameters (`.ctJuliaCheckpointState()`), so a resume goes on from
+          # this pass rather than from the first stage's.
+          walk <- keepknown(.ctJuliaAddRunCounts(.ctJuliaOptimise(model_spec,
+            gfs$point, optimcontrol = stagecontrol, gradient = gradient,
+            cores = cores, verbose = verbose, callback = optimcontrol$callback,
+            hessian = gfs$hessian, hessian_at = theta, walked = TRUE,
+            checkpoint = checkpoint), result))
+          walked <- .ctJuliaWalkedHessian(walk)
+          result <- walk
+          if (!is.null(walked)) {
+            curvature <- walked
+            certified <- FALSE
+            next
+          }
+        }
+        # Settled on a walked curvature, or a pass whose finish left no walk
+        # to read: certified here.
+        correction <- certified_stage(as.numeric(result$minimizer))
+        result <- correction$result
+        curvature <- correction$hessian
+        certified <- TRUE
+        if (is.null(curvature)) break
+      }
+      if (!certified) {
+        correction <- certified_stage(as.numeric(result$minimizer))
+        result <- correction$result
+      }
+    } else message("Smoothing parameters held at their starting values: ",
+      "estimating them needs the certified Hessian, which this fit does not ",
+      "form (estonly, certify = FALSE or intoverstates = FALSE).")
+    model_spec$penalty$passes <- smoothpasses
+  }
+  # The engine maximises the log posterior, so its `maximum_loglik` is the log
+  # posterior and the per-subject objectives (which carry no prior term) sum to
+  # the log likelihood. Without priors the two are the same number; with them
+  # they are not, and the summary reports both, as it does for Stan.
+  subject_loglik <- as.numeric(result$subject_loglik)
+  loglik <- if (length(subject_loglik)) sum(subject_loglik) else
+    as.numeric(result$maximum_loglik)
+  # `[theta; z]` comes back as one vector and is split here, so that
+  # `estimate$raw` means the same thing on every fit: the population
+  # parameters, and nothing else. Everything downstream -- the summary, the
+  # transforms, prediction -- reads that and needs no notion of a state
+  # block. The trajectory is kept beside it rather than folded in.
+  minimizer <- as.numeric(result$minimizer)
+  gradientvec <- as.numeric(result$gradient)
+  states <- NULL
+  innovations <- NULL
+  if (!isTRUE(intoverstates)) {
+    innovations <- minimizer[npar + seq_len(nstate)]
+    states <- .ctJuliaJointStates(model_spec, jointobjective, minimizer)
+    minimizer <- minimizer[seq_len(npar)]
+    gradientvec <- gradientvec[seq_len(npar)]
+  }
+  # `$data` is not set here: it is attached by ctFit.R after this call
+  # returns, as the sentinel-cleaned `standata` structure (matching a stan
+  # fit's `$data`/`$standata` split -- see R/ctFit.R). Setting the verbatim
+  # `datalong` here would only be overwritten there in the normal ctFit()
+  # entry point, and `model_spec$data` (the long data.frame `.ctJuliaPrepare()`
+  # kept) already covers what code inside this package needs from it, via
+  # `.ctBackendSpec()`.
+  # Two objects, because `$estimate` held thirty-five fields of which about a
+  # third were the answer and the rest described the search for it. `$estimate`
+  # is now what was estimated -- the point, its precision, and the likelihood at
+  # it -- and `$optim` is the run: its counts, its verdicts, its trace.
+  #
+  # The split is along the line a reader already draws. Nothing in `$optim`
+  # changes if the same estimate is reached another way, and nothing in
+  # `$estimate` says whether to believe it. It also matches `$uncertainty`,
+  # `$laplace` and `$identifiability`, each a subobject named for one concern;
+  # `$estimate` was the one that had grown into a flat namespace instead, and
+  # its `overshoot_*`, `saturated_*` and `carefulfit_*` prefixes were already
+  # doing a subobject's work by hand.
+  #
+  # Those prefixes stay flat *within* `$optim` rather than nesting one level
+  # further. With two or three fields each a prefix carries it, and making
+  # `overshoot` a list would turn `if (fit$optim$overshot)` from a logical test
+  # into a truthy one -- which is a silent change of meaning, not a rename.
+  optim_run <- list(
+    converged = isTRUE(result$converged),
+    # The gradient at the reported point, and its norm. Run material: it says
+    # where the optimiser stopped, not what was estimated.
+    gradient = gradientvec,
+    iterations = as.integer(result$iterations),
+    # How many pool workers the fit ran on: the `cores` ceiling, within the
+    # session's threads. Carried onto the fit because the uncertainty phase
+    # reads it. Two fits at different widths differ in an estimate's last
+    # digits, and so do two at one width above one, since the pool takes units
+    # as its workers come free; one worker reproduces.
+    chunks = if (is.null(result$chunks)) NA_integer_ else as.integer(result$chunks),
+    # Evaluation counts, because "how many times did it call the likelihood"
+    # is the first question about a fit that took longer than expected, and
+    # it was previously only obtainable by timing one evaluation and dividing.
+    f_calls = if (is.null(result$f_calls)) NA_integer_ else as.integer(result$f_calls),
+    g_calls = if (is.null(result$g_calls)) NA_integer_ else as.integer(result$g_calls),
+    # Subject filter passes whose predictions grew more than 100-fold between
+    # observations -- explosive dynamics over a gap, where the reverse pass
+    # loses accuracy -- and the subjects for which that holds at the estimate;
+    # and the gradients taken by forward mode for such subjects, when
+    # `optimcontrol$explosive_forward` asked for that. The warning below is
+    # about the model.
+    explosive_passes = as.integer(.ctJuliaOr(result$explosive_passes, 0L))[1L],
+    forward_gradients = as.integer(.ctJuliaOr(result$forward_gradients, 0L))[1L],
+    explosive_subjects = .ctJuliaExplosiveIds(result, model_spec, model),
+    # What the fit still had to gain when it stopped, in log likelihood
+    # units, and the tolerance that was asked of it. This is the criterion --
+    # `1/2 g'Bg` under the optimiser's own metric -- and not the gradient,
+    # which is reported beside it because it is what a reader recognises and
+    # because a fit that stops just short looks the same as one that never
+    # moved unless both are visible. The exact version of the same quantity,
+    # where a Hessian was computed, is
+    # `fit$uncertainty$certification$gap`; see `.ctBackendCertifiedVerdict()`.
+    gradient_norm = if (is.null(result$gradient_norm)) NA_real_ else
+      as.numeric(result$gradient_norm),
+    predicted_gain = if (is.null(result$predicted_gain)) NA_real_ else
+      as.numeric(result$predicted_gain),
+    convergence_tolerance = if (is.null(result$converge_tol)) NA_real_ else
+      as.numeric(result$converge_tol),
+    # What the final iteration actually gained. The second of the two ways a
+    # fit can satisfy the criterion, and the one that carries a fit whose
+    # metric has been corrupted by a flat direction -- see
+    # `_ctsem_optimise_verdict`.
+    last_gain = if (is.null(result$last_gain)) NA_real_ else
+      as.numeric(result$last_gain),
+    # A parameter that reached the flat region of its transform, and which.
+    # Invisible in the gradient -- a saturated transform reports a gradient
+    # of zero, which passes every tolerance -- so without this the warning
+    # below described such a fit by its gradient alone and read as though it
+    # had passed.
+    #
+    # `saturated` is a statement about identification, not about
+    # convergence: the usual cause is a population standard deviation with
+    # no individual differences behind it, which is a finding. `overshot` is
+    # the half of it that *is* a convergence failure -- the optimizer
+    # overstepped and the point is not a maximum -- and it is what
+    # `converged` is keyed on. See `_ctsem_overshot` in the engine.
+    saturated = isTRUE(result$saturated),
+    # 0 from the engine means "none"; never an empty vector, which deadlocks
+    # the bridge. Named where names are available, because "raw parameter 10"
+    # is not something a user can act on and "rawcor_mm2__mm1" is.
+    saturated_parameters = .ctJuliaSaturatedNames(result, model_spec, npar),
+    overshot = isTRUE(result$overshot),
+    overshoot_gain = if (is.null(result$overshoot_gain)) NA_real_ else
+      as.numeric(result$overshoot_gain),
+    # Which coordinates the pullback moved to establish that. The probe
+    # selects them by magnitude order rather than from the saturation flag,
+    # so this is its own list and can name a parameter that is not in
+    # `saturated_parameters` -- see `_ctsem_overshot` in the engine.
+    overshoot_parameters = .ctJuliaSaturatedNames(result, model_spec, npar,
+      "overshoot_parameters"),
+    # Whether the prior warm-up ran and its point became the start, how many
+    # iterations it ran, and why not when it did not -- all from what
+    # executed. It used to be `warmiter >= 1`, what was asked for, and so
+    # reported TRUE on every default fit while the stage was being skipped.
+    carefulfit = is.na(warmskip), carefulfit_iterations = warmran,
+    carefulfit_skipped = warmskip,
+    # Which line search produced the answer. "hagerzhang+backtracking" means
+    # Hager-Zhang stopped short and the fit was finished by the fallback.
+    linesearch = if (is.null(result$linesearch)) NA_character_ else
+      as.character(result$linesearch),
+    stalled = isTRUE(result$stalled),
+    # Whether the cheap stopping rule ended the run, which is what makes
+    # `f_calls` and `g_calls` undercounts: Optim stops updating them when a
+    # callback stops it, and there is no second source for those two.
+    # `iterations` is taken from the engine's own count and is right either
+    # way. See `ctsem_optimize`.
+    stopped_by_gap = isTRUE(result$stopped_by_gap),
+    # And whether it ended because it had stopped making progress with a
+    # transform flat as the reason. Reported separately from `stopped_by_gap`
+    # because they mean opposite things: the gap rule stops a fit that has
+    # arrived, this one stops a fit that is not going to.
+    stopped_by_stall = isTRUE(result$stopped_by_stall),
+    # Or because it was walking off to a limit, with no maximum at finite
+    # values: the parameters that were growing without bound (the engine's
+    # `CTSEMStallWatch`, "Walking off to a limit").
+    stopped_by_divergence = isTRUE(result$stopped_by_divergence),
+    diverging_parameters = .ctJuliaSaturatedNames(result, model_spec, npar,
+      "diverging_parameters"),
+    # The batch sizes the run grew through, and the iteration each began at;
+    # 0 when it did not batch (too few subjects or groups, a sampled TI
+    # predictor, or a route with no subset). A prior does not prevent it: the
+    # engine scales the likelihood part of a batch and leaves the prior whole
+    # (`_ctsem_batchable` is `isempty(ti_missing_parameter)`). See
+    # `_ctsem_batch_plan` in the engine.
+    batch_sizes = if (is.null(result$batch_sizes)) 0L else
+      as.integer(result$batch_sizes),
+    batch_iterations = if (is.null(result$batch_iterations)) 0L else
+      as.integer(result$batch_iterations),
+    # Steps the endgame took after L-BFGS handed over, escapes from a saddle
+    # included; 0 when there was no finish (nothing certifies on the Laplace
+    # route, or the run ended on its cap or a stall).
+    newton_steps = if (is.null(result$newton_steps)) 0L else
+      as.integer(result$newton_steps),
+    # L-BFGS steps taken on the score outer product's model (lbfgs_scores).
+    structured_steps = if (is.null(result$structured_steps)) 0L else
+      as.integer(result$structured_steps),
+    # The local curvature (lbfgs_local): builds, the gradients they cost, and
+    # the parameters taken exactly; 0 where none was built.
+    local_builds = if (is.null(result$local_builds)) 0L else
+      as.integer(result$local_builds),
+    local_gradients = if (is.null(result$local_gradients)) 0 else
+      as.numeric(result$local_gradients),
+    local_columns = if (is.null(result$local_columns)) 0L else
+      as.integer(result$local_columns),
+    # The L-BFGS stage's coreset stages (`optimcontrol$coreset`, Laplace
+    # route): each stage's units, the iterations run on a coreset, and the full
+    # gradients that checked them; 0 when none ran. `full_gradients` counts
+    # the optimiser's gradients of the whole objective, a Hessian's columns
+    # aside. See `_ctsem_coreset_plan` in the engine.
+    coreset_sizes = if (is.null(result$coreset_sizes)) 0L else
+      as.integer(result$coreset_sizes),
+    coreset_iterations = if (is.null(result$coreset_iterations)) 0L else
+      as.integer(result$coreset_iterations),
+    coreset_checks = if (is.null(result$coreset_checks)) 0L else
+      as.integer(result$coreset_checks),
+    full_gradients = if (is.null(result$full_gradients)) NA_integer_ else
+      as.integer(result$full_gradients),
+    # Full and subset Hessians the finish formed, the final (certification)
+    # one included: that one is handed over and not formed again.
+    newton_hessians = if (is.null(result$newton_hessians)) 0L else
+      as.integer(result$newton_hessians),
+    newton_subset_hessians = if (is.null(result$newton_subset_hessians)) 0L
+      else as.integer(result$newton_subset_hessians),
+    # The Krylov models the finish stepped on where the exact Hessian is dear,
+    # and the gradients they took (`CTSEMKrylov` in the engine).
+    newton_krylov_models = if (is.null(result$newton_krylov_models)) 0L
+      else as.integer(result$newton_krylov_models),
+    newton_krylov_products = if (is.null(result$newton_krylov_products)) 0L
+      else as.integer(result$newton_krylov_products),
+    # How many times the finish left a saddle along its negative curvature.
+    newton_escapes = if (is.null(result$newton_escapes)) 0L else
+      as.integer(result$newton_escapes),
+    stall_window = if (is.null(result$stall_window)) NA_integer_ else
+      as.integer(result$stall_window),
+    # And the two stopping rules as the engine actually received them.
+    # Reported because both were once switched off for every fit in the
+    # package by one variable read a line too late, and nothing in the
+    # result said so: a rule that is not running looks exactly like a rule
+    # that never had cause to fire. See `state_explicit` in
+    # `.ctJuliaOptimise()`.
+    gap_tol = if (is.null(result$gap_tol)) NA_real_ else
+      as.numeric(result$gap_tol)[1L],
+    # The tolerance the gap rule last applied: `gap_tol`, or what the
+    # objective resolved where that was more.
+    gap_floor = if (is.null(result$gap_floor)) NA_real_ else
+      as.numeric(result$gap_floor)[1L],
+    # The smallest gain the run found its objective cannot resolve
+    # (`_ctsem_resolution`: a finish step refused at every radius), and the
+    # convergence bar that set: `convergence_tolerance`, or that where it is
+    # more, which the certification held the fit to as well.
+    resolution = .ctJuliaOr(result[["resolution"]], NA_real_)[1L],
+    convergence_floor = .ctJuliaOr(result[["converge_floor"]], NA_real_)[1L],
+    # Which coordinates had gone flat when it stopped, named rather than
+    # numbered, and how many times the progress half fired. More than one
+    # trigger means the fit stalled, was found to be merely slow, and was
+    # given more rope.
+    stall_parameters = .ctJuliaSaturatedNames(result, model_spec, npar,
+      "stall_parameters"),
+    stall_triggers = if (is.null(result$stall_triggers)) NA_integer_ else
+      as.integer(result$stall_triggers),
+    # Iterations of the sgd phase (`optimcontrol$stochastic`), 0 when none ran.
+    sgd_iterations = if (is.null(result$sgd_iterations)) 0L else
+      as.integer(result$sgd_iterations),
+    # The SAEM phase (`optimcontrol$saem`): its iterations, whether it stopped
+    # on its trend rule and the trend there, its chains, its mean acceptance
+    # rate, and its trace -- the complete-data log posterior, which is not on
+    # the Laplace objective's scale, the score norm, the largest step, the
+    # acceptance rate and the trend, per iteration.
+    saem_iterations = if (is.null(result$saem_iterations)) 0L else
+      as.integer(result$saem_iterations),
+    saem_settled = isTRUE(result$saem_settled),
+    saem_trend = if (is.null(result$saem_trend)) NA_real_ else
+      as.numeric(result$saem_trend),
+    saem_chains = if (is.null(result$saem_chains)) 0L else
+      as.integer(result$saem_chains),
+    saem_acceptance = if (is.null(result$saem_acceptance)) NA_real_ else
+      as.numeric(result$saem_acceptance),
+    saem_trace = if (is.null(result$saem_trace)) NULL else
+      as.data.frame(lapply(result$saem_trace, as.numeric)),
+    # How many times the fit was pulled off a boundary and refitted.
+    stall_escapes = if (is.null(result$stall_escapes)) 0L else
+      as.integer(result$stall_escapes),
+    # Every iteration, recorded whatever `verbose` said. It costs a push onto a
+    # vector in Julia and one transfer at the end, and the fit whose trace turns
+    # out to be worth looking at is exactly the one nobody thought to turn
+    # reporting on for. On `$optim` rather than at top level because it is the
+    # most purely run-shaped thing a fit carries.
+    trace = .ctBackendTrace(result$trace))
+
+  out <- list(backend = "julia", model = model, model_spec = model_spec,
+    estimate = list(raw = minimizer,
+      loglik = loglik,
+      # The weighted log likelihood the fit maximised, with sampling weights;
+      # `loglik` stays the data's own (R/ctWeights.R).
+      loglik_weighted = if (length(model_spec$subject_weights) &&
+          length(subject_loglik) == length(model_spec$subject_weights))
+        sum(model_spec$subject_weights * subject_loglik) else NULL,
+      logposterior = as.numeric(result$maximum_loglik),
+      subject_loglik = result$subject_loglik,
+      # State-explicit fits only. `states` is the trajectory at the
+      # estimate, rows by latents, and `innovations` the standard normal
+      # vector it was built from -- the same thing `ctGenerate` is handed,
+      # so a fitted trajectory can be replayed.
+      #
+      # `loglik_type` says what `loglik` is. On the marginal route it is a
+      # marginal log likelihood; here it is the *joint* density of the data
+      # and the states, which is a different quantity and is not comparable
+      # with one -- an information criterion computed across the two would
+      # be meaningless, and this is what says so.
+      states = states, innovations = innovations,
+      loglik_type = if (isTRUE(intoverstates)) "marginal" else "joint"),
+    optim = optim_run,
+    engine = model_spec$engine,
+    # What nsubsteps = 'auto' decided: intervals, how many were refined, the
+    # largest count, the total, and whether the fit was redone after the mesh
+    # moved at the optimum. NULL unless it was asked for.
+    #
+    # Top level rather than on `$optim`: the mesh is a property of how the
+    # likelihood is discretised, which prediction and the Kalman routes read
+    # too, and it would be there whether or not anything had been optimised.
+    substeps = substeps,
+    args = list(backend = "julia",
+      optimcontrol = optimcontrol, cores = cores, priors = priors,
+      intoverpop = intoverpop, intoverstates = isTRUE(intoverstates)))
+  # An optimizer that ends where it started has not fitted anything, whatever
+  # its convergence flags say -- and Optim's own verdict is a disjunction that a
+  # failed first line search satisfies trivially. Saying so here is what stops a
+  # simulation study from averaging over starting values it never left.
+  # Not for a run that stopped on a jump at its start, which says so itself.
+  if (isTRUE(result$stalled) && is.null(result[["jumprecord"]])) {
+    warning("The optimizer made no progress from its starting values, and the ",
+      "gradient there is not zero. Treat this fit as failed: check the starting ",
+      "values, and see fit$optim$stalled.", call. = FALSE)
+  } else if (isTRUE(result$overshot)) {
+    # Reported separately because the gradient says nothing useful here: the
+    # coordinate's transform is flat, so the gradient underflows to zero and
+    # the point passes every tolerance while not being a maximum at all. The
+    # engine establishes that by pulling the coordinate back and finding the
+    # objective improves -- `overshoot_gain` is by how much.
+    warning("The optimizer stopped where the objective improves by ",
+      signif(as.numeric(result$overshoot_gain), 3), " if raw parameter(s) ",
+      paste(out$optim$overshoot_parameters, collapse = ", "),
+      " are pulled back toward zero, so this is not a maximum -- the usual ",
+      "cause is a transform that has gone flat, or a population scale that ",
+      "has collapsed and taken its correlations with it. Treat this fit as ",
+      "failed and check the starting values. See fit$optim$overshot.",
+      call. = FALSE)
+  } else if (!isTRUE(result$converged)) {
+    # Held rather than raised. The gradient says where the optimizer stopped;
+    # whether that is the optimum is a question about the curvature, and the
+    # curvature is computed a few lines below. Raised there, or superseded.
+    out$optim$convergence_pending <- TRUE
+  }
+  explosive <- out$optim$explosive_subjects
+  if (length(explosive)) {
+    warning(sprintf(paste0("At the estimate, predictions grow more than ",
+      "100-fold between observations for %d subject(s) (%s%s): explosive ",
+      "dynamics over the gaps. See fit$optim$explosive_subjects."),
+      length(explosive), paste(utils::head(explosive, 5), collapse = ", "),
+      if (length(explosive) > 5) ", ..." else ""), call. = FALSE)
+  }
+  if (!is.null(model_spec$laplace)) {
+    out$laplace <- .ctJuliaFitLaplaceBlock(model_spec, result)
+    if (!isTRUE(result$inner_converged)) {
+      warning("The random-effect mode did not converge for every subject; ",
+        "see fit$laplace$inner_converged.", call. = FALSE)
+    }
+  }
+  # Each smooth term's smoothing parameter and effective degrees of freedom
+  # (R/ctTIpredSmooth.R).
+  out$smooths <- .ctTIsmoothReport(out$model_spec$penalty)
+  # Random effects predicted by the others up to the correlation bound: the
+  # population covariance the data point to is singular (R/ctCorBound.R).
+  out$corbound <- .ctCorBoundReport(out)
+  .ctCorBoundWarn(out$corbound)
+  # How long the optimisation took before any restarts, which says how slow
+  # work repeating it would be (`.ctWorkerFitSeconds`).
+  out$optim$seconds <- fitseconds
+  if (!is.null(restarts)) {
+    # One row per random start: its log posterior, whether it converged, and
+    # which (if any) replaced the first fit.
+    out$optim$restarts <- restarts$table
+    out$optim$restarts_cancelled <- isTRUE(restarts$cancelled)
+  }
+  # Which of SAEM's maximum and the one reached without it the fit kept, and
+  # both corrected log posteriors (see the guard in `.ctJuliaOptimiseFit()`).
+  if (!is.null(saemguard)) out$optim$saem_guard <- saemguard
+  # The kept run's own count, when the fit also ran one it did not keep -- a
+  # stall escape, a substep refit (`.ctJuliaAddRunCounts()`): `iterations`
+  # counts both, and the trace is the kept run's.
+  if (!is.null(result$stage_iterations)) {
+    out$optim$stage_iterations <- as.integer(result$stage_iterations)[1L]
+  }
+  if (!is.null(correction)) {
+    # The Hessian goes on the fit so the uncertainty stage does not recompute
+    # the same matrix at the same point, and the certification with it so a
+    # fit made with `estonly` can still be told from one that was checked.
+    out$optim$corrections <- correction$corrections
+    # Totals over every stage the fit ran, which is what these names should
+    # always have meant. `stage_iterations` keeps the last stage's own count
+    # for anyone reading a trace against it -- the kept run's, when a stall
+    # escape replaced the run before it (`.ctJuliaOptimise()`).
+    out$optim$stage_iterations <- as.integer(.ctJuliaOr(result$stage_iterations,
+      out$optim$iterations))[1L]
+    out$optim$iterations <- as.integer(correction$totals[["iterations"]])
+    out$optim$f_calls <- as.integer(correction$totals[["f_calls"]])
+    out$optim$g_calls <- as.integer(correction$totals[["g_calls"]])
+    # A count of Hessians computed, which used to sit on `$estimate` as
+    # `hessians` -- an integer one letter away from the matrix beside it. Named
+    # for what it counts, and on `$optim` because it counts work the run did:
+    # the ones the engine's finish formed over every stage, and any the
+    # certification had to ask for where no finish ran.
+    out$optim$hessian_evaluations <- correction$hessians
+    # How far the reported estimate is from where that Hessian was evaluated,
+    # in the standard errors it implies: 0 when it is exactly there, and at
+    # most `.ctBackendHessianReuse()` when the finish kept the Hessian it took
+    # at the hand-over.
+    out$optim$hessian_distance <- correction$distance
+    # The matrix goes where its consumers look, and `evaluated_at` is what makes
+    # that safe. See `.ctBackendStoredHessian()`: every route says which point
+    # its Hessian describes, rather than leaving a reader to assume
+    # `$estimate$raw` -- which is close here and false on a sampled fit, where
+    # the matrix is at the Laplace point and `$estimate$raw` is the posterior
+    # mean. `.ctBackendCorrectResult()` recertifies at the top of every
+    # attempt and only breaks out before resuming, so this matrix describes the
+    # `minimizer` the fit reports: evaluated there, or within `hessianreuse`
+    # standard errors of it.
+    out$uncertainty <- list(certification = correction$certification,
+      hessian = correction$hessian,
+      evaluated_at = if (is.null(correction$evaluated_at)) minimizer else
+        as.numeric(correction$evaluated_at))
+    out <- .ctBackendCertifiedVerdict(out)
+  }
+  class(out) <- c("ctJuliaFit", "ctFit")
+
+  # The covariance-repair warnings raised while the uncertainty is built are
+  # held for the closing summary, which says the same finding once, beside the
+  # verdict (`.ctBackendFitWarnings()`).
+  repairs <- character(0)
+  holdrepair <- function(expr) withCallingHandlers(expr,
+    ctsemCovarianceRepair = function(w) {
+      repairs <<- c(repairs, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    })
+
+  # Uncertainty is part of fitting, not a separate step the user has to know to
+  # take -- `stanoptimis()` finishes every optimized Stan fit the same way, and
+  # a `summary()` that silently reported point estimates only, purely because of
+  # the backend chosen, is the difference this exists to remove. The control
+  # names are `stanoptimis()`'s, so `optimcontrol` means the same thing to both
+  # backends; `optimcontrol$estonly` skips it, as it does there.
+  # Not for an optimised state-explicit fit. The only curvature available
+  # there is the profile's, and with about as many innovations as
+  # observations the profile is nearly flat: the states re-optimise to
+  # absorb almost any change in the parameters, which is what profiling
+  # does and is why it is not an observed information. The term that
+  # identifies the parameters -- the log determinant the Laplace marginal
+  # carries -- is exactly the one profiling drops. Measured on fifteen
+  # subjects of six Gaussian rows with four free parameters, the largest
+  # eigenvalue of the profiled curvature was 0.05.
+  #
+  # Reporting intervals from that would be numbers that look like standard
+  # errors and are not, which is worse than saying so. The matrix is kept
+  # on the fit for anyone who wants to look, and an explicit
+  # ctOptimUncertainty(fit) still computes from it.
+  if (!isTRUE(intoverstates)) {
+    profiled <- try(.ctBackendJointHessian(out, out$estimate$raw),
+      silent = TRUE)
+    # On `$optim`, not `$uncertainty`. A state-explicit fit deliberately has
+    # no `$uncertainty` at all -- that NULL is how a caller tells "nothing was
+    # computed" from "computed and here it is" -- and the whole point of the
+    # message below is that this matrix is *not* an uncertainty: intervals from
+    # a profile the states flatten would be numbers that look like standard
+    # errors and are not. It is curvature the run reached, so it goes with the
+    # run.
+    if (!inherits(profiled, "try-error")) out$optim$hessian_profile <- profiled
+    message("No standard errors: an optimised intoverstates=FALSE fit has ",
+      "only the profile curvature, which the states flatten. Use ",
+      "optimize=FALSE to sample them, or intoverstates=TRUE.")
+  }
+  # A fit's default is for building a model: the curvature's normal, on the
+  # density the fit ends on, with the normal check made and recorded beside
+  # it (`control$check`), and one message where the posterior departs from
+  # that normal. To report, sample (`ctFitUncertainty(fit, 'sample')`).
+  # 'checked', the default before, cost 2.3 times as much on the race's
+  # hierarchical fixtures for the same median coverage, and its narrow
+  # intervals were no better announced (review/REVIEW-fit-uncertainty-2026-10-25.md,
+  # section 5). With sampling weights the sandwich, unless asked otherwise:
+  # the Hessian alone is the pseudo-likelihood's curvature, not the
+  # estimate's spread. `[[`: `$` falls back to the one field the name begins,
+  # so an `uncertaintyControl` given alone was read as the method and stopped
+  # the fit in `match.arg()`.
+  weighted <- length(out$model_spec$subject_weights) > 0L
+  uncertainty <- .ctJuliaOr(optimcontrol[["uncertainty"]],
+    if (weighted) "sandwich" else "hessian")
+  uncertaintycontrol <- .ctJuliaOr(optimcontrol$uncertaintyControl, list())
+  # The interval check beside 'hessian' (`optimcontrol$checks`).
+  uncertaintycontrol$check <- identical(uncertainty, "hessian") &&
+    "intervals" %in% .ctUncertaintyChecks(.ctJuliaOr(optimcontrol$checks, TRUE))
+  uncertain <- isTRUE(intoverstates) && !isTRUE(optimcontrol$estonly)
+  # One way to sample: `ctFit(optimize = FALSE)`, which places the sampler
+  # through this same pipeline before ever reaching this stage (see
+  # `.ctJuliaSampleFit()`, R/ctBackendSample.R). Asking for
+  # `uncertainty = 'sample'` here would mean sampling immediately after an
+  # ML/MAP optimisation that never wanted a metric built for it, on a fit
+  # whose `optimize = TRUE` the caller specifically chose -- refused by
+  # name rather than left to run two optimisations for one fit.
+  if (uncertain && identical(uncertainty, "sample")) {
+    stop("optimcontrol$uncertainty = 'sample' is refused here: sampling ",
+      "needs its own placement, which optimize = TRUE does not run. Use ",
+      "ctFit(optimize = FALSE) to fit and sample together, or ",
+      "ctFitUncertainty(fit, 'sample') on this fit once it is made.",
+      call. = FALSE)
+  }
+  measure <- function(fit, method, control = uncertaintycontrol) .ctFitUncertaintyImpl(
+    fit = fit, uncertainty = method,
+    draws = .ctJuliaOr(optimcontrol$uncertaintyDraws, "auto"),
+    finishsamples = .ctJuliaOr(optimcontrol$finishsamples, 1000L),
+    cores = cores, control = control, verbose = verbose)
+  # A run that ended on a jump has no Laplace answer: the objective is not
+  # continuous there, so it has no maximum. Its uncertainty is the curvature's
+  # at that point all the same, and the stage below warns whatever
+  # `checks` says; only the refined fit integrates the units
+  # it named, from there. That was once forced on every such fit, and on the
+  # affect pilot it gained 29 nats in nine hours.
+  jumped <- !is.null(out$laplace$jump)
+  continuing <- uncertain && !is.null(out$laplace) &&
+    identical(correctlaplace, "quadrature")
+  # Where the continuation runs it draws the uncertainty itself, by the method
+  # asked for, on the hybrid it ends on (`.ctLaplaceContinue()`), so the pass
+  # before it computes only what it starts from: the curvature's normal and
+  # the flat directions, without the interval check, which is made by the
+  # call that draws the intervals, on their density and at their point. The
+  # pass ran the sampling methods on the Laplace objective too, and threw the
+  # draws away: 134 s of anomS1's 205 s fit
+  # (review/REVIEW-fit-uncertainty-2026-10-25.md, section 3). Its draws are
+  # always replaced, so it leaves R's random stream where it found it: where
+  # the continuation leaves the fit alone, the method asked for then draws
+  # exactly what it draws on the uncorrected fit. A check made here, on the
+  # Laplace objective at its optimum, was once kept for a refined fit, whose
+  # intervals it did not describe.
+  plaincontrol <- uncertaintycontrol[setdiff(names(uncertaintycontrol), "check")]
+  if (uncertain && !(jumped && continuing)) {
+    if (continuing) {
+      restore <- .ctStreamKeep()
+      out <- holdrepair(measure(out, "hessian", plaincontrol))
+      restore()
+    } else out <- holdrepair(measure(out, uncertainty))
+  }
+
+  # The random-effects check, or the refined fit, after the certification has
+  # converged the Laplace objective and the uncertainty stage has built the
+  # Hessian it steps against, which it reuses rather than computing another.
+  # Before the constrained draws below, so that they are built once. See
+  # `.ctLaplaceContinue()`: the refined fit (`intoverpop = 'quadrature'`) replaces the
+  # covariance and draws with its own wherever its Hessian serves; the check,
+  # the default, only checks and warns.
+  if (!is.null(out$laplace) && isTRUE(intoverstates)) {
+    if (continuing) {
+      out <- holdrepair(.ctLaplaceContinue(out, cores = cores, verbose = verbose,
+        method = uncertainty, uncertaintycontrol = uncertaintycontrol))
+    } else if (jumped || identical(correctlaplace, "check")) {
+      out <- holdrepair(.ctLaplaceContinue(out, cores = cores, verbose = verbose,
+        correct = FALSE))
+    } else {
+      out$laplace$correction <- list(status = if (isTRUE(optimcontrol$estonly) &&
+        "randomeffects" %in% .ctUncertaintyChecks(.ctJuliaOr(optimcontrol$checks,
+          TRUE))) "estonly" else "off",
+        applied = FALSE)
+    }
+  }
+  # The method asked for where the refined fit did not draw it: on the
+  # Laplace objective, which the fit's estimate maximises unless the refined
+  # fit moved it with no Hessian of its own to draw on, when the draws are
+  # taken at the Laplace optimum and moved with the estimate, as the refined
+  # fit moves the normal's (`.ctLaplaceUncertaintyAtOptimum()`), and the
+  # interval check with them.
+  if (continuing && !jumped && !identical(out$laplace$correction$draws, "redrawn")) {
+    out <- holdrepair(.ctLaplaceUncertaintyAtOptimum(out,
+      function(fit) measure(fit, uncertainty)))
+  }
+  # What the check beside the curvature found, said once.
+  checknote <- if (uncertain) .ctUncertaintyCheckNote(out) else NULL
+  if (!is.null(checknote)) message(checknote)
+  # An accuracy asked for (`optimcontrol$accuracy`, in posterior sds): the
+  # method's own account of its error read against it, and a brief
+  # sampling run where it falls short (`.ctUncertaintyEscalate()`).
+  if (uncertain && !is.null(optimcontrol[["accuracy"]]) && !is.null(out$uncertainty$settings)) {
+    out <- holdrepair(.ctUncertaintyEscalate(out, optimcontrol[["accuracy"]],
+      cores = cores, verbose = verbose,
+      control = .ctJuliaOr(optimcontrol$sampleControl, list())))
+  }
+
+  # The draws pushed through the model's transforms, once, exactly as the Stan
+  # path stores `stanfit$transformedpars` at fit time. Every summary, extract
+  # and system-matrix collapse reads this rather than asking the engine again.
+  #
+  # `.ctBackendConstrained`, not `.ctBackendConstrain`: `ctOptimUncertainty()`
+  # has already done exactly this work for exactly these draws a few lines
+  # above, and calling the uncached form here repeated it in full. That was
+  # 4.5 s of a 16.7 s fit -- 27% of it -- computed twice and thrown away once,
+  # and it is the single largest reason a julia fit was slower end to end than
+  # the Stan path whose numerics it beats. The cached form recomputes only when
+  # the draws differ, which is what happens when uncertainty was skipped and
+  # `out$transformedpars` is still NULL.
+  out$transformedpars <- .ctBackendConstrained(out)
+
+  # The filter output at the estimate, cached as the Stan path caches
+  # `stanfit$kalman`: summary()'s standardised residual covariance reads it, and
+  # recomputing it per summary call would repeat a whole filter pass.
+  #
+  # The Laplace route filters each subject at its own estimated random effects,
+  # which is the smoothed equivalent of what the augmented route's carrier
+  # states give -- see `.ctBackendKalmanRaw`, which says so at the point of use.
+  # Only the prior prediction errors, not the whole filter pass. Every summary
+  # that reads a cached filter reads exactly `errprior`; the other seventeen
+  # arrays were transferred and stored so that one could be. See
+  # `.ctBackendPriorErrors`.
+  out$priorerrors <- .ctBackendPriorErrors(out)
+
+  # What the fit can honestly say about its own credibility. Not a verdict on
+  # whether the answer is sensible -- that is a judgement about the model and
+  # the data -- but a statement of which directions the data does not determine,
+  # and therefore which reported intervals do not mean what they appear to.
+  rawnames <- .ctBackendRawParameterNames(out, length(out$estimate$raw))
+  # First, how well the data determine each random effect's population sd,
+  # and how much of each subject's effect its own data determine, at the
+  # estimate the fit reports -- after the quadrature correction, when
+  # that moved it. Put where `.ctBackendIdentifiability()` below finds it
+  # (`fit = out`), which carries it into the report, as every later rebuild
+  # of the report does. Not at the start, which was the plan, and not where
+  # the optimiser stopped: at the first the population sds are starting
+  # values, and the second is the Laplace optimum before the correction, which
+  # can sit where the approximation is least trustworthy; both are measured
+  # in R/ctBackendEffectInformation.R. Not on the state-explicit route, whose
+  # estimate is the joint optimum.
+  #
+  # Under the fit's `cores` ceiling, as the optimiser and the uncertainty phase
+  # are. Outside it, a `cores = 1` fit spread its check over every thread the
+  # session had, and left the worker pool at full width behind it.
+  # The fit's modes held on the layer the passes evaluate, for the units
+  # whose layout is the hybrid's (R/ctJuliaFitModes.R).
+  .ctJuliaHoldModes(out$model_spec, out$laplace[["modes"]], hybrid = FALSE)
+  effectcheck <- if (isTRUE(intoverstates)) .ctBackendWithMaxChunks(cores,
+    .ctEffectInformation(out$model_spec, out$estimate$raw,
+      point = "at the estimate", alone = !isTRUE(optimcontrol$estonly),
+      progress = .ctBackendProgressSink(verbose))) else NULL
+  if (!is.null(effectcheck)) {
+    # Each group's posterior from the same pass, stored once for every
+    # person-level report (R/ctRandomEffects.R).
+    out$randomeffects <- .ctRandomEffectsStore(out, effectcheck$posterior)
+    effectcheck$posterior <- NULL
+    out$identifiability <- list(effects = effectcheck)
+  }
+  .ctEffectMessage(effectcheck)
+  # `fit`/`at` let it tell a random-effect block trading its scale off against
+  # its correlations -- where the covariances are determined, and fixing a
+  # value throws them away -- from a direction the data says nothing about.
+  # `at` is where that curvature was evaluated, which after the Laplace
+  # correction is the Laplace optimum and not the reported estimate. `screen`
+  # is the likelihood's verdict along that curvature's flat directions, from
+  # the same point; see `.ctBackendIdentifiability()`.
+  out$identifiability <- .ctBackendIdentifiability(out$uncertainty$hessian,
+    rawnames, fit = out,
+    at = .ctJuliaOr(out$uncertainty$evaluated_at, out$estimate$raw),
+    screen = out$uncertainty$details$flatdirections,
+    certification = out$uncertainty$certification)
+  # `$uncertainty$intervalcheck` is attached by `.ctBackendUncertainty()`, so
+  # it describes whichever method ran; it is only warned about here. A separate
+  # question from identifiability: a direction can be flat enough to ruin every
+  # interval that touches it without being flat enough to be called
+  # unidentified, and that case reaches the user as a plausible fit with
+  # suspiciously wide intervals.
+  out$collapsedScales <- .ctBackendCollapsedScales(out)
+  # The convergence verdict and the standard-error findings together, once,
+  # now that both exist (see `.ctBackendFitWarnings()`).
+  .ctBackendFitWarnings(out, repairs = unique(repairs))
+  out
+}
+
+#' @export
+print.ctJuliaFit <- function(x, ...) {
+  cat("ctsem Julia fit\n")
+  # On a sampled fit the optimisation only placed the chains, so neither its
+  # log likelihood nor its verdict is the fit's: the sampler's line below is.
+  # Its own record stays on `$optim`, and its warnings in
+  # `$optim$placement_warnings`.
+  sampled <- !is.null(x$sample)
+  if (!sampled) cat("  log likelihood:", format(x$estimate$loglik),
+    if (identical(x$estimate$loglik_method, "checked")) paste0("(Laplace's error ",
+      "integrated by its check, ", .ctLoglikCheckedError(x$estimate),
+      "; Laplace ", format(x$estimate$loglik_laplace), ")"), "\n")
+  if (!is.null(x$estimate$loglik_weighted)) cat("  weighted log likelihood:",
+    format(x$estimate$loglik_weighted), "(sampling weights)\n")
+  if (!sampled) cat("  converged:", x$optim$converged, " iterations:",
+    x$optim$iterations, "\n")
+  # A sampled fit's headline is not the optimiser's. That optimisation ran only
+  # to place the sampler and build its metric, so a fit whose chains never
+  # agreed prints `converged: TRUE` on the line above and is still worthless.
+  if (!is.null(x$sample)) {
+    cat("  sampled: ", if (!is.null(x$sample$target))
+      paste0(x$sample$target, " posterior, ") else "",
+      .ctSampleDrawsLabel(x$sample), "; chains converged: ",
+      if (is.null(x$sample$converged) || is.na(x$sample$converged)) "unknown" else
+        as.character(isTRUE(x$sample$converged)), "\n", sep = "")
+    if (length(x$sample$diagnosis)) {
+      cat("  ", paste(utils::head(x$sample$diagnosis, 3), collapse = "; "),
+        ". See fit$sample.\n", sep = "")
+    }
+  }
+  # Everything below reads the optimum and its curvature, which on a sampled fit
+  # are the placement's: its intervals come from the draws.
+  if (sampled) return(invisible(x))
+  # The refined fit, only when it moved the estimate by a tenth of a
+  # standard error or more; the random-effects check's warning otherwise.
+  corr <- x$laplace$correction
+  if (isTRUE(corr$applied) && isTRUE(corr$material)) {
+    cat("  Laplace estimate ", if (identical(corr$method, "quadrature"))
+        paste0("continued on the quadrature objective",
+          if (!identical(corr$continuation, "converged")) ", short of its optimum")
+      else "refined by quadrature",
+      ": up to ", format(max(abs(corr$delta_se), na.rm = TRUE), digits = 2),
+      " standard errors, log likelihood ", format(corr$loglik_laplace, digits = 8),
+      " -> ", format(corr$loglik_quadrature, digits = 8),
+      ". See fit$laplace$correction.\n", sep = "")
+  } else if (!isTRUE(corr$applied) &&
+      isTRUE(abs(as.numeric(.ctJuliaOr(corr$gap_reported, 0))[1L]) >= 1)) {
+    # Not moved, and the approximation is still off by a nat or more here: the
+    # AnomAuth case, a Laplace optimum the quadrature objective does not have.
+    cat("  Laplace log likelihood ", format(corr$loglik_laplace, digits = 8),
+      if (corr$gap_reported < 0) " exceeds" else " falls short of",
+      " the quadrature value by ", format(abs(corr$gap_reported), digits = 3),
+      " here and no quadrature step improved on it; the log likelihood ",
+      "reported is the quadrature one. See fit$laplace$correction.\n", sep = "")
+  } else if (identical(corr$status, "flagged") || identical(corr$status, "jump")) {
+    # What the fit's warning said (`.ctLaplaceShiftMessage()`, or the jump's).
+    cat("  ", corr$message, "\n", sep = "")
+  }
+  # What the objective is known to, where the correction scored it and found
+  # anything to say: the rules' errors and what the screen left on Laplace.
+  err <- corr$error
+  if (is.list(err) && isTRUE(is.finite(err$nats)) && isTRUE(err$nats > 0)) {
+    cat("  Marginal likelihood integrated to within ", format(err$nats, digits = 2),
+      " nats; the estimate within ", format(err$se, digits = 2),
+      " standard errors of the exact-marginal optimum",
+      ". See fit$laplace$correction$error.\n", sep = "")
+  }
+  # One line, only when there is something to say. A reported interval much
+  # wider than the curvature at the estimate supports is not visible anywhere
+  # in the numbers themselves -- it was found once only by fitting the same
+  # data twice -- so it is said here, where a single fit is looked at.
+  cond <- x$laplace$conditioning
+  if (!is.null(cond) && isTRUE(cond$near_singular > 0L)) {
+    cat("  ", cond$near_singular, " of ", length(cond$min_eigenvalue),
+      " unit(s) with near-singular random-effect curvature; their Laplace ",
+      "terms are too high. See fit$laplace$conditioning.\n", sep = "")
+  }
+  ivc <- x$uncertainty$intervalcheck
+  if (!is.null(ivc) && isTRUE(ivc$nflagged > 0L)) {
+    cat("  ", ivc$nflagged, " interval(s) far wider than the curvature supports: ",
+      paste(utils::head(ivc$parameters, 4), collapse = ", "),
+      ". See fit$uncertainty$intervalcheck.\n", sep = "")
+  }
+  # And the opposite, which needs saying here more than the above does: a
+  # coordinate lying in a direction with no curvature keeps none of the
+  # variance the projected inverse has left to give, so it prints as tightly
+  # estimated. Nothing in the numbers themselves shows it.
+  if (!is.null(ivc) && isTRUE(ivc$nunidentified > 0L)) {
+    cat("  ", ivc$nunidentified,
+      " parameter(s) with no curvature, so no interval: ",
+      paste(utils::head(ivc$unidentified, 4), collapse = ", "),
+      ". summary() reports these as NA.\n", sep = "")
+  }
+  invisible(x)
+}
+
+#' Plots for ctJuliaFit objects
+#'
+#' The \code{backend='julia'} counterpart of \code{\link{plot.ctStanFit}}.
+#' \code{'regression'} plots model implied regression coefficients against the
+#' time interval via \code{\link{ctDiscretePars}}, \code{'kalman'} plots
+#' expectations via \code{\link{ctPredict}}, \code{'priorcheck'} plots each
+#' population parameter's prior against its posterior via
+#' \code{\link{ctPlotPosterior}}, and \code{'trace'} plots how the fit reached
+#' its estimate via \code{\link{ctTracePlot}}: the optimiser's trace, or each
+#' chain's draws for a sampled fit. Stan's own density and interval plots of a
+#' sampled fit (\code{'density'}, \code{'intervals'}) have no julia
+#' counterpart; \code{'priorcheck'} shows the posterior densities.
+#'
+#' @param x Fit object from \code{ctFit(..., backend='julia')}.
+#' @param types Vector of plot types: 'all', 'regression', 'kalman',
+#'   'priorcheck', 'trace'. 'all' leaves out 'regression' for a discrete time
+#'   model, 'priorcheck' for a fit with no posterior draws, and 'trace' for a
+#'   fit with nothing to trace.
+#' @param wait Logical. Pause between plots?
+#' @param ... Passed through to \code{\link{ctDiscretePars}} and
+#'   \code{\link{ctPredict}}. Beware clashes when \code{types='all'}.
+#' @return Nothing. Generates plots.
+#' @method plot ctJuliaFit
+#' @examples
+#' \donttest{
+#' # Needs a working julia backend, so the example is inert where Julia is
+#' # absent -- including on CRAN, whose check machines have none.
+#' if (isTRUE(ctJuliaStatus()$available)) {
+#'   data <- ctstantestdat
+#'   model <- ctModel(type = 'ct', manifestNames = 'Y1', latentNames = 'eta1',
+#'     LAMBDA = matrix(1))
+#'   model$pars$indvarying <- FALSE
+#'   fit <- ctFit(data, model, backend = 'julia', cores = 1)
+#'   plot(fit, wait = FALSE)
+#'   # Julia keeps running between calls, holding what it has compiled;
+#'   # this ends it.
+#'   ctJuliaKill("session")
+#' }
+#' }
+#' @export
+plot.ctJuliaFit <- function(x, types = "all", wait = TRUE, ...) {
+  available <- c("regression", "kalman", "priorcheck", "trace")
+  if (identical(types[1L], "all")) {
+    types <- available
+    if (!isTRUE(.ctFitModelObject(x)$continuoustime)) types <- setdiff(types, "regression")
+    if (NROW(x$estimate$rawposterior) < 2L) types <- setdiff(types, "priorcheck")
+    if (is.null(x$sample) && !NROW(x$optim$trace)) types <- setdiff(types, "trace")
+  }
+  unknown <- setdiff(types, available)
+  if (length(unknown)) {
+    stop("plot types ", paste0("'", unknown, "'", collapse = ", "),
+      " are Stan's own plots of its sample object; backend='julia' offers ",
+      paste0("'", available, "'", collapse = ", "), ", and 'priorcheck' ",
+      "shows the posterior densities.", call. = FALSE)
+  }
+  waitf <- function() {
+    if (!isTRUE(wait) || !length(types)) return(TRUE)
+    answer <- readline("Input [s] to stop, or leave blank and press [return] for next plot.")
+    !answer %in% c("s", "S")
+  }
+  if ("regression" %in% types) {
+    message("Plotting model implied regression coeffcients conditional on time interval using ctDiscretePars")
+    print(ctDiscretePars(x, plot = TRUE, ...))
+    types <- types[types != "regression"]
+    if (!waitf()) return(invisible(NULL))
+  }
+  if ("kalman" %in% types) {
+    message("Plotting expectations from ctPredict")
+    print(ctPredict(x, plot = TRUE, ...))
+    types <- types[types != "kalman"]
+    if (!waitf()) return(invisible(NULL))
+  }
+  if ("priorcheck" %in% types) {
+    message("Plotting prior and posterior distributions using ctPlotPosterior")
+    ctPlotPosterior(x, wait = wait)
+    types <- types[types != "priorcheck"]
+    if (!waitf()) return(invisible(NULL))
+  }
+  if ("trace" %in% types) {
+    message("Plotting how the fit reached its estimate using ctTracePlot")
+    print(ctTracePlot(x))
+  }
+  invisible(NULL)
+}
+
+#' @export
+coef.ctJuliaFit <- function(object, ...) .ctFitNameRaw(object, object$estimate$raw)
+
+# ctsem's N(0,1) raw prior on every coordinate of a julia model's parameter
+# vector -- what `priors = TRUE` builds -- whatever prior the model was fitted
+# with: the prior warm-up starts from it, and ctPlotPosterior() draws it.
+# `.ctBackendLaplacePriorSpec` maps it across levels on the Laplace route and
+# refuses a shape it cannot map rather than mis-assigning it.
+.ctJuliaFullPriorSpec <- function(model_spec, prepared_data, npar) {
+  if (!is.null(model_spec$laplace))
+    .ctBackendLaplacePriorSpec(prepared_data, model_spec$laplace, npar)
+  else .ctBackendPriorSpec(prepared_data, npar,
+    nextra = NROW(model_spec$ti_missing))
+}
+
+# The uncertainty step's covariance; on a sampled fit that is the draws' own.
+#' @export
+vcov.ctJuliaFit <- function(object, ...) .ctFitNameRawCov(object, object$estimate$cov)
+
+#' @export
+logLik.ctJuliaFit <- function(object, ...) {
+  if (.ctFitWeighted(object)) stop("logLik() and AIC() do not apply to a fit ",
+    "with sampling weights, which maximises a weighted likelihood: that value is ",
+    "fit$estimate$loglik_weighted.", call. = FALSE)
+  # `object$data` is now the sentinel-cleaned `standata` structure (a list,
+  # for parity with a stan fit -- see R/ctFit.R), not a data.frame, so
+  # `nrow()` on it no longer gives the row count. `$standata$ndatapoints` is
+  # the same count read directly off that structure; `model_spec$data` (the
+  # long data.frame `.ctJuliaPrepare()` kept) is the fallback for a fit built
+  # before that field existed.
+  nobs <- if (!is.null(object$standata$ndatapoints)) as.integer(object$standata$ndatapoints) else
+    nrow(.ctBackendSpec(object)$data)
+  structure(object$estimate$loglik, df = length(object$estimate$raw), nobs = nobs, class = "logLik")
+}
+
+# The controls for a run from the fit's own start: batching off when the caller
+# supplied that start, unless `optimcontrol$batch` says otherwise. See
+# `.ctJuliaOptimiseFit()`.
+#' @keywords internal
+.ctJuliaStartControl <- function(optimcontrol, inits) {
+  supplied <- !is.null(inits) && !identical(inits, "random")
+  if (!supplied || !is.null(optimcontrol$batch)) return(optimcontrol)
+  utils::modifyList(optimcontrol, list(batch = FALSE))
+}

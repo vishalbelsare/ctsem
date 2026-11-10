@@ -1,0 +1,127 @@
+## A content-keyed cache in front of the covariance construction, for BOTH
+## routes.
+##
+## `_ekf_predict_step!` and its neighbours call `sdcovsqrt2cov!` unconditionally
+## on every row, and the julia filter has no equivalent of the stan writer's
+## `whenmat`/`statedep` gate -- so T0VAR, DIFFUSION and MANIFESTVAR are rebuilt
+## whether or not anything about them changed. Measured on a k=3, 30-subject,
+## 300-row model with individual differences in one DIFFUSION correlation: 6000
+## construction calls per gradient on the laplace route for 140 distinct
+## matrices.
+##
+## Keyed on `mat`'s full contents rather than a hash, so an entry cannot go
+## stale. A hit costs up to `_COVCACHE_SLOTS` comparisons of O(d^2); the
+## construction it replaces is O(d^3). A table rather than one slot because the
+## three matrices of a given size share the entry and would otherwise evict each
+## other.
+##
+## Disabled by `_CTSEM_COV_CACHE[] = false`, so the uncached cost can be
+## measured rather than inferred.
+
+const _CTSEM_COV_CACHE = Ref(true)
+
+const _COVCACHE_SLOTS = 8
+const _COVCACHE_TLS_KEY = :ctsem_covcaches
+# Calls into the covariance construction, and how many missed the cache.
+const _COVCACHE_CALLS = Ref(0)
+const _COVCACHE_MISSES = Ref(0)
+
+"""Zero the covariance construction counters."""
+function ctsem_cov_cache_reset_counts()
+    _COVCACHE_CALLS[] = 0
+    _COVCACHE_MISSES[] = 0
+    return nothing
+end
+
+struct CovCache{T}
+    keys::Vector{Matrix{T}}
+    outs::Vector{Matrix{T}}
+    nslots::Base.RefValue{Int}
+    nextslot::Base.RefValue{Int}
+    d::Int
+    # Which construction this table's entries were built under; see below.
+    code::Int
+end
+
+CovCache{T}(D::Int, code::Int) where {T} = CovCache{T}(
+    [zeros(T, D, D) for _ in 1:_COVCACHE_SLOTS],
+    [zeros(T, D, D) for _ in 1:_COVCACHE_SLOTS], Ref(0), Ref(1), D, code)
+
+# The construction in force is part of the key. Without it an entry built under
+# one route is served under the other, which a switch mid-session -- every
+# comparison test and benchmark here -- turns into a wrong answer with no
+# symptom. Caught by the transparency test, not by inspection.
+#
+# The *code*, not a flag saying "expm or not". That was enough while there were
+# two constructions and stopped being enough the moment there were three: a
+# code-0 entry would have been served to a code-1 call, which is the same
+# failure one level down.
+#
+# In task-local storage, not a global keyed by thread. See the matching comment
+# in `_expm_cov_scratch`: a task can migrate between threads, so a thread id
+# does not identify a private buffer. The reuse that pays here is within one
+# task's run -- the same DIFFUSION matrix across that chunk's subjects and rows
+# -- and that is exactly what a task-local cache keeps. Across calls the
+# parameters have moved and every entry would miss anyway.
+#
+# One task-local *list* of tables under a plain `Symbol`, scanned by type and
+# code, rather than one entry per `(T, d, code)` key. The key was the obvious
+# form and it allocated: a tuple holding a `Type` is not `isbits`, so every
+# lookup built it on the heap -- 144 KB per gradient, for a function whose
+# whole purpose is to avoid work. A `Symbol` is already a heap object and
+# passing it costs nothing.
+#
+# The scan is over the tables one task has built, which is one per element
+# type, dimension and construction actually used -- a handful -- and each step
+# is a type test. That is cheaper than the allocation it replaces, let alone
+# than the construction either one is in front of.
+function _covcache(::Type{T}, __d::Int, code::Int) where {T}
+    d = __d
+    store = _ctsem_scratch()
+    caches = get(store, _COVCACHE_TLS_KEY, nothing)
+    if caches === nothing
+        caches = Vector{Any}()
+        store[_COVCACHE_TLS_KEY] = caches
+    end
+    list = caches::Vector{Any}
+    for e in list
+        if e isa CovCache{T} && e.d == d && e.code == code
+            return e
+        end
+    end
+    c = CovCache{T}(d, code)
+    push!(list, c)
+    return c
+end
+
+# The whole of `mat` is the key: the diagonal carries the standard deviations
+# and the lower triangle the off-diagonal coordinates, and both feed the result.
+@inline function _covcache_lookup(c::CovCache{T}, mat, __d::Int) where {T}
+    d = __d
+    @inbounds for e in 1:c.nslots[]
+        k = c.keys[e]
+        same = true
+        for j in 1:d, i in 1:d
+            if k[i, j] != mat[i, j]
+                same = false
+                break
+            end
+        end
+        same && return e
+    end
+    return 0
+end
+
+@inline function _covcache_store!(c::CovCache{T}, mat, out, __d::Int) where {T}
+    d = __d
+    slot = c.nextslot[]
+    @inbounds begin
+        for j in 1:d, i in 1:d
+            c.keys[slot][i, j] = mat[i, j]
+        end
+        copyto!(c.outs[slot], out)
+    end
+    c.nslots[] = max(c.nslots[], slot)
+    c.nextslot[] = slot == _COVCACHE_SLOTS ? 1 : slot + 1
+    return nothing
+end

@@ -1,0 +1,239 @@
+# Reporting for a `poprank` fit.
+#
+# The design constraint is that everything downstream keeps one code path. The
+# summary's `popsd` and `rawpopcorr` are already *derived* from the population
+# covariance rather than being free parameters -- `.ctBackendPopulationsOf()`
+# reads the model matrix `rawpopcov` and `.ctBackendRandomEffectLevel()` integrates each parameter's
+# transform over its own marginal spread by quadrature -- so a reduced-rank fit
+# only has to hand them the same thing: one entry per varying parameter, with a
+# marginal raw sd and the correlations among them.
+#
+# So this file computes the full `k x k` population covariance implied by the
+# basis block and the regression coefficients, and returns it in exactly the
+# shape the full-rank path returns. The single branch is in
+# `.ctBackendPopulationsOf()`; nothing else in the summary knows this feature
+# exists.
+
+# Raw parameter numbers for a set of labels, from the prepared parameter table.
+.ctBackendPopParnumber <- function(spec, labels) {
+  table <- as.data.frame(spec$parameter_table, stringsAsFactors = FALSE)
+  vapply(labels, function(l) {
+    index <- which(!is.na(table$param) & table$param %in% l &
+        !is.na(table$parnumber))
+    if (!length(index)) NA_integer_ else as.integer(table$parnumber[index[1L]])
+  }, integer(1L))
+}
+
+# The population moments a `poprank` fit reports: one entry per varying
+# parameter, basis effects first, with the regressed effects' variances and
+# covariances implied by `Sigma = [[S, S b'], [b S, b S b']]`.
+#
+# A regressed effect's `parnumber` is its *mean* parameter, which is what the
+# quadrature in `.ctBackendRandomEffectLevel()` has to displace to integrate
+# that parameter's transform over its population distribution. Its `rawsd` is
+# `sqrt((b S b')[i,i])`, which is a derived quantity with a genuine posterior
+# spread because `b` and `S` both have one -- so the interval it reports is
+# real, unlike the full-rank route's interval on a coordinate the likelihood
+# cannot distinguish.
+# The population moments under the standardised loading form: `Sigma = L L'`.
+#
+# One matrix product per draw, and no `T0cov` read at all -- the dimensions are
+# standardised by construction, so the covariance is entirely the loadings.
+# Rows are the basis effects in carrier order, then the regressed ones, which
+# is the order the rest of the summary machinery expects.
+#
+# Row `i` of the basis block has `i` free loadings and zeros after, which is
+# what removes the rotation freedom. A regressed row is full.
+.ctBackendPopLoadingPopulation <- function(spec, samples, regression,
+  basis, regressed, coefficients, ndraws) {
+  loadings <- regression$loadings
+  if (is.null(loadings) || !nrow(loadings)) return(NULL)
+  r <- length(basis)
+  k <- r + length(regressed)
+
+  number <- matrix(NA_integer_, k, r,
+    dimnames = list(c(basis, regressed), NULL))
+  for (i in seq_len(nrow(loadings))) {
+    number[loadings$param[i], loadings$dimension[i]] <-
+      .ctBackendPopParnumber(spec, loadings$loading[i])
+  }
+  for (i in seq_len(nrow(coefficients))) {
+    number[coefficients$param[i], match(coefficients$basis[i], basis)] <-
+      .ctBackendPopParnumber(spec, coefficients$coefficient[i])
+  }
+  # The basis block's upper triangle is structurally zero, so those entries are
+  # expected to be missing; anything else missing means the table and the spec
+  # disagree and a covariance built from it would be wrong.
+  structural <- outer(seq_len(k), seq_len(r), function(i, j) i <= r & j > i)
+  if (any(is.na(number) != structural)) return(NULL)
+
+  covariance <- array(0, dim = c(ndraws, k, k))
+  for (d in seq_len(ndraws)) {
+    L <- matrix(0, k, r)
+    L[!structural] <- samples[d, as.integer(number[!structural])]
+    covariance[d, , ] <- L %*% t(L)
+  }
+
+  meannumber <- .ctBackendPopParnumber(spec, c(basis, regressed))
+  if (anyNA(meannumber)) return(NULL)
+  .ctBackendPopulationMoments(list(parnumber = as.integer(meannumber),
+    param = c(basis, regressed), level = spec$model$subjectIDname,
+    covariance = covariance, rank = regression$rank,
+    regressed = regressed, approximate = isTRUE(regression$approximate)))
+}
+
+.ctBackendPopRegressionPopulation <- function(spec, samples, layout, flat) {
+  regression <- spec$model$popregression
+  if (is.null(regression)) return(NULL)
+  coefficients <- regression$coefficients
+  if (is.null(coefficients) || !nrow(coefficients)) return(NULL)
+
+  # BEFORE the `augmented` guard below, not after. Under the standardised
+  # loading form there are no free population sd parameters at all -- the block
+  # is a fixed identity -- so `.ctBackendAugmentedSds()` is empty and that
+  # guard returned NULL before this branch could run, which is what left
+  # `summary()$popsd` NULL. The whole covariance is `L L'` here: the dimensions
+  # have unit variance by construction, so there is no basis block to read out
+  # of `T0cov` and no product with it to form.
+  if (isTRUE(regression$standardised)) {
+    return(.ctBackendPopLoadingPopulation(spec, samples, regression,
+      regression$basis, regression$regressed, coefficients, nrow(samples)))
+  }
+
+  augmented <- .ctBackendAugmentedSds(spec)
+  if (is.null(augmented)) return(NULL)
+
+  basis <- regression$basis
+  regressed <- unique(coefficients$param)
+  ndraws <- nrow(samples)
+
+  # Basis effects in the order their carrier states appear, which is the order
+  # the full-rank path reports and the order the population sds are in.
+  basisparam <- as.character(augmented$param)
+  basisorder <- match(basisparam, basis)
+  if (anyNA(basisorder)) return(NULL)
+  # The basis effects' covariance, raw, in carrier order: the model matrix.
+  S <- .ctBackendRawPopCovMatrix(layout, flat, "rawpopcov")
+
+  # beta, as [regressed, basis] per draw, with columns matched to the basis
+  # order S is in.
+  betanumber <- matrix(NA_integer_, length(regressed), length(basis),
+    dimnames = list(regressed, basis))
+  for (ri in seq_len(nrow(coefficients))) {
+    betanumber[coefficients$param[ri], coefficients$basis[ri]] <-
+      .ctBackendPopParnumber(spec, coefficients$coefficient[ri])
+  }
+  betanumber <- betanumber[, basisparam, drop = FALSE]
+  if (anyNA(betanumber)) return(NULL)
+  meannumber <- .ctBackendPopParnumber(spec, regressed)
+  if (anyNA(meannumber)) return(NULL)
+
+  k <- length(basis) + length(regressed)
+  covariance <- array(0, dim = c(ndraws, k, k))
+  ia <- seq_along(basis); ib <- length(basis) + seq_along(regressed)
+  covariance[, ia, ia] <- S
+  for (d in seq_len(ndraws)) {
+    b <- matrix(samples[d, as.integer(betanumber)], length(regressed),
+      length(basis))
+    Sd <- matrix(S[d, , ], length(basis), length(basis))
+    covariance[d, ia, ib] <- Sd %*% t(b)
+    covariance[d, ib, ia] <- b %*% Sd
+    covariance[d, ib, ib] <- b %*% Sd %*% t(b)
+  }
+
+  parnumber <- c(as.integer(augmented$parnumber), as.integer(meannumber))
+  parname <- c(.ctBackendParamLabel(augmented$param, augmented$parnumber),
+    regressed)
+  .ctBackendPopulationMoments(list(parnumber = parnumber, param = parname,
+    level = spec$model$subjectIDname,
+    covariance = covariance, rank = regression$rank,
+    regressed = regressed, approximate = isTRUE(regression$approximate)))
+}
+
+# The estimated coefficients, as their own table. This is the object a
+# `poprank` fit actually estimated, so it is reported rather than only the
+# moments derived from it: `beta[i,j]` says how much of regressed effect `i` a
+# one raw unit difference in basis effect `j` implies.
+.ctBackendPopRegressionTable <- function(fit, spec, samples, digits = 3) {
+  regression <- spec$model$popregression
+  if (is.null(regression) || is.null(regression$coefficients)) return(NULL)
+  coefficients <- regression$coefficients
+  numbers <- .ctBackendPopParnumber(spec, coefficients$coefficient)
+  if (anyNA(numbers)) return(NULL)
+  draws <- samples[, as.integer(numbers), drop = FALSE]
+  out <- data.frame(
+    param = coefficients$param, on = coefficients$basis,
+    mean = apply(draws, 2L, mean), sd = apply(draws, 2L, stats::sd),
+    `2.5%` = apply(draws, 2L, stats::quantile, probs = .025),
+    `50%` = apply(draws, 2L, stats::median),
+    `97.5%` = apply(draws, 2L, stats::quantile, probs = .975),
+    row.names = NULL, check.names = FALSE, stringsAsFactors = FALSE)
+  numeric <- vapply(out, is.numeric, logical(1L))
+  out[numeric] <- lapply(out[numeric], round, digits)
+  attr(out, 'rank') <- regression$rank
+  attr(out, 'approximate') <- isTRUE(regression$approximate)
+  attr(out, 'basis') <- regression$basis
+  out
+}
+
+# The same statement for LaTeX, as one escaped line.
+#
+# Separate from `.ctBackendPopRegressionNote()` because the register is
+# different -- a figure outlives the session that made it, so this says the
+# structure and the count and nothing else -- and because the text has to
+# survive TeX. Only the parameter names can carry characters TeX would read, and
+# ctsem labels are alphanumeric, so an underscore is the whole of the escaping.
+.ctPopRegressionLatexNote <- function(fit) {
+  model <- tryCatch(.ctFitModelObject(fit), error = function(e) NULL)
+  regression <- model$popregression
+  if (is.null(regression) || is.null(regression$coefficients)) return(NULL)
+  escape <- function(x) gsub('_', '\\\\_', x, fixed = FALSE)
+  regressed <- escape(paste(unique(regression$coefficients$param), collapse = ', '))
+  basis <- escape(paste(regression$basis, collapse = ', '))
+  total <- regression$rank + length(unique(regression$coefficients$param))
+  paste0("&\\textrm{Individual differences have ", regression$rank,
+    " dimension", if (regression$rank > 1) "s" else "", " of ", total,
+    ": the spread of ", regressed, " follows from ", basis,
+    " and is not independent of it.} \\\\\n")
+}
+
+# What to say under the tables.
+#
+# The reader is shown standard deviations and correlations, which is what they
+# want from a multilevel fit, and some of those were estimated while others
+# follow from the dimension structure. Nothing in the numbers distinguishes
+# them, so the note has to -- and it is phrased in terms of *dimensions of
+# individual difference* rather than of the regression that implements them,
+# because the coefficients are the mechanism and not the finding.
+.ctBackendPopRegressionNote <- function(spec) {
+  regression <- spec$model$popregression
+  if (is.null(regression)) return(NULL)
+  regressed <- unique(regression$coefficients$param)
+  roles <- regression$roles
+  variancecell <- intersect(regressed, roles$param[!roles$mean])
+  demoted <- intersect(regressed, roles$param[roles$mean])
+  basis <- paste(regression$basis, collapse = ', ')
+  total <- regression$rank + length(regressed)
+
+  note <- paste0('Individual differences here have ', regression$rank,
+    ' dimension', if (regression$rank > 1) 's' else '', ', not ', total,
+    ': the spread and correlations of ', paste(regressed, collapse = ', '),
+    ' follow from ', basis, ' rather than being estimated separately, so ',
+    if (length(regressed) > 1) 'they have' else 'it has',
+    ' no variation independent of ', basis, '.')
+  if (length(variancecell)) {
+    note <- paste0(note, ' ', paste(variancecell, collapse = ', '),
+      if (length(variancecell) > 1) ' vary' else ' varies',
+      ' only in DIFFUSION / MANIFESTVAR, where this is the whole of what the ',
+      'data determines.')
+  }
+  if (length(demoted)) {
+    note <- paste0(note, ' ', paste(demoted, collapse = ', '),
+      if (length(demoted) > 1) ' are' else ' is',
+      ' constrained beyond that, to the ', regression$rank,
+      ' dimensions asked for rather than the ', regression$nmean,
+      ' the data supports -- an approximation, and the spreads above absorb ',
+      'what it drops.')
+  }
+  paste0(note, ' See poprank in ?ctFit.')
+}

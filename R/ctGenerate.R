@@ -1,65 +1,783 @@
 ctModeltoNumeric <- function(ctmodelobj){
   ###read in model
   #set any matrices to numeric elements
-  domessage<-FALSE
+  #
+  # Free parameters need *a* value before anything can be simulated. Zero,
+  # matching ctsem's behaviour before commit 437bfbc0, except for the
+  # diagonals `.ctGenerateDefaults()` names there.
+  #
+  # `.ctGenerateDefaults()` holds the per-matrix choices. They are defaults for
+  # *simulation*, not estimates: the point is that generation does not error,
+  # and anything a user cares about they should set. The julia generator does
+  # not use them; it puts free parameters at their prior centre.
+  defaults <- .ctGenerateDefaults(continuoustime =
+    if(!is.null(ctmodelobj$continuoustime)) ctmodelobj$continuoustime else TRUE)
+  filled <- character()
   sapply(names(ctmodelobj), function(x){
     if(is.matrix(ctmodelobj[[x]])){
       m <- ctmodelobj[[x]]
-      if(any(suppressWarnings(is.na(as.numeric(m))))){
-        domessage <<-TRUE
+      free <- suppressWarnings(is.na(as.numeric(m)))
+      dim(free) <- dim(m)
+      if(any(free)){
+        spec <- defaults[[x]]
+        idx <- which(free, arr.ind=TRUE)
+        for(k in seq_len(nrow(idx))){
+          i <- idx[k,1]; j <- idx[k,2]
+          value <- if(is.null(spec)) 0 else
+            if(i == j) spec$diagonal else spec$offdiagonal
+          m[i,j] <- value
+          # Every filled cell is named, including the ones filled with zero.
+          # Reporting only the non-zero ones made the common case silent: a
+          # model leaving only MANIFESTVAR or T0MEANS free said nothing at all,
+          # so a script -- or a test under a set.seed() -- generated from
+          # values it never stated and had no way to notice when those values
+          # changed underneath it. That is how test-binary-binary-mix.R came to
+          # characterise a dataset that no longer existed.
+          filled <<- c(filled, sprintf('%s[%d,%d]=%s', x, i, j, format(value)))
+        }
       }
-      m[suppressWarnings(is.na(as.numeric(m)))] <- 0
       ctmodelobj[[x]] <<- matrix(as.numeric(m),nrow=nrow(m), ncol=ncol(m))
     }
   })
-  if(domessage) message('Some free parameters in matrices set to zero!')
+  if(length(filled)) message(length(filled),
+    ' free parameters were given generating values: ',
+    paste(utils::head(filled, 8), collapse=', '),
+    if(length(filled) > 8) ', ...' else '',
+    '. Set them in the model if they matter.')
   
   return(ctmodelobj)
 }
+
+# The prior predictive itself. `ctGenerate(fromPriors = TRUE)` is the way in;
+# `ctGenerateFromPriors()` below is the deprecated former entry point, kept
+# because it is on CRAN, and `ctPlotPosterior()` reaches here directly for
+# `parsonly`, which generating data does not expose.
+.ctGenerateFromPriors <- function(cts,datastruct=NA,
+  fullposterior=TRUE, nsamples=200, parsonly=FALSE,cores=getOption("mc.cores", 2L),
+  backend=c('auto','julia','stan'),
+  n.subjects=20, Tpoints=NULL, dtmean=1){
+
+  backend <- match.arg(backend)
+
+  # A fit is unwrapped to the two things this needs -- the model it was built
+  # from, and the design to generate over. The model is the one the user passed
+  # to ctFit(), which `.ctFitBaseModel()` returns for either backend. What
+  # `.ctFitModelObject()` returns, and every other backend-agnostic caller
+  # wants, is that model after .ctModelIntOverPop() has augmented it. Handing
+  # the augmented one back to ctFit() below augments it a second time --
+  # measured on ctstantestfit, 28 parameter rows against 82 -- and renumbers
+  # the raw vector the prior indices refer to. A julia fit made before fits
+  # carried their model has only the augmented form, so it is refused, with
+  # the way past it.
+  if(inherits(cts, c('ctStanFit', 'ctJuliaFit'))){
+    fit <- cts
+    cts <- .ctFitBaseModel(fit)
+    if(is.null(cts)) stop(
+      'This fit does not carry the model it was built from -- julia fits made ',
+      'before fits kept it do not -- and the augmented form it runs cannot be ',
+      'prepared again. Pass the model instead: ctGenerateFromPriors(mymodel), ',
+      'adding datastruct if you want the design this fit used rather than a ',
+      "default one. backend='julia' is about which engine generates the data ",
+      'and is available either way.', call.=FALSE)
+    datastruct <- .ctFitLongData(fit)
+    .ctPriorScopeWarning(fit)
+  }
+
+  # A model on its own is enough to ask what its prior implies. `datastruct`
+  # says which subjects and times to generate for; a fit brought one, and
+  # without either there is a balanced design to fall back on -- otherwise a
+  # model that has never been fitted to anything, which is exactly the case a
+  # prior predictive is for, could not be asked the question.
+  if(!is.data.frame(datastruct) && !is.matrix(datastruct) &&
+      length(datastruct) == 1 && is.na(datastruct)){
+    tp <- if(!is.null(Tpoints) && !is.na(Tpoints[1])) as.integer(Tpoints[1]) else
+      if(!is.null(cts$Tpoints) && !is.na(cts$Tpoints[1])) as.integer(cts$Tpoints[1]) else
+        stop('No datastruct was given and the model carries no Tpoints, so ',
+          'there is no design to generate over. Pass Tpoints (with n.subjects ',
+          'and dtmean if the defaults do not suit), or a datastruct naming the ',
+          'subjects, times and missingness you want.', call.=FALSE)
+    datastruct <- data.frame(
+      rep(seq_len(n.subjects), each = tp),
+      rep(seq(0, by = dtmean, length.out = tp), times = n.subjects))
+    names(datastruct) <- c(cts$subjectIDname, cts$timeName)
+    # Zero rather than absent: a predictor column the model declares has to be
+    # there, and zero is the value that asks it for nothing.
+    for(predname in c(cts$TDpredNames, cts$TIpredNames)) datastruct[[predname]] <- 0
+  }
+
+  # -99, not NA. The placeholder says "generate a value for this row"; NA says
+  # the row is missing, and a missing row is one the generator steps over.
+  datastruct[,cts$manifestNames] <- -99
+
+  cts$TIpredAuto <- 0L
+
+  # `parsonly` asks about parameters and generates nothing, so there is no
+  # generator to choose; the prior draws are the same object either way. It
+  # takes the stan preparation because the constrained draws it returns are
+  # stan shaped -- ctPlotPosterior() reads `$stanfit$transformedpars`.
+  if(backend == 'auto') backend <-
+    if(isTRUE(tryCatch(ctJuliaStatus()$available, error=function(e) FALSE)))
+      'julia' else 'stan'
+  if(parsonly) backend <- 'stan'
+
+  # Prepared, not fitted.
+  #
+  # This used to fit the model to a one-row-per-subject dataset with every
+  # manifest set to NA, so that the "posterior" it optimised would be the
+  # prior, and then draw from the hessian covariance at the mode. That was a
+  # way to get a stan model instance to draw through, not a statement about
+  # the prior, and it cost an optimisation and a hessian to arrive at an
+  # answer that is written down in the model: ctsem's raw priors are
+  # independent normals, so the draws are one rnorm() each. It also went
+  # wrong in the ways an unnecessary optimisation does -- an empty dataset
+  # with priors off is a completely flat objective, and the optimiser wanders.
+  #
+  # `fit=FALSE` gives the same prepared data and model this needs, over the
+  # real row and missingness structure rather than a dummy one, without
+  # running anything.
+  args <- cts$args
+  args$model <- cts
+  args$ctstanmodel <- NULL
+  args$datalong <- datastruct
+  args$fit <- FALSE
+  args$priors <- TRUE
+  args$optimize <- TRUE
+  args$intoverstates <- TRUE
+  args$intoverpop <- TRUE
+  # `poprank` exists because the augmented *filter* cannot identify part of the
+  # population covariance. Generating is the other direction -- the covariance
+  # is being specified, not recovered -- so restricting its rank here would only
+  # stop a user generating data with a full-rank one.
+  #
+  # Load-bearing since julia gained random-effect generation: without it, every
+  # model with an indvarying DIFFUSION or MANIFESTVAR cell would generate from a
+  # rank-restricted population covariance, and seed-for-seed output would have
+  # moved for a reason that has nothing to do with generating.
+  args$poprank <- NA
+  args$cores <- cores
+  args$backend <- backend
+
+  prepared <- do.call(ctFit, args)
+
+  # With nothing free there is no prior to draw from; each backend otherwise
+  # failed further in, julia saying to use stan and stan with a raw exception.
+  nfree <- if(backend == 'julia') .ctBackendNpar(.ctBackendSpec(prepared)) else
+    as.integer(prepared$standata$nparams)
+  if(!length(nfree) || nfree < 1L) stop(
+    'This model has no free parameters, so there is no prior to draw from. ',
+    'ctGenerate(model) generates from the values it fixes.', call.=FALSE)
+
+  if(backend == 'julia'){
+    spec <- .ctBackendSpec(prepared)
+    if(is.null(spec$priors) || !length(spec$priors$index)) stop(
+      'The prepared model carries no prior specification, so there is nothing ',
+      "to draw from. Use backend='stan'.", call.=FALSE)
+    # The spec accounts for every free parameter or refuses to be built, so its
+    # index is exactly seq_len(npar).
+    npar <- length(spec$priors$index)
+    draws <- .ctPriorRawDraws(prepared$standata, npar, nsamples)
+    prepared$estimate <- list(raw = rep(0, npar), rawposterior = draws)
+    message('Generating ', nsamples, ' datasets from the prior, backend julia.')
+    ppf <- .ctBackendGenerateFromFit(prepared, nsamples=nsamples,
+      fullposterior=fullposterior, cores=cores)
+    return(list(Y = ppf$generated$Y, llrow = ppf$generated$llrow))
+  }
+
+  # stan. `sm` follows ctFit()'s own rule: the built-in model unless this
+  # model's text differs from it, in which case there is nothing compiled to
+  # reuse.
+  standata <- prepared$standata
+  if(isTRUE(prepared$setup$recompile)){
+    message('Compiling model -- usually ~ 1 min.')
+    sm <- rstan::stan_model(model_code = prepared$stanmodeltext)
+  } else sm <- stanmodels$ctsm
+
+  npar <- rstan::get_num_upars(stan_reinitsf(sm, standata))
+  draws <- .ctPriorRawDraws(standata, npar, nsamples)
+
+  prepared$stanmodel <- sm
+  prepared$stanfit <- list(rawest = rep(0, npar), rawposterior = draws)
+  class(prepared) <- c('ctStanFit','ctFit')
+
+  if(parsonly){
+    # dokalman=FALSE matches what the fitted route computed here: it took
+    # `dokalman` from `savescores`, which is off for this data.
+    prepared$stanfit$transformedpars <- suppressMessages(stan_constrainsamples(
+      sm = sm, standata = standata, samples = draws, cores = cores,
+      savescores = FALSE, savesubjectmatrices = FALSE, dokalman = FALSE,
+      pcovn = FALSE))
+    return(prepared)
+  }
+
+  ppf <- ctGenerateFromFit(fit = prepared, nsamples = nsamples,
+    fullposterior = fullposterior, cores = cores)
+
+  # Named by ctGenerateFromFit() and by .ctBackendGenerateFromFit() alike, and
+  # named correctly: dim 1 is the sample. This used to relabel dim 1
+  # `datapoints` and dim 2 `samples`, which is the wrong way round and
+  # contradicted the @return text directly above.
+  list(Y = ppf$generated$Y, llrow = ppf$generated$llrow)
+}
+
+# Says so when the fit had less than the full prior the draws come from.
+#
+# The draws always use every parameter's prior -- `.ctGenerateFromPriors()`
+# prepares with `priors = TRUE` whatever the fit used -- because that is what a
+# prior predictive is. A fit made with less used to be refused. That belonged to
+# the route this replaced, which fitted the model to an empty dataset and so had
+# nothing to optimise without a prior; drawing directly has no such need.
+#
+# `priorscope` says which prior the fit had. `$args$input$priors` alone cannot,
+# because ctFit() reduces 'randomCorr' to TRUE before it is captured; `$args$resolved$priors` records the scope itself, but only since
+# 2026-10-05. A fit made before `priorscope` was recorded has only the logical:
+# under `$args$resolved`; in `$args` itself for a fit saved by 3.11.1; or,
+# failing both, in the prepared data (`.ctFitPriorScope()`).
+.ctPriorScopeWarning <- function(fit){
+  scope <- .ctFitPriorScope(fit)
+  if(!scope %in% 'all') warning('This fit was specified with ',
+    if(scope %in% 'randomCorr') paste0("priors='randomCorr', a prior on the ",
+      'random-effect correlations only') else 'priors=FALSE',
+    '; these datasets draw every parameter from the prior the model specifies.',
+    call.=FALSE)
+  invisible(scope)
+}
+
+# Which prior a fit had: 'all', 'none' or 'randomCorr', read from what a fit
+# of any age records (see `.ctPriorScopeWarning()`).
+.ctFitPriorScope <- function(fit){
+  scope <- fit$args$input$priorscope
+  if(!is.null(scope)) return(scope)
+  priors <- fit$args$resolved$priors
+  if(is.null(priors)) priors <- fit$args$priors
+  if(is.null(priors) && !is.null(fit$standata$priors))
+    priors <- as.logical(fit$standata$priors)
+  if(identical(priors, 'randomCorr')) 'randomCorr' else
+    if(is.null(priors) || isTRUE(as.logical(priors))) 'all' else 'none'
+}
+
+# ctsem's prior over the raw parameters, sampled directly.
+#
+# `.ctBackendPriorSpec()` reads the index and scale of each raw parameter's
+# prior out of the prepared data. It is the same spec the julia engine is
+# handed and the same layout the generated stan model uses, and every family in
+# it is normal: the density the engines evaluate is
+# `weight * sum(dnorm(value / scale, log = TRUE))`, which as a distribution over
+# `value` is `normal(0, scale / sqrt(weight))`. `weight` is
+# `priormod / nsubsets`, and is 1 for anything but a subsetted fit.
+#
+# The spec accounts for every free parameter or refuses to be built, so there
+# is no unnamed remainder; the zero-filled matrix is there to make that
+# assumption visible rather than to be relied on.
+.ctPriorRawDraws <- function(standata, npar, nsamples,
+  spec = .ctBackendPriorSpec(standata, npar)){
+  .ctPriorRejectUnsamplable(standata)
+  sdvec <- spec$scale / sqrt(spec$weight)
+  draws <- matrix(0, nrow = nsamples, ncol = npar)
+  draws[, spec$index] <- stats::rnorm(nsamples * length(spec$index)) *
+    rep(sdvec, each = nsamples)
+  draws
+}
+
+# The prior families this cannot draw from, refused where the caller can act.
+#
+# `.ctBackendRejectLaplacePriors()` refuses the same models but advises
+# `backend='stan'`, which is wrong here: the obstacle is the density, not the
+# engine, and no backend samples it.
+#
+# Worth saying plainly what changed, because it reads like a lost capability
+# and is not one. The fit-to-empty-data route this replaced did not sample
+# these either -- it optimised to the mode and drew from the hessian covariance
+# there, so a laplaceprior parameter's "prior" draws came back gaussian
+# whatever laplaceprior said, and nothing reported it.
+.ctPriorRejectUnsamplable <- function(standata){
+  laplaceprior <- as.integer(standata$laplaceprior)
+  if((length(laplaceprior) && any(laplaceprior == 1L)) ||
+      isTRUE(as.integer(standata$laplacetipreds)[1L] == 1L)) stop(
+    'ctGenerateFromPriors() draws from the prior directly, and the smoothed ',
+    'double exponential ctsem uses for laplaceprior parameters is not a ',
+    'density it can draw from. No backend changes that -- the obstacle is the ',
+    'prior rather than the engine. The route this replaced did not sample them ',
+    'either: it drew from a gaussian approximation, so those draws were normal ',
+    'whatever laplaceprior said. Drop laplaceprior for the affected matrices ',
+    'to generate from priors.', call.=FALSE)
+  invisible(TRUE)
+}
+
+#' Generate data from a model's priors (deprecated)
+#'
+#' Deprecated. Use \code{\link{ctGenerate}(fromPriors = TRUE)}, which is the
+#' same computation reached through the function that generates data from a
+#' ctsem model generally. \code{ctStanGenerate} is a backward-compatible alias
+#' and is deprecated with it.
+#'
+#' @param cts A model -- \code{\link{ctModel}} or
+#' \code{\link{ctModelConvertOMX}} -- or a fit from either backend, which is
+#' simply a model that arrives with a design attached. Nothing here needs a fit:
+#' generating from the prior needs the model and a set of subjects and times to
+#' generate over, and a fit is one way to supply both.
+#' @param datastruct Long format data structure as used by ctsem, giving the
+#' subjects, times and missingness to generate for. Ignored when \code{cts} is
+#' a fit, which carries its own. Left at NA for a model, a balanced design of
+#' \code{n.subjects} subjects observed at \code{Tpoints} occasions
+#' \code{dtmean} apart is built instead.
+#' @param n.subjects,Tpoints,dtmean The design to build when \code{cts} is a
+#' model and no \code{datastruct} is given, and unused otherwise.
+#' \code{Tpoints} falls back to the model's own when it carries one.
+#' \code{n.subjects} is deliberately smaller than \code{\link{ctGenerate}}'s:
+#' this returns \code{nsamples} datasets rather than one.
+#' @param is Deprecated and ignored, with a warning if set. Importance
+#' sampling reweights draws taken from a gaussian approximation onto a target
+#' that cannot be sampled directly. Fitted to an empty dataset there is no
+#' such target: the likelihood contributes nothing and what remains is the
+#' prior, which ctsem holds as independent univariate densities in the raw
+#' space these draws are taken in. There is no approximation to correct.
+#' @param fullposterior Generate from the full prior, or from its mode (the raw
+#' origin)?
+#' @param nsamples How many samples to generate?
+#' @param parsonly If TRUE, only return samples of raw parameters, don't generate data.
+#' @param cores Number of cpu cores to use.
+#' @param backend Which engine turns a parameter draw into data: \code{'auto'}
+#' (the default -- \code{'julia'} when a julia session is available,
+#' \code{'stan'} otherwise), \code{'julia'} or \code{'stan'}. The draws
+#' themselves do not depend on this: they come from the model's prior, which is
+#' the same object either way. \code{parsonly=TRUE} returns those draws and
+#' generates nothing, so it does not use this argument.
+#'
+#' @return List containing Y, an array of nsamples by data rows by manifest
+#' variables, and llrow, an array of nsamples by data rows log likelihoods.
+#' With \code{parsonly=TRUE}, the prepared model carrying the prior draws
+#' under \code{$stanfit$rawposterior} and \code{$stanfit$transformedpars}.
+#' @aliases ctStanGenerate
+#' @export
+#'
+#' @examples
+#' \donttest{
+#' #generate and plot samples from prior predictive
+#' priorpred <- ctGenerateFromPriors(cts = ctstantestfit,cores=2,nsamples = 50)
+#' # backend = 'auto' generates with julia where it is available. Julia keeps
+#' # running between calls, holding what it has compiled; this ends it.
+#' if (isTRUE(ctJuliaStatus()$available)) ctJuliaKill("session")
+#'}
+ctGenerateFromPriors <- function(cts,datastruct=NA, is=FALSE,
+  fullposterior=TRUE, nsamples=200, parsonly=FALSE,cores=getOption("mc.cores", 2L),
+  backend=c('auto','julia','stan'),
+  n.subjects=20, Tpoints=NULL, dtmean=1){
+
+  .Deprecated(msg = paste0(
+    'ctGenerateFromPriors() is deprecated. Use ctGenerate(model, ',
+    'fromPriors = TRUE) instead -- same computation, reached through the ',
+    'function that generates data from a ctsem model generally.'))
+
+  # `is` selected stan's optimize-then-importance-sample route, back when
+  # ctFit() had an `optimcontrol$is` to select it with. It is not rewired,
+  # because nothing here approximates anything for it to correct. Named
+  # separately from the deprecation above, since it is a different mistake.
+  if(!identical(is, FALSE)) .Deprecated(msg = paste0(
+    'The `is` argument is deprecated and ignored. Importance sampling ',
+    'corrects a gaussian approximation to a posterior; this draws from the ',
+    'prior directly, so there is no approximation to correct.'))
+
+  .ctGenerateFromPriors(cts=cts, datastruct=datastruct,
+    fullposterior=fullposterior, nsamples=nsamples, parsonly=parsonly,
+    cores=cores, backend=backend, n.subjects=n.subjects, Tpoints=Tpoints,
+    dtmean=dtmean)
+}
+
+#' @export
+ctStanGenerate <- ctGenerateFromPriors
+
+
 
 #' ctGenerate
 #' 
 #' This function generates data according to the specified ctsem model object. 
 #' 
 #' @param ctmodelobj ctsem model object from \code{\link{ctModel}}.
-#' @param n.subjects Number of subjects to output.
+#' @param n Number of subjects to output. For a model with grouping
+#' levels above the subject (\code{ctModel(id = c('subject', 'study'))}), one
+#' count per level in the same order, innermost first: \code{c(100, 10)} is
+#' 100 subjects split evenly over 10 studies. A level not given has one group.
+#' @param n.subjects Deprecated; use \code{n}.
 #' @param burnin Number of initial time points to discard (to simulate stationary data)
-#' @param dtmean Positive numeric. Average time interval (delta T) to use.
-#' @param logdtsd Numeric. Standard deviation for variability of the time interval.
-#' @param dtmat Either NA, or numeric matrix of n.subjects rows and Tpoints-1 columns, 
+#' @param dtmean Positive numeric. Median time interval (delta T) to use.
+#' Intervals are drawn as \code{exp(rnorm(n, log(dtmean), logdtsd))}, so
+#' \code{dtmean} is the median rather than the mean whenever \code{logdtsd}
+#' is non-zero: the mean interval is \code{dtmean * exp(logdtsd^2/2)}, which
+#' at \code{logdtsd = 0.6} is about 20 percent longer than \code{dtmean}.
+#' @param logdtsd Numeric. Standard deviation of the log time interval. Zero
+#' gives an equal-interval design.
+#' @param dtmat Either NA, or numeric matrix of n rows and Tpoints-1 columns, 
 #' containing positive numeric values for all time intervals between measurements. 
 #' If not NA, dtmean and logdtsd are ignored.
+#' @param Tpoints Optional number of time points to generate. If supplied, this overrides
+#' any \code{Tpoints} stored in \code{ctmodelobj}. If not supplied, \code{ctGenerate}
+#' uses \code{ctmodelobj$Tpoints} when available.
 #' @param wide Logical. Output in wide format?
-#' @details Covariance related matrices are treated as Cholesky factors. 
+#' @param backend Which generator to use: \code{'r'}, \code{'julia'}, or
+#' \code{'auto'} (the default). \code{'julia'} generates from the model
+#' itself: each subject's parameters are drawn from the population at every
+#' level, its latent trajectory is simulated from the process, and each
+#' observation is drawn from its measurement model, so nonlinear dynamics,
+#' random effects on any parameter and binary, ordinal or count indicators are
+#' all generated exactly. It needs \code{ctmodelobj} to be a
+#' \code{ctModel(type='ct'/'dt')} object rather than the matrix-list form.
+#' \code{'r'} integrates a linear Gaussian system with a matrix exponential at
+#' the values the model states, with individual differences only through
+#' \code{TRAITVAR} and \code{MANIFESTTRAITVAR}, and fills free parameters
+#' with fixed defaults; it refuses a nonlinear model and has no measurement
+#' link. \code{'auto'} uses \code{'r'}, as \code{ctGenerate} always has,
+#' unless the model or the call needs \code{'julia'}: a nonlinear model, a
+#' non-Gaussian indicator, more than one count in \code{n}, or
+#' \code{values}. On a model that declares random effects or TI predictor
+#' effects, \code{'r'} says what it leaves out.
+#' @param values For \code{backend='julia'}: the population values to
+#' generate from, named and scaled as \code{summary()} reports them, so a
+#' model written for fitting can generate data at chosen values. A named
+#' numeric vector gives free parameters' values on their natural scale, e.g.
+#' \code{c(mm = 2, drift = -0.3)}. A list gives \code{summary()}'s sections:
+#' \code{values} (the same), \code{popsd} (random-effect sds on the natural
+#' scale, named by parameter), \code{rawpopcorr} (correlations of the random
+#' effects, named \code{'a__b'}) and \code{tipreds} (linearised TI predictor
+#' effects, named \code{'tip_<predictor>_<parameter>'}), as in
+#' \code{list(values = c(mm = 2), popsd = c(mm = 0.5), tipreds =
+#' c(tip_TI1_mm = 1))}; with grouping levels, \code{popsd.<level>} and
+#' \code{rawpopcorr.<level>} name a level's. What is not given takes its
+#' prior's centre: raw zero for a mean, \code{sdscale} for a raw sd, zero for
+#' a correlation or a free effect. A value fixed in the model cannot also be
+#' given here.
+#' @param fromPriors Draw the parameters from the model's priors rather than
+#' using the values the model specifies, and return \code{nsamples} datasets
+#' instead of one. This is the prior predictive: what the model says the data
+#' could look like before it has seen any. It needs no fitted model and no
+#' data -- with no \code{datastruct}, a balanced design of \code{n}
+#' subjects at \code{Tpoints} occasions \code{dtmean} apart is used.
+#' @param nsamples With \code{fromPriors=TRUE}, how many datasets to draw.
+#' @param datastruct A long format data frame giving the design to generate
+#' for, in place of the balanced one \code{n}, \code{Tpoints} and
+#' \code{dtmean} build: the subject (and any group) ids and times, TD and TI
+#' predictor values, and which observations exist -- a manifest cell that is
+#' NA stays missing, any other value or a manifest column left out is
+#' generated. A predictor the model names and \code{datastruct} lacks is zero
+#' (TD) or drawn standard normal per subject (TI). The same data frame is
+#' returned with the generated values filled in. Needs \code{backend='julia'},
+#' or \code{fromPriors=TRUE}, where a fit passed as \code{ctmodelobj} brings
+#' its own.
+#' @param cores With \code{fromPriors=TRUE}, cpu cores to use.
+#' @param intoverstates For \code{backend='julia'}: \code{'auto'} (the
+#' default, which is \code{FALSE}), \code{TRUE} or \code{FALSE}. A
+#' diagnostic handle rather than a modelling choice.
+#'
+#' \code{FALSE} samples the latent trajectory from the process and then each
+#' observation from its conditional distribution given the state at its row:
+#' a draw from the model. \code{TRUE} instead draws each row from the filter's
+#' one-step-ahead predictive, for the same subjects, which is the density a
+#' fit integrating over the states maximises. The two agree in distribution
+#' for linear dynamics with Gaussian indicators and differ otherwise, which is
+#' what makes the comparison useful.
+#'
+#' \code{backend='r'} already generates this way and ignores the argument.
+#' @section Generating values:
+#' With \code{backend='julia'} every value the model leaves free is fixed by
+#' the scale of its prior, and all of them are named in a message:
+#' \itemize{
+#'   \item a free parameter is at its prior's centre, raw zero, unless
+#'   \code{values} names it;
+#'   \item an individually varying parameter's population sd is its
+#'   \code{sdscale}, at every level it varies at, on the raw,
+#'   untransformed scale, unless \code{RAWPOPVAR} (\code{RAWPOPVAR_<level>})
+#'   states a number, and random effects are uncorrelated unless it states a
+#'   coordinate -- \code{\link{ctCov}} writes one from a covariance;
+#'   \item a time independent predictor is drawn standard normal per subject,
+#'   and an effect fixed in the model (\code{'mm||||TI1=0.5'}) shifts the raw
+#'   parameter by that much per unit of the predictor; an effect left free is
+#'   zero.
+#' }
+#' \code{fromPriors=TRUE} draws all of these from the priors instead.
+#'
+#' The julia generator also returns what it generated from, as attributes:
+#' \code{attr(, 'subjectpars')}, each subject's parameters on their natural
+#' scale with its id and groups; \code{attr(, 'grouppars')}, for a model with
+#' grouping levels, each group's parameters at each level -- its own effects
+#' and those above it, as a subject of average deviation within it would have;
+#' and \code{attr(, 'states')}, the latent
+#' states at every row by id and time (not with \code{intoverstates=TRUE},
+#' which draws observations from the filter rather than states).
+#' @details Covariance related matrices are treated as Cholesky factors.
 #' TRAITTDPREDCOV and TIPREDCOV matrices are not accounted for, at present. 
 #' The first 1:n.TDpred rows and columns of TDPREDVAR are used for generating
 #' tdpreds at each time point. 
-#' @examples 
-#' #generate data for 2 process model, each process measured by noisy indicator, 
-#' #stable individual differences in process levels.
-#' 
+#' @examples
+#' #a 2 process model, each process measured by a noisy indicator, with stable
+#' #individual differences in process levels
 #' generatingModel<-ctModel(Tpoints=8,n.latent=2,n.TDpred=0,n.TIpred=0,n.manifest=2,
 #'  MANIFESTVAR=diag(.1,2),
 #'  LAMBDA=diag(1,2),
 #'  DRIFT=matrix(c(-.2,-.05,-.1,-.1),nrow=2),
-#'  TRAITVAR=matrix(c(.5,.2,0,.8),nrow=2),
 #'  DIFFUSION=matrix(c(1,.2,0,4),2),
-#'  CINT=matrix(c(1,0),nrow=2),
+#'  CINT=matrix(c('cint1, indvarying=TRUE, sdscale=0.05',
+#'    'cint2, indvarying=TRUE, sdscale=0.08'),nrow=2),
+#'  MANIFESTMEANS=matrix(0,ncol=1,nrow=2),
 #'  T0MEANS=matrix(0,ncol=1,nrow=2),
 #'  T0VAR=diag(1,2))
 #'
-#' data<-ctGenerate(generatingModel,n.subjects=15,burnin=10)
+#' #the R generator: every subject at the values the model states, with free
+#' #cells filled by fixed defaults and no individual differences
+#' data <- ctGenerate(generatingModel,n=15,burnin=10)
+#'
+#' \donttest{
+#' #the julia engine: each subject's CINT drawn from the population, with the
+#' #means stated on the natural scale and the sds given by sdscale on the raw
+#' #scale (CINT is 10 * raw, so 0.5 and 0.8)
+#' if (isTRUE(ctJuliaStatus()$available)) {
+#'   data <- ctGenerate(generatingModel,n=15,burnin=10,
+#'     backend='julia',values=c(cint1=1,cint2=0))
+#' }
+#' }
+#'
+#' #the prior predictive: what the model says data could look like before it
+#' #has seen any. No fit, and no data.
+#' \donttest{
+#' priorpred <- ctGenerate(generatingModel, fromPriors = TRUE, Tpoints = 6,
+#'   n = 10, nsamples = 20, cores = 2)
+#' str(priorpred$Y)
+#' # backend = 'auto' generates with julia where it is available. Julia keeps
+#' # running between calls, holding what it has compiled; this ends it.
+#' if (isTRUE(ctJuliaStatus()$available)) ctJuliaKill("session")
+#' }
+#' @return From the R generator, a long format matrix with one row per subject
+#'   and time point, or wide format with \code{wide = TRUE}. From the julia
+#'   generator, the same long format, carrying the attributes described under
+#'   Generating values. With \code{fromPriors = TRUE}, a list: \code{Y}, an
+#'   \code{nsamples} by data rows by manifest variables array of generated
+#'   data, and \code{llrow}, the matching array of row log likelihoods.
 #' @export
 
-ctGenerate<-function(ctmodelobj,n.subjects=100,burnin=0,dtmean=1,logdtsd=0,dtmat=NA,
-  wide=FALSE){
+ctGenerate<-function(ctmodelobj,n=100,burnin=0,dtmean=1,logdtsd=0,dtmat=NA,
+  Tpoints=NULL, wide=FALSE, backend=c('auto','r','julia','stan'),
+  intoverstates='auto', fromPriors=FALSE, nsamples=200, datastruct=NA, cores=getOption("mc.cores", 2L),
+  values=NULL, n.subjects){
+  backend <- match.arg(backend)
+  if(!missing(n.subjects)){
+    .Deprecated(msg = 'ctGenerate(n.subjects = ) is deprecated; use n.')
+    n <- n.subjects
+  }
+  # A fit's `$model` is the specification prepared for fitting, with random
+  # effects added as extra states, and the generator's matrices no longer
+  # conform to it -- it failed with "non-conformable arguments". Said by name,
+  # with where the model as given is kept.
+  if(!is.null(ctmodelobj$modelmats)) stop(
+    "This model has been prepared for fitting, so it is not one ctGenerate() ",
+    "can generate from. Use the model as given to ctFit(), which a fit keeps ",
+    "as fit$modelbase (backend = 'julia') or fit$ctstanmodelbase ",
+    "(backend = 'stan'), or ctGenerateFromFit(fit) to generate from the ",
+    "fitted values.", call. = FALSE)
+
+  # The prior predictive is a different question about the same model -- what
+  # could the data look like, before the model has seen any -- so it lives
+  # behind a flag here rather than in a function of its own. The body is
+  # `.ctGenerateFromPriors()`.
+  #
+  # Arguments that shape the balanced design carry through; the rest describe a
+  # single dataset built by the generator below, which this route does not use,
+  # and are refused by name rather than accepted and ignored.
+  if(isTRUE(fromPriors)){
+    if(backend == 'r') stop("backend='r' cannot generate from priors: it ",
+      'integrates the model at fixed parameter values and has no way to ',
+      "apply a draw of them. Use 'julia' or 'stan'.", call.=FALSE)
+    unused <- c(if(!identical(burnin, 0)) 'burnin',
+      if(!identical(logdtsd, 0)) 'logdtsd',
+      if(!identical(dtmat, NA) && !is.na(dtmat[1])) 'dtmat',
+      if(!identical(wide, FALSE)) 'wide',
+      if(!identical(intoverstates, 'auto')) 'intoverstates',
+      if(!is.null(values)) 'values',
+      if(length(n) > 1L) 'one count per level in n')
+    if(length(unused)) stop('fromPriors=TRUE does not use ',
+      paste(unused, collapse=', '), ': it returns nsamples datasets over one ',
+      'design rather than a single dataset, and the design is n, ',
+      'Tpoints and dtmean, or a datastruct. Drop ',
+      if(length(unused) > 1) 'those arguments' else 'that argument',
+      ' or build the design yourself and pass it as datastruct.', call.=FALSE)
+    return(.ctGenerateFromPriors(cts=ctmodelobj, datastruct=datastruct,
+      nsamples=nsamples, cores=cores,
+      backend=if(backend == 'auto') 'auto' else backend,
+      n.subjects=n, Tpoints=Tpoints, dtmean=dtmean))
+  }
+  if(backend == 'stan') stop("backend='stan' generates only from priors, ",
+    'which is what it is there for. Use fromPriors=TRUE, or one of ',
+    "'auto', 'r' and 'julia'.", call.=FALSE)
+  # A design given is generated for as given: the arguments that describe a
+  # design to build instead are refused by name rather than ignored.
+  design <- is.data.frame(datastruct) || is.matrix(datastruct)
+  if(design){
+    unused <- c(if(!missing(n)) 'n', if(!missing(n.subjects)) 'n.subjects',
+      if(!missing(Tpoints)) 'Tpoints', if(!missing(dtmean)) 'dtmean',
+      if(!missing(logdtsd)) 'logdtsd', if(!missing(dtmat)) 'dtmat',
+      if(!missing(burnin)) 'burnin')
+    if(length(unused)) stop('datastruct is the design to generate for, and ',
+      paste(unused, collapse=', '), if(length(unused) > 1) ' describe' else
+        ' describes', ' one to build instead. Drop ',
+      if(length(unused) > 1) 'them.' else 'it.', call.=FALSE)
+    if(backend == 'r') stop("backend='r' cannot generate for a datastruct. ",
+      "Use backend='julia'.", call.=FALSE)
+  }
+  # `auto` is the R generator -- what ctGenerate has always been, so existing
+  # scripts keep their data -- except where only julia can do what was asked:
+  # a nonlinear model, a non-Gaussian indicator, grouping levels or stated
+  # population means. Julia generates from the model, random effects and
+  # measurement included; the R generator integrates a linear Gaussian system
+  # at fixed values and says so when the model asks for more.
+  nonlinear <- isTRUE(try(ctModelIsNonlinear(ctmodelobj), silent=TRUE))
+  # The R generator has no notion of a link, so it would produce continuous
+  # values for a manifest the model declares binary, ordinal or count.
+  categorical <- !is.null(ctmodelobj$manifesttype) &&
+    any(ctmodelobj$manifesttype > 0)
+  # The matrix-list model form carries no parameter specification for the
+  # engine to read, so `auto` keeps it on the R generator.
+  specified <- inherits(ctmodelobj, 'ctStanModel')
+  # Initial conditions named 'stationary' are placed by the engine.
+  stationary <- specified && any(ctmodelobj$pars$param %in% 'stationary')
+  # Stated population means (ctPar(mean=)) describe random effects, which only
+  # julia draws.
+  stated <- specified && length(ctmodelobj[['fixedpopmeans']]) > 0L
+  if(backend == 'auto') backend <-
+    if(nonlinear || categorical || stationary || stated || length(n) > 1L ||
+      !is.null(values) || design) 'julia' else 'r'
+  if(backend == 'r' && stated) stop("backend='r' does not generate random ",
+    "effects, so it cannot use the model's stated population means ",
+    "(fixedpopmeans). Use backend='julia'.", call.=FALSE)
+  # `'auto'` is the state-explicit route for every model. The argument stays
+  # because comparing the two routes on one specification is how the
+  # filter's approximation is checked; see test-julia-intoverstates.R.
+  if(identical(intoverstates,'auto')) intoverstates <- FALSE
+  intoverstates <- isTRUE(as.logical(intoverstates)[1])
+  if(backend == 'r' && (length(n) > 1L || !is.null(values))) {
+    stop("backend='r' generates subjects at the values the model states, ",
+      "without grouping levels or population means: ",
+      if(length(n) > 1L) "n must be one count" else
+        "values is a backend='julia' argument",
+      ". Use backend='julia'.", call.=FALSE)
+  }
+  if(backend == 'r' && categorical){
+    warning('This model declares non-Gaussian indicators (manifesttype ',
+      "1, 2 or 3) and backend='r' generates continuous values for them: the R ",
+      'generator has no measurement link. Use backend="julia" for ',
+      'binary, ordinal or count data.', call.=FALSE)
+  }
+  # Refusals first: the note below describes data that is then generated, and
+  # before them it named a 'stationary' cell's placeholder as a random effect
+  # in front of the refusal of the model that held it.
+  if(backend == 'r' && stationary) {
+    stop("This model names 'stationary' initial conditions, which ctGenerate's ",
+      "own generator cannot place. Use backend='julia' (the default for such ",
+      "models).", call.=FALSE)
+  }
+  if(backend == 'r' && nonlinear) {
+    stop("This model is nonlinear, and ctGenerate's own generator integrates a ",
+      "linear system: it has no way to apply a state-dependent specification. ",
+      "Use backend='julia' (the default for such models), which simulates ",
+      "the model directly.", call.=FALSE)
+  }
+  # What the R generator does not draw, named, since the julia path draws it
+  # and the two otherwise look alike from the call.
+  if(backend == 'r' && specified) {
+    varying <- .ctVaryingParams(ctmodelobj)
+    tieffects <- unlist(lapply(ctmodelobj$TIpredNames, function(nm) {
+      column <- ctmodelobj$pars[[paste0(nm, '_effect')]]
+      if(!is.null(column) && any(.ctTipredEffectActive(column) &
+          !is.na(ctmodelobj$pars$param))) nm
+    }))
+    if(length(varying) || length(tieffects)) message("backend='r' generates ",
+      'every subject at the values the model states: ',
+      if(length(varying)) paste0('random effects on ',
+        paste(varying, collapse=', '), if(length(tieffects)) ' and ' else ''),
+      if(length(tieffects)) paste0('effects of ', paste(tieffects, collapse=', ')),
+      " are not drawn, and free parameters are filled with fixed defaults. ",
+      "backend='julia' draws them from the population the model states.")
+  }
+  if(backend == 'julia'){
+    if(!'ctStanModel' %in% class(ctmodelobj)) {
+      stop("backend='julia' generation needs a ctModel(type='ct'/'dt') object, ",
+        "which carries the parameter specification the engine reads. The ",
+        "matrix-list form does not.", call.=FALSE)
+    }
+    if(design){
+      out <- .ctGenerateJulia(ctmodelobj, design = datastruct,
+        values = values, intoverstates = intoverstates)
+      if(wide) out <- ctLongToWide(out, id=ctmodelobj$subjectIDname,
+        time=ctmodelobj$timeName, manifestNames=ctmodelobj$manifestNames,
+        TDpredNames=ctmodelobj$TDpredNames, TIpredNames=ctmodelobj$TIpredNames)
+      return(out)
+    }
+    modelTpoints <- if(!is.null(Tpoints) && !is.na(Tpoints[1])) Tpoints[1] else
+      if(!is.null(ctmodelobj$Tpoints) && !is.na(ctmodelobj$Tpoints[1]))
+        ctmodelobj$Tpoints[1] else
+          stop('Tpoints not found in ctmodelobj and no Tpoints argument supplied. Provide Tpoints explicitly.')
+    fullTpoints <- burnin + as.integer(modelTpoints)
+    nsubjects <- as.integer(n[1])
+    times <- lapply(seq_len(nsubjects), function(si){
+      dtvec <- if(is.na(dtmat[1])) exp(rnorm(fullTpoints,log(dtmean),logdtsd)) else
+        c(rep(1,burnin), dtmat[si,,drop=TRUE])
+      tv <- numeric(fullTpoints)
+      for(t in 2:fullTpoints) tv[t] <- round(tv[t-1] + dtvec[t-1], 6)
+      tv
+    })
+    out <- .ctGenerateJulia(ctmodelobj, n, times,
+      values = values, intoverstates = intoverstates)
+    subjectpars <- attr(out, 'subjectpars')
+    grouppars <- attr(out, 'grouppars')
+    states <- attr(out, 'states')
+    if(burnin > 0){
+      keep <- unlist(lapply(seq_len(nsubjects), function(si)
+        (si-1)*fullTpoints + (burnin+1):fullTpoints))
+      out <- out[keep, , drop=FALSE]
+      if(!is.null(states)) states <- states[keep, , drop=FALSE]
+      # Time restarts at zero for each subject once the burnin is dropped, as
+      # the generator below does. Leaving it running from the burnin would make
+      # the first observed interval look like the whole burnin period.
+      for(si in seq_len(nsubjects)){
+        rows <- (si-1)*(fullTpoints-burnin) + seq_len(fullTpoints-burnin)
+        if(!is.null(states)) states[rows,ctmodelobj$timeName] <-
+          states[rows,ctmodelobj$timeName] - out[rows[1],ctmodelobj$timeName]
+        out[rows,ctmodelobj$timeName] <-
+          out[rows,ctmodelobj$timeName] - out[rows[1],ctmodelobj$timeName]
+      }
+    }
+    if(wide) out <- ctLongToWide(out, id=ctmodelobj$subjectIDname,
+      time=ctmodelobj$timeName,
+      manifestNames=ctmodelobj$manifestNames,
+      TDpredNames=ctmodelobj$TDpredNames, TIpredNames=ctmodelobj$TIpredNames)
+    attr(out, 'subjectpars') <- subjectpars
+    if(!is.null(grouppars)) attr(out, 'grouppars') <- grouppars
+    if(!is.null(states)) attr(out, 'states') <- states
+    return(out)
+  }
+  if('ctStanModel' %in% class(ctmodelobj)){
+    # The R generator reads every covariance as a Cholesky factor, so a
+    # covariance given as ctCov() is rewritten as one.
+    ctmodelobj <- .ctCovRefresh(ctmodelobj, 'cholesky')
+    # Reconstruct matrix-style slots when a ctStanModel is supplied.
+    mlist <- listOfMatrices(ctmodelobj$pars)
+    for(nm in names(mlist)){
+      ctmodelobj[[nm]] <- mlist[[nm]]
+    }
+  }
   
   ctmodelobj <- ctModeltoNumeric(ctmodelobj)
   
   m <- ctmodelobj
+  
+  modelTpoints <- NULL
+  if(!is.null(m$Tpoints) && !is.na(m$Tpoints[1])) modelTpoints <- m$Tpoints[1]
+  if(!is.null(Tpoints) && !is.na(Tpoints[1])) modelTpoints <- Tpoints[1]
+  
+  if(is.null(modelTpoints)) stop('Tpoints not found in ctmodelobj and no Tpoints argument supplied. Provide Tpoints explicitly.')
+  if(length(modelTpoints) != 1 || !is.finite(modelTpoints) || modelTpoints < 1) stop('Tpoints must be a single finite value >= 1.')
+  
+  modelTpoints <- as.integer(modelTpoints)
+  m$Tpoints <- modelTpoints
   fullTpoints<-burnin+m$Tpoints
 
-  for(si in 1:n.subjects){
+  for(si in 1:n){
     
     if(is.na(dtmat[1])) dtvec<- exp(rnorm(fullTpoints,log(dtmean),logdtsd))
     if(!is.na(dtmat[1])) dtvec <- c(rep(1,burnin),dtmat[si,,drop=FALSE])
@@ -68,7 +786,7 @@ ctGenerate<-function(ctmodelobj,n.subjects=100,burnin=0,dtmean=1,logdtsd=0,dtmat
     
     if(m$n.TDpred > 0) {
       tdpreds <- rbind(matrix(0,nrow=1+(burnin),ncol=m$n.TDpred)[-1,,drop=FALSE], #additional row added then removed in case no burnin
-        matrix(m$TDPREDMEANS + m$TDPREDVAR %*% rnorm(nrow(m$TDPREDVAR),0,1),ncol=m$n.TDpred))
+        matrix(m$TDPREDMEANS,ncol=m$n.TDpred))
     }
     
     # #convert to triangular...
@@ -103,25 +821,25 @@ ctGenerate<-function(ctmodelobj,n.subjects=100,burnin=0,dtmean=1,logdtsd=0,dtmat
 
     
     latents[1,] <- sm$T0MEANS+m$T0VAR %*% rnorm(m$n.latent)
-    Qinf <- fQinf(sm$DRIFT,sm$DIFFUSION)
-    
+    nl <- m$n.latent
+    Q <- sm$DIFFUSION %*% t(sm$DIFFUSION)
+
     for(i in 2:nrow(latents)){
-      dtA=expm::expm(sm$DRIFT * (sdat$time[i]-sdat$time[i-1]))
-      # message('dtA')
-      # print(dtA)
-      # message('dtCINT')
-      # print(solve(sm$DRIFT,(dtA - diag(m$n.latent))) %*% sm$CINT)
-      # message('dtG')
-      # print(t(chol(fdtQ(Qinf,dtA))))
-      latents[i,] <- dtA %*% latents[i-1,] +
-        solve(sm$DRIFT,(dtA - diag(m$n.latent))) %*% sm$CINT + 
-        t(chol(fdtQ(Qinf,dtA))) %*% rnorm(m$n.latent)
-      # browser()
-      if(m$n.TDpred > 0) latents[i,] <- latents[i,] + sm$TDPREDEFFECT %*% 
+      # The interval's intercept and noise as block exponentials, which divide
+      # by nothing: a drift with an auto effect of 0 -- a trend, a trait, an
+      # integrator -- has no inverse and no asymptotic covariance, and is
+      # generated as it is written.
+      dt <- sdat$time[i]-sdat$time[i-1]
+      dtA <- expm::expm(sm$DRIFT * dt)
+      dtCINT <- as.matrix(expm::expm(rbind(cbind(sm$DRIFT, sm$CINT), 0) * dt))[
+        1:nl, nl + 1, drop = FALSE]
+      latents[i,] <- dtA %*% latents[i-1,] + dtCINT +
+        .ctGenerateRoot(.ctNetworkInnovation(sm$DRIFT, Q, dt)) %*% rnorm(nl)
+      if(m$n.TDpred > 0) latents[i,] <- latents[i,] + sm$TDPREDEFFECT %*%
         t(as.matrix(sdat[i,m$TDpredNames,drop=FALSE]))
     }
     
-    for(i in 1:nrow(sdat)){
+    for(i in seq_len(nrow(sdat))){
       sdat[i,m$manifestNames] <- sm$LAMBDA %*% latents[i,] + sm$MANIFESTMEANS + 
         sm$MANIFESTVAR %*% rnorm(m$n.manifest)
     }
@@ -137,10 +855,18 @@ ctGenerate<-function(ctmodelobj,n.subjects=100,burnin=0,dtmean=1,logdtsd=0,dtmat
   }
   
   datalong<-as.matrix(datalong)
-  
-  
+
+  # Named as the model names them, matching backend='julia'. The loop above
+  # works in 'id' and 'time' throughout, so the rename happens once here
+  # rather than at every reference. A matrix-list model carries neither name
+  # and keeps the defaults.
+  idname <- if(!is.null(m$subjectIDname)) m$subjectIDname else 'id'
+  timename <- if(!is.null(m$timeName)) m$timeName else 'time'
+  colnames(datalong)[match(c('id','time'), colnames(datalong))] <-
+    c(idname, timename)
+
   if(wide==FALSE) return(datalong) else {
-    datawide <- ctLongToWide(datalong = datalong,id = 'id',time = 'time',
+    datawide <- ctLongToWide(datalong = datalong,id = idname,time = timename,
       manifestNames = m$manifestNames, TDpredNames = m$TDpredNames,TIpredNames = m$TIpredNames)
     datawide <- ctIntervalise(datawide = datawide,Tpoints = m$Tpoints,n.manifest = m$n.manifest,n.TDpred = m$n.TDpred,n.TIpred = m$n.TIpred,
       manifestNames=m$manifestNames,TDpredNames=m$TDpredNames,TIpredNames=m$TIpredNames)

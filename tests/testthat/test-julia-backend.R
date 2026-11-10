@@ -1,0 +1,940 @@
+test_that("Julia backend preparation is serializable and does not start Julia", {
+  model <- suppressWarnings(ctModel(
+    type = "ct",
+    LAMBDA = diag(1),
+    DRIFT = matrix("drift", 1, 1),
+    DIFFUSION = matrix("diffusion", 1, 1),
+    MANIFESTVAR = matrix("residual", 1, 1),
+    MANIFESTMEANS = matrix(0, 1, 1),
+    T0VAR = matrix(1, 1, 1),
+    T0MEANS = matrix(0, 1, 1)
+  ))
+  dat <- data.frame(id = rep(1:2, each = 3), time = rep(0:2, 2), Y1 = 0)
+
+  prepared <- suppressMessages(ctFit(
+    dat, model, backend = "julia", fit = FALSE,
+    optimcontrol = list(gradient = "forward"), nlcontrol = list(maxtimestep = .5)
+  ))
+  expect_s3_class(prepared, "ctJuliaModel")
+  expect_true(is.data.frame(prepared$parameter_table))
+  expect_equal(prepared$subject_starts, c(1L, 4L))
+  expect_equal(prepared$max_timestep, .5)
+  expect_true(all(c("PARS", "JAx", "Jy") %in% prepared$parameter_table$matrix))
+  free_transforms <- prepared$parameter_table$transform[
+    !is.na(prepared$parameter_table$parnumber)
+  ]
+  expect_true(all(grepl("param[", free_transforms, fixed = TRUE)))
+  expect_silent(unserialize(serialize(prepared, NULL)))
+})
+
+test_that("Julia setup emits ASCII string literals", {
+  expect_equal(ctsem:::.ctJuliaString("https://example.org/engine.git"),
+    "\"https://example.org/engine.git\"")
+  expect_equal(ctsem:::.ctJuliaString("C:/Julia/project"), "\"C:/Julia/project\"")
+  expect_error(ctsem:::.ctJuliaString("bad\nvalue"), "one non-empty-line")
+})
+
+test_that("Julia default initial values match Stan's small random raw initialization", {
+  set.seed(20260820)
+  expected <- rnorm(4, 0, .01)
+  set.seed(20260820)
+  expect_equal(ctsem:::.ctJuliaInitialValues(4), expected)
+  expect_equal(ctsem:::.ctJuliaInitialValues(2, c(.1, -.2)), c(.1, -.2))
+})
+
+test_that("forcerecompile reaches the julia spec and the objective it builds", {
+  # Fit-free: the spec, and the inputs every objective is built from.
+  nl <- function(drift) suppressWarnings(suppressMessages(ctModel(type = "ct",
+    n.latent = 2, n.manifest = 2, manifestNames = c("Y1", "Y2"),
+    latentNames = c("eta1", "eta2"), LAMBDA = diag(2),
+    PARS = matrix(paste0("p", 1:4), 4, 1), DRIFT = drift)))
+  heavy <- nl(matrix(c("-PARS[1,1]*(1 + 0.3*eta1^2)", "PARS[2,1]*eta1",
+    "PARS[3,1]*eta2", "-PARS[4,1]*(1 + 0.2*eta1*eta2)"), 2, 2))
+  set.seed(1)
+  dat <- data.frame(id = rep(1:4, each = 5), time = rep(0:4, 4),
+    Y1 = stats::rnorm(20), Y2 = stats::rnorm(20))
+  spec_of <- function(m, ...) suppressWarnings(suppressMessages(ctFit(dat, m,
+    backend = "julia", fit = FALSE, ...)))
+  compiled <- spec_of(heavy, forcerecompile = TRUE)
+  expect_true(isTRUE(compiled$compiletransforms))
+  expect_true(isTRUE(ctsem:::.ctJuliaObjectiveInputs(compiled)$ekf$compile_transforms))
+  plain <- spec_of(heavy)
+  expect_null(plain$compiletransforms)
+  expect_null(ctsem:::.ctJuliaObjectiveInputs(plain)$ekf$compile_transforms)
+
+})
+
+test_that("Julia backend rejects unsupported capabilities before session startup", {
+  model <- ctModel(
+    type = "ct", LAMBDA = diag(1), DRIFT = matrix("drift", 1, 1),
+    DIFFUSION = matrix(.2, 1, 1), MANIFESTVAR = matrix(.1, 1, 1),
+    MANIFESTMEANS = matrix(0, 1, 1), T0VAR = matrix(1, 1, 1),
+    T0MEANS = matrix(0, 1, 1)
+  )
+  # Overriding one entry at a time, rather than passing through `...`, because
+  # `...` would supply a second value for a formal the defaults already name.
+  unsupported <- function(...) do.call(ctsem:::.ctJuliaUnsupported,
+    utils::modifyList(list(model = model, optimize = TRUE, priors = FALSE,
+      intoverpop = FALSE, gendata = FALSE, stanmodeltext = NA,
+      compileArgs = list(), forcerecompile = FALSE), list(...)))
+  binary <- model
+  binary$manifesttype <- 1L
+  expect_error(unsupported(gendata = TRUE), "generation")
+  expect_error(unsupported(compileArgs = list(verbose = TRUE)), "Stan compilation controls")
+  # Honoured on julia: it compiles the model's expressions.
+  expect_no_error(unsupported(forcerecompile = TRUE))
+  # Binary is supported now -- the filter integrates the observation rather
+  # than linearising it -- so what is refused is anything beyond it.
+  expect_no_error(unsupported(model = binary))
+  # Ordinal is supported too, by the same quadrature with a cumulative logit
+  # in place of the Bernoulli likelihood.
+  ordinal <- model
+  ordinal$manifesttype <- 2L
+  expect_no_error(unsupported(model = ordinal))
+  # Count (3) and censored (4) are supported now as well, so what is refused
+  # is anything past them.
+  count <- model
+  count$manifesttype <- 3L
+  expect_no_error(unsupported(model = count))
+  beyond <- model
+  beyond$manifesttype <- 5L
+  expect_error(unsupported(model = beyond), "beyond censored")
+
+  # `optimize = FALSE` used to be on that list and is not any more: the engine
+  # has its own sampler, so the combination has to pass the capability check
+  # rather than be rejected by it. Asserting the absence of the old error keeps
+  # the lifted limitation from quietly coming back.
+  expect_no_error(unsupported(optimize = FALSE))
+
+  # Accepted and ignored until 2026-10-05; each now says what computes it.
+  expect_error(unsupported(savescores = TRUE), "ctKalman")
+  expect_error(unsupported(savesubjectmatrices = TRUE), "ctSubjectPars")
+  expect_error(unsupported(dots = "seed"), "seed, which only backend='stan'")
+})
+
+test_that("arguments a fit would coerce or drop are refused or named before any work", {
+  model <- suppressWarnings(suppressMessages(ctModel(type = "ct",
+    LAMBDA = diag(1), DRIFT = matrix("drift", 1, 1),
+    DIFFUSION = matrix("diffusion", 1, 1), MANIFESTVAR = matrix("residual", 1, 1),
+    MANIFESTMEANS = matrix(0, 1, 1), T0VAR = matrix(1, 1, 1),
+    T0MEANS = matrix(0, 1, 1))))
+  dat <- data.frame(id = rep(1:2, each = 3), time = rep(0:2, 2),
+    Y1 = c(0, 1, 0, 1, 1, 0))
+  prep <- function(...) suppressMessages(ctFit(dat, model, backend = "julia",
+    fit = FALSE, ...))
+  # 0 used to run and be recorded as the cores used; 'yes' became NA.
+  expect_error(prep(cores = 0), "positive whole number")
+  expect_error(prep(cores = 1.5), "positive whole number")
+  expect_error(prep(verbose = "yes"), "verbose must be")
+  expect_error(prep(seed = 1), "only backend='stan'")
+  # Sampling settings on a fit that optimises are named as unused.
+  expect_warning(prep(sampleControl = list(chains = 3)), "not used")
+  # The prior the fit runs under, not the logical it was reduced to; none by
+  # default.
+  expect_identical(suppressWarnings(prep(priors = "randomCorr"))$args$resolved$priors,
+    "randomCorr")
+  expect_identical(suppressWarnings(prep())$args$resolved$priors, FALSE)
+  # A binary indicator is checked against the data, as counts and ordinal
+  # categories are: a continuous column declared binary fitted silently.
+  binary <- model
+  binary$manifesttype <- 1L
+  binary$pars$value[binary$pars$matrix %in% "MANIFESTVAR"] <- 0
+  binary$pars$param[binary$pars$matrix %in% "MANIFESTVAR"] <- NA
+  expect_no_error(suppressWarnings(suppressMessages(ctFit(dat, binary,
+    backend = "julia", fit = FALSE))))
+  continuous <- dat
+  continuous$Y1 <- continuous$Y1 + 0.5
+  expect_error(suppressWarnings(suppressMessages(ctFit(continuous, binary,
+    backend = "julia", fit = FALSE))), "other than 0 and 1")
+  # ctFitUncertainty's ... swallowed a misplaced control entry; refused first,
+  # before the fit is looked at.
+  expect_error(ctFitUncertainty(NULL, "opg", chains = 4),
+    "control = list\\(chains")
+})
+
+test_that("the defaults a sampled or reduced-rank fit resolves to combine", {
+  # The ?ctFit example: random intercepts, TI predictors, one TI1 value missing.
+  m <- suppressMessages(ctModel(type = "ct", latentNames = c("eta1", "eta2"),
+    manifestNames = c("Y1", "Y2"), MANIFESTVAR = diag(.1, 2),
+    TDpredNames = "TD1", TIpredNames = c("TI1", "TI2", "TI3"),
+    LAMBDA = diag(2)))
+  prep <- function(...) suppressWarnings(suppressMessages(ctFit(ctstantestdat,
+    m, backend = "julia", fit = FALSE, ...)))
+  # Sampling integrates random intercepts with Gaussian indicators exactly and
+  # samples the exact marginal ('laplace'), and the missing value with it:
+  # imputed for the placement, a parameter of the sample.
+  sampled <- prep(optimize = FALSE)
+  expect_identical(sampled$args$resolved$intoverpop, "laplace")
+  expect_identical(sampled$ti_imputed$predictor, 1L)
+  # Sampling keeps the priors it is given, the default included -- it is not
+  # switched to TRUE -- and a scope that leaves parameters flat warns before
+  # the run. priors = TRUE is the way out, and says nothing.
+  expect_identical(sampled$args$resolved$priors, FALSE)
+  expect_identical(prep()$args$resolved$priors, FALSE)
+  expect_warning(suppressMessages(ctFit(ctstantestdat, m, backend = "julia",
+    fit = FALSE, optimize = FALSE)), "Sampling with priors=FALSE")
+  expect_warning(suppressMessages(ctFit(ctstantestdat, m, backend = "julia",
+    fit = FALSE, optimize = FALSE, priors = "randomCorr")),
+    "population sds without a prior")
+  expect_no_warning(suppressMessages(ctFit(ctstantestdat, m, backend = "julia",
+    fit = FALSE, optimize = FALSE, priors = TRUE)), message = "without a prior")
+  # Under laplace a rank below the varying T0MEANS fixed the initial state
+  # along a direction (-5481 against -1034, reported converged).
+  expect_error(prep(intoverpop = "laplace", poprank = 1),
+    "below the 2 individually varying T0MEANS")
+  expect_no_error(prep(intoverpop = "laplace", poprank = 2))
+})
+
+test_that("chain processes number at most cores", {
+  expect_identical(ctsem:::.ctBackendSampleWorkers(4L, 2L), 2L)
+  expect_identical(ctsem:::.ctBackendSampleWorkers(2L, 8L), 2L)
+  expect_identical(ctsem:::.ctBackendSampleWorkers(4L, NA), 1L)
+})
+
+test_that("a bracketed expression is resolved or refused for the reason it actually hit", {
+  # One model shape, three expressions, so the difference in the message is
+  # attributable to the expression and nothing else.
+  mk <- function(matrixname, cell) {
+    args <- list(type = "ct", n.latent = 2, n.manifest = 2, LAMBDA = diag(2),
+      manifestNames = c("Y1", "Y2"), latentNames = c("eta1", "eta2"),
+      PARS = matrix("shrink", 1, 1),
+      DRIFT = matrix(c("dr1", 0, 0, "dr2"), 2, 2, byrow = TRUE),
+      DIFFUSION = matrix(c("df1", 0, 0, "df2"), 2, 2),
+      MANIFESTVAR = matrix(c("mv1", 0, 0, "mv2"), 2, 2),
+      MANIFESTMEANS = matrix(0, 2, 1), CINT = matrix(0, 2, 1),
+      T0MEANS = matrix(0, 2, 1),
+      T0VAR = matrix(c("t0v1", 0, "t0v21", "t0v2"), 2, 2, byrow = TRUE))
+    args[[matrixname]][2, 1] <- cell
+    suppressWarnings(suppressMessages(do.call(ctModel, args)))
+  }
+
+  # A state reference reaches the canonical table as `state[1]`, which is what
+  # the message keys on -- so assert the rewriting as well as the refusal,
+  # since the refusal reads the rewritten text and not what was written.
+  # Spaces aside: the model is set up as a fit sets it up, which strips them.
+  canonical <- ctsem:::.ctJuliaCanonicalModel(mk("T0VAR", "0.5 * eta1"))
+  cell <- canonical$pars$param[canonical$pars$matrix %in% "T0VAR" &
+    canonical$pars$row == 2 & canonical$pars$col == 1]
+  expect_equal(gsub(" ", "", as.character(cell)), "0.5*state[1]")
+
+  expect_error(ctsem:::.ctJuliaParameterTable(mk("T0VAR", "0.5 * eta1")),
+    "cannot resolve T0VAR\\[2,1\\]")
+  expect_error(ctsem:::.ctJuliaParameterTable(mk("T0VAR", "0.5 * eta1")),
+    "depends on a latent state")
+  # And a parameter reference is a different problem with a different answer:
+  # it is resolved over the parameter it names, so the cell becomes that
+  # expression over a parameter slot rather than an error. Asserted by the
+  # shape of the composed transform, because which slot it lands in is fixture
+  # arithmetic. The resolver itself is tested in test-julia-parsrefs.R.
+  resolved <- ctsem:::.ctJuliaParameterTable(mk("T0VAR", "0.5 * PARS[1,1]"))
+  cell <- resolved[resolved$matrix %in% "T0VAR" & resolved$row == 2 &
+    resolved$col == 1, ]
+  expect_equal(nrow(cell), 1L)
+  expect_match(gsub(" ", "", as.character(cell$transform)),
+    "^0[.]5[*][(]param\\[[0-9]+[]][)]$")
+
+  # The three groups still take one, so the refusal above is about T0VAR being
+  # outside them rather than about bracketed expressions in general.
+  expect_no_error(ctsem:::.ctJuliaParameterTable(
+    mk("DIFFUSION", "0.2 + 0.05 * PARS[1,1]")))
+  expect_no_error(ctsem:::.ctJuliaParameterTable(
+    mk("MANIFESTVAR", "0.1 + 0.02 * PARS[1,1]")))
+})
+
+test_that("Julia parameter preparation emits state and Jacobian expressions", {
+  model <- ctModel(
+    type = "ct", LAMBDA = matrix("1 + eta1", 1, 1),
+    DRIFT = matrix(-.2, 1, 1), DIFFUSION = matrix(.2, 1, 1),
+    MANIFESTVAR = matrix(.1, 1, 1), MANIFESTMEANS = matrix(0, 1, 1),
+    T0VAR = matrix(1, 1, 1), T0MEANS = matrix(0, 1, 1)
+  )
+  table <- ctsem:::.ctJuliaParameterTable(model)
+  # Spaces aside, as a fit's setup leaves them out.
+  nospace <- function(x) gsub(" ", "", x)
+  expect_equal(nospace(table$updatetransform[table$matrix == "LAMBDA"]), "1+state[1]")
+  expect_equal(table$value[table$matrix == "JAx"], -.2)
+  expect_equal(nospace(table$updatetransform[table$matrix == "Jy"]), "1+2*state[1]")
+})
+
+test_that("Julia reuses the canonical raw transform for shared parameters", {
+  model <- suppressWarnings(ctModel(
+    type = "ct", n.latent = 2, LAMBDA = diag(2),
+    PARS = matrix("cross||TRUE", 1, 1),
+    DRIFT = matrix(c("d11", "PARS[1,1]", "d21", "d22"), 2, 2, byrow = TRUE),
+    DIFFUSION = diag(c(.2, .15)), MANIFESTVAR = diag(c(.1, .1)),
+    MANIFESTMEANS = matrix(0, 2, 1), T0VAR = diag(2), T0MEANS = matrix(0, 2, 1)
+  ))
+  data <- data.frame(id = rep(1:2, each = 2), time = rep(0:1, 2),
+    Y1 = 0, Y2 = 0)
+
+  # Augmented by name: the parameter table this reads is that route's, and
+  # 'auto' takes laplace for a varying parameter shared with DRIFT.
+  prepared <- suppressMessages(ctFit(data, model, backend = "julia", fit = FALSE,
+    intoverpop = "augmented"))
+  d11 <- subset(prepared$parameter_table,
+    matrix == "DRIFT" & row == 1L & col == 1L)
+  d22 <- subset(prepared$parameter_table,
+    matrix == "DRIFT" & row == 2L & col == 2L)
+  pars <- subset(prepared$parameter_table,
+    matrix == "PARS" & row == 1L & col == 1L)
+
+  expect_true(is.na(pars$parnumber))
+  expect_equal(d22$parnumber, 3L)
+
+  # This assertion used to read "0 + 1 * (param[3] * 1 + 0)", the identity,
+  # and it was pinning a bug rather than a behaviour. The PARS carrier row
+  # carries when == 100 by the time the julia setup is built, and the
+  # canonical-transform lookup accepted when == 100 alongside when == 0. A
+  # `when == 100` row holds a *state* index in the column the lookup reads as
+  # a parameter number, so the carrier claimed parameter 3 and handed d22 its
+  # own identity transform. d22 is a drift diagonal: losing that transform
+  # loses the constraint keeping the diagonal negative, which is the whole
+  # point of it. Both diagonals must now carry the same transform, differing
+  # only in which raw parameter they read.
+  expect_equal(d22$transform,
+    "-(1e-06 + 2 * log1p_exp(-(2 * param[3])))")
+  expect_equal(d22$transform, gsub("param[1]", "param[3]", d11$transform,
+    fixed = TRUE))
+})
+
+test_that("both drift diagonals keep their transform on the default route too", {
+  model <- suppressWarnings(ctModel(
+    type = "ct", n.latent = 2, LAMBDA = diag(2),
+    PARS = matrix("cross||TRUE", 1, 1),
+    DRIFT = matrix(c("d11", "PARS[1,1]", "d21", "d22"), 2, 2, byrow = TRUE),
+    DIFFUSION = diag(c(.2, .15)), MANIFESTVAR = diag(c(.1, .1)),
+    MANIFESTMEANS = matrix(0, 2, 1), T0VAR = diag(2), T0MEANS = matrix(0, 2, 1)
+  ))
+  data <- data.frame(id = rep(1:2, each = 2), time = rep(0:1, 2),
+    Y1 = 0, Y2 = 0)
+  # Laplace, where the varying PARS cell is a parameter rather than a carrier
+  # row, so it has a raw index of its own; the drift diagonals must still
+  # carry the drift transform, differing only in which raw parameter they read.
+  prepared <- suppressMessages(ctFit(data, model, backend = "julia", fit = FALSE))
+  expect_false(is.null(prepared$laplace))
+  tab <- prepared$parameter_table
+  d11 <- subset(tab, matrix == "DRIFT" & row == 1L & col == 1L)
+  d22 <- subset(tab, matrix == "DRIFT" & row == 2L & col == 2L)
+  pars <- subset(tab, matrix == "PARS" & row == 1L & col == 1L)
+  expect_false(is.na(pars$parnumber))
+  expect_match(d22$transform, "log1p_exp", fixed = TRUE)
+  expect_equal(d22$transform, gsub(sprintf("param[%d]", d11$parnumber),
+    sprintf("param[%d]", d22$parnumber), d11$transform, fixed = TRUE))
+})
+
+test_that("Julia preparation retains missing manifest values", {
+  model <- ctModel(type = "ct", LAMBDA = diag(1), DRIFT = matrix("drift", 1, 1),
+    DIFFUSION = matrix("diffusion", 1, 1), MANIFESTVAR = matrix("residual", 1, 1),
+    MANIFESTMEANS = matrix(0, 1, 1), T0VAR = matrix(1, 1, 1),
+    T0MEANS = matrix(0, 1, 1))
+  dat <- data.frame(id = 1, time = 0, Y1 = NA_real_)
+  prepared <- suppressMessages(ctFit(dat, model, backend = "julia", fit = FALSE))
+  expect_true(is.na(prepared$manifest_data[1, 1]))
+})
+
+test_that("Julia preparation receives ctFit predictor arrays and TI effect mapping", {
+  model <- suppressWarnings(ctModel(
+    type = "ct", LAMBDA = diag(1), DRIFT = matrix("drift", 1, 1),
+    DIFFUSION = matrix(.2, 1, 1), MANIFESTVAR = matrix(.1, 1, 1),
+    MANIFESTMEANS = matrix(0, 1, 1), T0VAR = matrix(1, 1, 1),
+    T0MEANS = matrix(0, 1, 1), n.TDpred = 1, TDpredNames = "dose",
+    TDPREDEFFECT = matrix("impulse", 1, 1), n.TIpred = 1,
+    TIpredNames = "group", tipredDefault = FALSE
+  ))
+  model$pars$group_effect[model$pars$param == "drift"] <- TRUE
+  dat <- data.frame(
+    id = rep(1:2, each = 3), time = rep(c(0, 1, 3), 2), Y1 = 0,
+    dose = c(1, NA, 0, 0, 1, 0), group = rep(c(-1, 2), each = 3)
+  )
+
+  # The NA `dose` is warned about and zeroed; that is asserted on its own
+  # below, and suppressed here so this test speaks only to the arrays.
+  prepared <- suppressWarnings(suppressMessages(
+    ctFit(dat, model, backend = "julia", fit = FALSE)))
+  expect_equal(prepared$tdpred_data, matrix(c(1, 0, 0, 0, 1, 0), nrow = 1))
+  expect_equal(unname(prepared$tipred_data), matrix(c(-1, 2), ncol = 1))
+  expect_equal(prepared$ti_effects$parameter, 1L)
+  expect_equal(prepared$ti_effects$predictor, 1L)
+  expect_equal(prepared$ti_effects$coefficient,
+    max(prepared$parameter_table$parnumber, na.rm = TRUE) + 1L)
+})
+
+# Collect warnings without letting them escape, so a test can say how many
+# there were as well as what they said -- one per fit is part of the claim.
+.ctWarnings <- function(expr) {
+  seen <- character()
+  value <- withCallingHandlers(expr, warning = function(w) {
+    seen <<- c(seen, conditionMessage(w))
+    invokeRestart("muffleWarning")
+  })
+  list(value = value, warnings = seen)
+}
+
+# A missing TD predictor becomes zero on both backends, which is a decision
+# rather than an accident, so what it needs is to be visible: one warning per
+# fit naming the count and the column. Asserted at the object the julia engine
+# consumes, since that is where the substituted value would otherwise arrive
+# unannounced.
+test_that("a missing TD predictor warns once and reaches the julia path as zero", {
+  model <- suppressWarnings(ctModel(
+    type = "ct", LAMBDA = diag(1), DRIFT = matrix("drift", 1, 1),
+    DIFFUSION = matrix(.2, 1, 1), MANIFESTVAR = matrix(.1, 1, 1),
+    MANIFESTMEANS = matrix(0, 1, 1), T0VAR = matrix(1, 1, 1),
+    T0MEANS = matrix(0, 1, 1), n.TDpred = 1, TDpredNames = "dose",
+    TDPREDEFFECT = matrix("impulse", 1, 1)
+  ))
+  dat <- data.frame(id = rep(1:2, each = 3), time = rep(0:2, 2), Y1 = 0,
+    dose = c(1, NA, 0, 0, NA, 1))
+
+  run <- .ctWarnings(suppressMessages(
+    ctFit(dat, model, backend = "julia", fit = FALSE)))
+  told <- grep("TDpreds", run$warnings, value = TRUE)
+  expect_length(told, 1L)
+  expect_match(told, "2 in dose", fixed = TRUE)
+  expect_match(told, "replaced by zeroes", fixed = TRUE)
+  expect_equal(run$value$tdpred_data, matrix(c(1, 0, 0, 0, 0, 1), nrow = 1))
+})
+
+# A missing TI predictor -- imputed on the optimising path, sampled on the
+# sampling one -- is test-julia-tipred-missing.R's, which holds every test of
+# it, the fit on the optimising path included.
+
+test_that("Julia preparation expands individual differences into static states", {
+  model <- ctModel(
+    type = "ct", LAMBDA = diag(1), DRIFT = matrix("drift", 1, 1),
+    DIFFUSION = matrix(.2, 1, 1), MANIFESTVAR = matrix(.1, 1, 1),
+    MANIFESTMEANS = matrix(0, 1, 1), T0VAR = matrix(1, 1, 1),
+    T0MEANS = matrix(0, 1, 1), CINT = matrix("cint||TRUE", 1, 1)
+  )
+  dat <- data.frame(id = rep(1:2, each = 2), time = rep(0:1, 2), Y1 = 0)
+
+  # The augmented route by name: its preparation is what adds the states.
+  prepared <- suppressMessages(ctFit(dat, model, backend = "julia", fit = FALSE,
+    intoverpop = "augmented"))
+  expect_equal(prepared$nlatent, 1L)
+  expect_equal(prepared$nlatent_augmented, 2L)
+  expect_equal(prepared$dynamic_state_indices, 1L)
+  expect_true(any(prepared$parameter_table$matrix == "DRIFT" &
+    prepared$parameter_table$row == 2L & prepared$parameter_table$col == 2L))
+  expect_true(any(prepared$random_effects$type == "sd"))
+  expect_true(any(prepared$rewritten_cells$matrix == "CINT"))
+})
+
+test_that("Julia preparation rejects non-constant TI predictors", {
+  model <- suppressWarnings(ctModel(
+    type = "ct", LAMBDA = diag(1), DRIFT = matrix("drift", 1, 1),
+    DIFFUSION = matrix(.2, 1, 1), MANIFESTVAR = matrix(.1, 1, 1),
+    MANIFESTMEANS = matrix(0, 1, 1), T0VAR = matrix(1, 1, 1),
+    T0MEANS = matrix(0, 1, 1), n.TIpred = 1, TIpredNames = "group",
+    tipredDefault = FALSE
+  ))
+  model$pars$group_effect[model$pars$param == "drift"] <- TRUE
+  dat <- data.frame(id = c(1, 1), time = 0:1, Y1 = 0, group = c(0, 1))
+  expect_error(
+    suppressMessages(ctFit(dat, model, backend = "julia", fit = FALSE)),
+    "constant within subject"
+  )
+})
+
+# Row 1 used to build the manifest covariance before the update-group transform
+# that owns the cell had run, so a state-dependent MANIFESTVAR was read from a
+# parameter slot nothing had written. It needs no Stan to pin: with one
+# occasion per subject the state at the measurement is T0MEANS, which is fixed
+# here, so the state-dependent cell must give exactly what the same model gives
+# with that cell fixed at the transform's value there.
+test_that("a state-dependent MANIFESTVAR is transformed before row 1 reads it", {
+  skip_without_julia()
+
+  t0 <- 1.5
+  fixedsd <- .3 + .05 * t0   # what the expression yields at the initial state
+
+  .m <- function(manifestvar) suppressWarnings(ctModel(
+    type = "ct",
+    LAMBDA = diag(1),
+    DRIFT = matrix("drift", 1, 1),
+    DIFFUSION = matrix("diffusion", 1, 1),
+    MANIFESTVAR = matrix(manifestvar, 1, 1),
+    MANIFESTMEANS = matrix(0, 1, 1),
+    T0VAR = matrix(1, 1, 1),
+    T0MEANS = matrix(t0, 1, 1)))
+
+  statedep <- .m(paste0(".3 + .05 * eta1"))
+  equivalent <- .m(as.character(fixedsd))
+
+  # One row per subject, so every row is a row 1.
+  set.seed(11)
+  dat <- data.frame(id = 1:8, time = 0, Y1 = stats::rnorm(8, t0, 1))
+
+  specA <- suppressMessages(ctFit(dat, statedep, backend = "julia", fit = FALSE))
+  specB <- suppressMessages(ctFit(dat, equivalent, backend = "julia", fit = FALSE))
+
+  npar <- max(specA$parameter_table$parnumber, na.rm = TRUE)
+  expect_equal(npar, max(specB$parameter_table$parnumber, na.rm = TRUE))
+
+  set.seed(12)
+  raw <- stats::rnorm(npar, 0, .3)
+  a <- ctJuliaEvaluate(specA, raw, gradient = FALSE)$value
+  b <- ctJuliaEvaluate(specB, raw, gradient = FALSE)$value
+
+  expect_true(is.finite(as.numeric(a)))
+  expect_equal(as.numeric(a), as.numeric(b), tolerance = 1e-10)
+
+  # And the transform must actually be doing something: a cell fixed at a
+  # different value has to disagree, or the test above would pass on a model
+  # where MANIFESTVAR never varied at all.
+  specC <- suppressMessages(ctFit(dat, .m(as.character(fixedsd * 3)),
+    backend = "julia", fit = FALSE))
+  cc <- ctJuliaEvaluate(specC, raw, gradient = FALSE)$value
+  expect_false(isTRUE(all.equal(as.numeric(a), as.numeric(cc), tolerance = 1e-6)))
+})
+
+# `covmattransform` never reached the engine: every call passed a literal 0 and
+# the branch the other values select is commented out, so a 'cholesky' model
+# was fitted with the default transform and measured 3.76 log units away from
+# the same model on stan, silently. Refused rather than implemented.
+test_that("the julia backend accepts the constructions it can build", {
+  skip_on_cran()
+
+  .m <- function() suppressWarnings(ctModel(
+    type = "ct",
+    LAMBDA = diag(1, 2),
+    DRIFT = matrix(c("drift11", 0, 0, "drift22"), 2, 2),
+    DIFFUSION = matrix(c("diff11", "diff21", 0, "diff22"), 2, 2),
+    MANIFESTMEANS = matrix(0, 2, 1),
+    T0MEANS = matrix(0, 2, 1)))
+  dat <- data.frame(id = rep(1:4, each = 2), time = rep(0:1, 4),
+    Y1 = 0, Y2 = 0)
+  build <- function(tf) {
+    model <- .m()
+    model$covmattransform <- tf
+    suppressMessages(ctFit(dat, model, backend = "julia", fit = FALSE))
+  }
+
+  # `fit = FALSE` stops before Julia is needed, so none of this depends on a
+  # Julia installation.
+  for (tf in c("rawcorr", "cholesky", "z")) {
+    expect_error(build(tf), regexp = NA, info = tf)
+  }
+
+  # One value is refused, and not because the engine cannot build it:
+  # 'rawcorr_indep' selects the same construction as 'rawcorr' and differs only
+  # in the prior, so accepting it would accept a setting that does nothing.
+  expect_error(build("rawcorr_indep"), regexp = "covmattransform")
+
+  # Whatever the default is, it has to be one the guard accepts. Pinning the
+  # string made this fail the moment the default moved to "z", which tested the
+  # default rather than the guard this block is for.
+  expect_true(.m()$covmattransform %in% c("rawcorr", "cholesky", "z"))
+})
+
+test_that("the construction code map resolves every accepted name and no other", {
+  # The integers are stan's, from `standata$choleskymats` in R/ctData.R, so one
+  # model means one construction on either backend. Checked here as a table
+  # rather than through a fit, because what went wrong was the map itself:
+  # `.ctCovMatCode` sent 'z' to 2 and everything else to 0, which was correct
+  # only while the other values were refused upstream. Nothing tested it, and
+  # accepting 'cholesky' would have sent it to 0 -- the right answer for a
+  # different model, reported as this one's.
+  code <- function(tf) ctsem:::.ctCovMatCode(list(covmattransform = tf))
+  expect_equal(code("rawcorr_indep"), -1L)
+  expect_equal(code("rawcorr"), 0L)
+  expect_equal(code("cholesky"), 1L)
+  expect_equal(code("z"), 2L)
+  # No covmattransform at all is the pre-4.0 shape, and it means 'rawcorr'.
+  expect_equal(ctsem:::.ctCovMatCode(list()), 0L)
+  # And an unknown name errors rather than resolving: it means the validation
+  # has drifted from this table, which must not resolve to a construction by
+  # luck.
+  expect_error(code("nonesuch"), "Unknown covmattransform")
+})
+
+# The same row-1 ordering defect one hop further out. PARS lives in the
+# *predict* transform group, and row 1 ran the td and the update group only, so
+# an update-group cell written from a PARS cell -- LAMBDA, MANIFESTMEANS,
+# MANIFESTVAR or Jy -- read a parameter slot the predict group had not filled
+# and took the buffer's zero. Against stan that was 11.5 log units at one
+# occasion per subject.
+#
+# Pinned like its sibling above and for the same reason: at one occasion the
+# state at the measurement is T0MEANS. The PARS cell here is indvarying, so
+# intoverpop rewrites it to the augmented population coordinate, whose T0MEANS
+# is the raw parameter under the identity transform -- a known value. The
+# consumer is MANIFESTVAR rather than LAMBDA because the manifest covariance
+# does not enter Jy, so the two models agree exactly rather than to a
+# linearisation.
+test_that("a PARS cell is transformed before row 1's update group reads it", {
+  skip_without_julia()
+
+  t0 <- 1.5
+
+  .m <- function(manifestvar) suppressWarnings(ctModel(
+    type = "ct",
+    LAMBDA = diag(1),
+    PARS = matrix("mvp||TRUE", 1, 1),
+    DRIFT = matrix("drift", 1, 1),
+    DIFFUSION = matrix("diffusion", 1, 1),
+    MANIFESTVAR = matrix(manifestvar, 1, 1),
+    MANIFESTMEANS = matrix(0, 1, 1),
+    T0VAR = matrix(1, 1, 1),
+    T0MEANS = matrix(t0, 1, 1)))
+
+  # One row per subject, so every row is a row 1.
+  set.seed(11)
+  dat <- data.frame(id = 1:8, time = 0, Y1 = stats::rnorm(8, t0, 1))
+
+  # Augmented by name, all three: the PARS carrier is that route's.
+  specA <- suppressMessages(ctFit(dat, .m("PARS[1,1]"), backend = "julia", fit = FALSE,
+    intoverpop = "augmented"))
+  ptab <- specA$parameter_table
+  npar <- max(ptab$parnumber, na.rm = TRUE)
+
+  # The two halves of "the value the transform yields at row 1": PARS[1,1] is
+  # the augmented state, and that state at row 1 is its own T0MEANS, which is
+  # the raw parameter untransformed.
+  augmented <- which(ptab$matrix == "T0MEANS" & ptab$row == 2)
+  expect_identical(ptab$predicttransform[ptab$matrix == "PARS"][1], "state[2]")
+  expect_identical(ptab$transform[augmented],
+    paste0("param[", ptab$parnumber[augmented], "]"))
+
+  raw <- rep(-.5, npar)
+  raw[ptab$parnumber[augmented]] <- .4
+
+  specB <- suppressMessages(ctFit(dat, .m("0.4"), backend = "julia", fit = FALSE,
+    intoverpop = "augmented"))
+  expect_equal(npar, max(specB$parameter_table$parnumber, na.rm = TRUE))
+
+  a <- ctJuliaEvaluate(specA, raw, gradient = FALSE)$value
+  b <- ctJuliaEvaluate(specB, raw, gradient = FALSE)$value
+
+  expect_true(is.finite(as.numeric(a)))
+  expect_equal(as.numeric(a), as.numeric(b), tolerance = 1e-10)
+
+  # And the cell has to matter, or the equality above would also hold on a
+  # model whose MANIFESTVAR never varied.
+  specC <- suppressMessages(ctFit(dat, .m("1.2"), backend = "julia", fit = FALSE,
+    intoverpop = "augmented"))
+  cc <- ctJuliaEvaluate(specC, raw, gradient = FALSE)$value
+  expect_false(isTRUE(all.equal(as.numeric(a), as.numeric(cc), tolerance = 1e-6)))
+})
+
+# The same row-1 ordering defect a third time, in the state-explicit pass
+# (`_ctsem_state_pass!`) rather than in the filter. Its own docstring says the
+# pass materialises "the same three groups of state-dependent transforms at the
+# same three points" as the filter, and warns that a pass materialising them
+# elsewhere "would be fitting a different model and would still return a
+# perfectly plausible number"; row 1 ran the td group and the update group and
+# never the predict group. This is the path `intoverstates = FALSE` takes, and
+# `intoverstates = 'auto'` resolves to FALSE for a categorical model.
+#
+# Pinned like its two siblings above, and for the same reason: at one occasion
+# per subject the state at the measurement is T0MEANS, and with zero
+# innovations the T0VAR factor contributes nothing, so the state is exactly
+# T0MEANS. The PARS cell is indvarying, so intoverpop rewrites it to the
+# augmented population coordinate, whose T0MEANS is the raw parameter under the
+# identity transform -- a known value.
+#
+# MANIFESTMEANS is the consumer rather than MANIFESTVAR because the two agree
+# exactly here either way (the state pass reads LAMBDA and MANIFESTVAR
+# directly, with no Jacobian anywhere), and a MANIFESTVAR that took the
+# buffer's zero would be a zero measurement standard deviation, which returns
+# NaN and so announces itself. A MANIFESTMEANS that takes the zero returns a
+# finite, ordinary-looking number, 12.67 log units from the right one.
+test_that("a PARS cell is transformed before row 1 of the state pass reads it", {
+  skip_without_julia()
+
+  t0 <- 1.5
+
+  .m <- function(manifestmeans) suppressWarnings(ctModel(
+    type = "ct",
+    LAMBDA = diag(1),
+    PARS = matrix("mvp||TRUE", 1, 1),
+    DRIFT = matrix("drift", 1, 1),
+    DIFFUSION = matrix("diffusion", 1, 1),
+    MANIFESTVAR = matrix(0.3, 1, 1),
+    MANIFESTMEANS = matrix(manifestmeans, 1, 1),
+    T0VAR = matrix(1, 1, 1),
+    T0MEANS = matrix(t0, 1, 1)))
+
+  # One row per subject, so every row is a row 1.
+  set.seed(11)
+  dat <- data.frame(id = 1:8, time = 0, Y1 = stats::rnorm(8, t0, 1))
+
+  prep <- function(cell) suppressWarnings(suppressMessages(
+    ctFit(dat, .m(cell), backend = "julia", fit = FALSE, intoverstates = FALSE)))
+
+  specA <- prep("PARS[1,1]")
+  ptab <- specA$parameter_table
+  npar <- max(ptab$parnumber, na.rm = TRUE)
+
+  # The two halves of "the value the transform yields at row 1": PARS[1,1] is
+  # the augmented state, and that state at row 1 is its own T0MEANS, which is
+  # the raw parameter untransformed.
+  augmented <- which(ptab$matrix == "T0MEANS" & ptab$row == 2)
+  expect_identical(ptab$predicttransform[ptab$matrix == "PARS"][1], "state[2]")
+  expect_identical(ptab$transform[augmented],
+    paste0("param[", ptab$parnumber[augmented], "]"))
+
+  raw <- rep(-.5, npar)
+  raw[ptab$parnumber[augmented]] <- .4
+
+  handleA <- structure(specA, class = c("ctJuliaModel", "ctFitModel"))
+  # Zero innovations, so the state is T0MEANS exactly at every subject's row.
+  z <- numeric(ctsem:::.ctBackendStateDimension(handleA))
+
+  specB <- prep("0.4")
+  expect_equal(npar, max(specB$parameter_table$parnumber, na.rm = TRUE))
+  handleB <- structure(specB, class = c("ctJuliaModel", "ctFitModel"))
+
+  a <- ctsem:::.ctBackendJointDensity(handleA, raw, z, gradient = FALSE)
+  b <- ctsem:::.ctBackendJointDensity(handleB, raw, z, gradient = FALSE)
+
+  expect_true(is.finite(as.numeric(a$value)))
+  # The observation term on its own, as well as the total: the innovations'
+  # density is identical between the two models by construction, so comparing
+  # only the total would let a difference hide inside a term that cannot vary.
+  expect_equal(as.numeric(a$observation), as.numeric(b$observation),
+    tolerance = 1e-10)
+  expect_equal(as.numeric(a$value), as.numeric(b$value), tolerance = 1e-10)
+
+  # And the cell has to matter, or the equality above would also hold on a
+  # model whose MANIFESTMEANS never varied.
+  handleC <- structure(prep("1.2"), class = c("ctJuliaModel", "ctFitModel"))
+  cc <- ctsem:::.ctBackendJointDensity(handleC, raw, z, gradient = FALSE)
+  expect_false(isTRUE(all.equal(as.numeric(a$value), as.numeric(cc$value),
+    tolerance = 1e-6)))
+})
+
+# The Julia session the cache belongs to --------------------------------------
+#
+# Everything cached under `.ct_julia_cache` is a handle into one Julia process,
+# and nothing stops that process ending without ctsem's involvement: a user or
+# another package calling `JuliaConnectoR::stopJulia()`, or Julia dying. What
+# used to happen then was a raw bridge error -- "Object reference ... could not
+# be resolved", or `UndefVarError: ContinuousTimeSEM not defined` -- from
+# whatever the user called next, most visibly `ctGenerateFromFit()`. It reads
+# as a stored fit having gone stale, and it is not: a `ctJuliaFit` carries no
+# Julia handles, so the model rebuilds from its own plain R spec.
+
+test_that("a cache stamped with another Julia session is dropped rather than used", {
+  cache <- ctsem:::.ct_julia_cache
+  saved <- list(module = cache$module, project = cache$project,
+    engine = cache$engine, session = cache$session,
+    objectives = cache$objectives, layouts = cache$layouts)
+  withr::defer({
+    cache$module <- saved$module; cache$project <- saved$project
+    cache$engine <- saved$engine; cache$session <- saved$session
+    cache$objectives <- saved$objectives; cache$layouts <- saved$layouts
+  })
+
+  # A cache that believes it belongs to a session no longer reachable. The
+  # stamp is compared, not the module, so this needs no Julia at all.
+  cache$module <- new.env(parent = emptyenv())
+  cache$project <- "some/project"
+  cache$objectives <- new.env(parent = emptyenv())
+  assign("key", "a dead handle", envir = cache$objectives)
+  cache$session <- list(connection = NULL, port = -1L)
+
+  expect_message(expect_true(ctsem:::.ctJuliaCheckSession()), "has ended")
+  expect_null(cache$module)
+  expect_null(cache$session)
+  expect_length(ls(cache$objectives), 0L)
+  # Nothing to say on a cache that is empty, or on one whose stamp matches.
+  expect_silent(expect_false(ctsem:::.ctJuliaCheckSession()))
+})
+
+test_that("a model whose Julia session has ended is rebuilt, not reported as a dead reference", {
+  skip_without_julia()
+  # The model the package image has compiled (helper-julia.R): the Julia this
+  # test starts has compiled nothing else, and the subject is the session.
+  spec <- suppressMessages(ctFit(image_data(nsub = 3L, nobs = 4L, seed = 4L),
+    image_model(), backend = "julia", fit = FALSE))
+  raw <- rep(0, ctsem:::.ctBackendNpar(spec))
+
+  value <- suppressMessages(ctJuliaEvaluate(spec, raw, gradient = FALSE)$value)
+  expect_true(is.finite(as.numeric(value)))
+  cache <- ctsem:::.ct_julia_cache
+  expect_gt(length(ls(cache$objectives)), 0L)
+
+  # The session goes away underneath the cache, which is what a crash or
+  # somebody else's stopJulia() does. Nothing here holds the objective handle
+  # itself: a proxy kept in a local would be finalized against the replacement
+  # session later in the run, and that decrement prints a Julia stacktrace from
+  # inside whatever call happens to be next.
+  JuliaConnectoR::stopJulia()
+
+  expect_message(expect_true(ctsem:::.ctJuliaCheckSession()), "has ended")
+  expect_length(ls(cache$objectives), 0L)
+  # And the model rebuilds from its own spec, to the same likelihood -- which is
+  # what the reported failure could not do.
+  expect_equal(as.numeric(suppressMessages(
+    ctJuliaEvaluate(spec, raw, gradient = FALSE)$value)), as.numeric(value),
+    tolerance = 1e-10)
+})
+
+test_that("a call into a Julia process that has died errors by name, and the next starts afresh", {
+  skip_without_julia()
+  # The model the package image has compiled (helper-julia.R): the Julia this
+  # test starts has compiled nothing else, and the subject is the session.
+  spec <- suppressMessages(ctFit(image_data(nsub = 3L, nobs = 4L, seed = 4L),
+    image_model(), backend = "julia", fit = FALSE))
+  raw <- rep(0, ctsem:::.ctBackendNpar(spec))
+  value <- suppressMessages(ctJuliaEvaluate(spec, raw, gradient = FALSE)$value)
+
+  # Killed rather than stopped: nothing on R's side closes the socket, so it
+  # still reads as open, and the next call used to write into it and then wait
+  # for a reply for as long as the R session lasted.
+  bridge <- get("pkgLocal", envir = asNamespace("JuliaConnectoR"))
+  dead <- bridge$con
+  withr::defer(if (identical(bridge$con, dead)) {
+    suppressWarnings(try(JuliaConnectoR::stopJulia(), silent = TRUE))
+  })
+  # SIGKILL, as the test below sends, except on Windows, where pskill refuses
+  # it and its default terminates the process. Not SIGTERM: Julia runs its own
+  # exit on that, and on GitHub's runners it now and then had not ended a
+  # minute later (2 runs of 18, each at the full minute of the wait below,
+  # against 4-5 s otherwise), so the socket never read and the check rightly
+  # found a live session. What a SIGTERM leaves on the socket is tested below,
+  # on a socket pair.
+  pid <- as.integer(JuliaConnectoR::juliaEval("getpid()"))
+  tools::pskill(pid,
+    if (.Platform$OS.type == "windows") tools::SIGTERM else tools::SIGKILL)
+  # Up to a minute, ending as soon as the socket reads: on a machine with every
+  # core busy the process can take a while to end and its socket to close.
+  for (i in seq_len(600)) {
+    if (isTRUE(socketSelect(list(dead), timeout = 0.1))) break
+  }
+
+  # Asked of the check every call comes in through rather than of a call:
+  # with the module cached it makes no call into Julia of its own, so a guard
+  # that has stopped working fails here instead of hanging the suite. A time
+  # limit does not do that -- R does not check one inside JuliaConnectoR's
+  # read loop.
+  expect_error(ctsem:::.ctJuliaCheckSession(), "Julia session has ended")
+  expect_null(bridge$con)
+  skip_if(!is.null(bridge$con), "the dead session is still attached")
+  expect_equal(as.numeric(suppressMessages(
+    ctJuliaEvaluate(spec, raw, gradient = FALSE)$value)), as.numeric(value),
+    tolerance = 1e-10)
+})
+
+test_that("a session killed mid-call is not replaced until the call returns", {
+  skip_without_julia()
+  # What the out-of-memory killer does: the process dies during a call. Every
+  # stage of a fit that catches its own errors would otherwise start a new
+  # session and rebuild what had just exhausted the machine, so none starts
+  # until the top-level call returns -- here, the whole test file, which
+  # testthat runs as one -- and running it again starts afresh.
+  spec <- suppressMessages(ctFit(image_data(nsub = 3L, nobs = 4L, seed = 4L),
+    image_model(), backend = "julia", fit = FALSE))
+  raw <- rep(0, ctsem:::.ctBackendNpar(spec))
+  value <- suppressMessages(ctJuliaEvaluate(spec, raw, gradient = FALSE)$value)
+  cache <- ctsem:::.ct_julia_cache
+  withr::defer(cache$lost <- NULL)
+  bridge <- get("pkgLocal", envir = asNamespace("JuliaConnectoR"))
+
+  # Killed from another process two seconds into a call that would sleep for
+  # two minutes: SIGKILL, as the out-of-memory killer sends, except on
+  # Windows, where pskill refuses it and its default terminates the process.
+  pid <- as.integer(ctsem:::.ctJuliaEval("getpid()"))
+  signal <- if (.Platform$OS.type == "windows") "tools::SIGTERM" else "tools::SIGKILL"
+  system2(file.path(R.home("bin"), "Rscript"), c("-e", shQuote(sprintf(
+    "Sys.sleep(2); tools::pskill(%d, %s)", pid, signal))), wait = FALSE)
+  expect_error(ctsem:::.ctJuliaEval("sleep(120); 1"), "killed or crashed")
+  expect_identical(cache$lost, "mainevalcmd")
+
+  # Refused rather than started, at whatever entry the next call comes in by.
+  expect_error(suppressMessages(ctJuliaEvaluate(spec, raw, gradient = FALSE)),
+    "no new one starts until the call returns")
+  expect_null(bridge$con)
+
+  # What the task callback does when the call returns.
+  cache$lost <- NULL
+  expect_equal(as.numeric(suppressMessages(
+    ctJuliaEvaluate(spec, raw, gradient = FALSE)$value)), as.numeric(value),
+    tolerance = 1e-10)
+})
+
+test_that("a session that died partway through a message is reported gone, not waited on", {
+  # What a SIGTERM leaves on Linux: Julia prints its signal report to stderr on
+  # the way out, so the socket holds a stderr marker, a message cut short, and
+  # end of file. JuliaConnectoR's own reader loops on that forever, which hung
+  # the test above on Linux and nowhere else. A local socket pair stands in for
+  # Julia, so this needs none and runs on every platform.
+  skip_if_not_installed("JuliaConnectoR")
+  ns <- asNamespace("JuliaConnectoR")
+  port <- sample(20000:40000, 1L)
+  server <- tryCatch(serverSocket(port), error = function(e) NULL)
+  skip_if(is.null(server), "no local port to listen on")
+  client <- socketConnection("localhost", port, blocking = TRUE, open = "r+b")
+  peer <- socketAccept(server, blocking = TRUE, open = "r+b")
+  close(server)
+  withr::defer(try(close(client), silent = TRUE))
+  # Installed as JuliaConnectoR's own connection, because that is the only one
+  # its reader ever reads: the old code handed a message over only when the
+  # connection was that one, so any other passed without reaching the loop.
+  bridge <- get("pkgLocal", envir = ns)
+  saved <- bridge$con
+  bridge$con <- client
+  withr::defer(bridge$con <- saved)
+
+  # A complete message on a live socket is output, printed and not a death.
+  writeBin(c(get("STDOUT_INDICATOR", envir = ns),
+    writeBin(5L, raw(), size = 4L), charToRaw("hello")), peer)
+  flush(peer)
+  Sys.sleep(0.2)
+  expect_output(expect_false(ctsem:::.ctJuliaPeerGone(client)), "hello")
+
+  # Promised 100 bytes, sent 11, then gone.
+  writeBin(c(get("STDERR_INDICATOR", envir = ns),
+    writeBin(100L, raw(), size = 4L), charToRaw("signal (15)")), peer)
+  close(peer)
+  Sys.sleep(0.2)
+  expect_true(ctsem:::.ctJuliaPeerGone(client))
+})
+
+test_that("output Julia prints between calls is not taken for a session that has died", {
+  skip_without_julia()
+  # A task can print after the call that started it has returned. That leaves
+  # the socket readable exactly as a dead process does, and the guard above
+  # has to tell the two apart without losing the output or the stream's place.
+  invisible(JuliaConnectoR::juliaEval(
+    "@async (sleep(0.2); println(\"printed after the call returned\")); nothing"))
+  Sys.sleep(1)
+  expect_output(ctsem:::.ctJuliaCheckAlive(), "printed after the call returned")
+  expect_equal(JuliaConnectoR::juliaEval("1 + 1"), 2)
+})
+
+test_that("asking whether the bridge's socket has something to read does not wait", {
+  skip_on_cran()
+  # The liveness check asks this as every Julia operation comes in. Asked with
+  # `socketSelect(timeout = 0)` it waited out R's 200 ms select interval on
+  # Windows whenever nothing was waiting, which made every Julia call there
+  # 0.2-0.4 s slower. A bare socket pair, so no Julia is needed to ask.
+  server <- NULL
+  for (attempt in 1:20) {
+    port <- 40000L + ((Sys.getpid() + attempt * 7919L) %% 20000L)
+    server <- tryCatch(serverSocket(port), error = function(e) NULL)
+    if (!is.null(server)) break
+  }
+  skip_if(is.null(server), "no local port to listen on")
+  withr::defer(close(server))
+  client <- socketConnection("localhost", port, blocking = TRUE, open = "r+b")
+  withr::defer(try(close(client), silent = TRUE))
+  peer <- socketAccept(server, blocking = TRUE, open = "r+b")
+  withr::defer(try(close(peer), silent = TRUE))
+
+  elapsed <- system.time(for (i in 1:10) {
+    idle <- ctsem:::.ctSocketReadable(client)
+  })[["elapsed"]]
+  expect_false(idle)
+  # Ten asks, against two seconds for the wait this replaced.
+  expect_lt(elapsed, 1)
+  writeBin(as.raw(1:3), peer)
+  flush(peer)
+  expect_true(ctsem:::.ctSocketReadable(client))
+  invisible(readBin(client, "raw", 3L))
+  expect_false(ctsem:::.ctSocketReadable(client))
+  # A peer that has gone reads as readable, which is how the check finds it.
+  close(peer)
+  expect_true(ctsem:::.ctSocketReadable(client))
+})

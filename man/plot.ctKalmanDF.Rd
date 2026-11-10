@@ -2,7 +2,7 @@
 % Please edit documentation in R/ctKalman.R
 \name{plot.ctKalmanDF}
 \alias{plot.ctKalmanDF}
-\title{Plots Kalman filter output from ctKalman.}
+\title{Plots prediction output from ctPredict.}
 \usage{
 \method{plot}{ctKalmanDF}(
   x,
@@ -13,23 +13,25 @@
   plot = TRUE,
   elementNames = NA,
   polygonsteps = 10,
-  polygonalpha = 0.1,
-  facets = vars(Variable),
+  polygonalpha = 0.2,
+  facets = "Variable",
   ...
 )
 }
 \arguments{
-\item{x}{Output from \code{\link{ctKalman}}. In general it is easier to call 
-\code{\link{ctKalman}} directly with the \code{plot=TRUE} argument, which calls this function.}
+\item{x}{Output from \code{\link{ctPredict}}. In general it is easier to call
+\code{\link{ctPredict}} directly with the \code{plot=TRUE} argument, which calls this function.}
 
-\item{subjects}{vector of integers denoting which subjects (from 1 to N) to plot predictions for.}
+\item{subjects}{which subjects to plot, as they appear in the Subject column of
+\code{x}: the ids in the data, unless \code{ctPredict} read them as ctsem's numbering.}
 
-\item{kalmanvec}{string vector of names of any elements of the output you wish to plot, 
-the defaults of 'y' and 'ysmooth' plot the original data, 'y', 
-and the estimates of the 'true' value of y given all data. Replacing 'y' by 'eta' will 
-plot latent states instead (though 'eta' alone does not exist) and replacing 'smooth' 
-with 'upd' or 'prior' respectively plots updated (conditional on all data up to current time point)
-or prior (conditional on all previous data) estimates.}
+\item{kalmanvec}{string vector of the elements of the output to plot: 'y', the
+data, or 'y', 'eta', 'err' or 'errstd' followed by 'prior', 'upd' or 'smooth'. 'y' is
+the observed variables and 'eta' the latent states; 'prior' is conditional on all
+previous data, 'upd' on all data up to the current time point, and 'smooth' on all
+data. 'err' is the data minus the estimate, and 'errstd' its standardised form, present
+when the output was made with \code{standardisederrors=TRUE}. The default, 'y' and
+'yprior', plots the data against the one step ahead predictions.}
 
 \item{errorvec}{vector of names indicating which kalmanvec elements to plot uncertainty bands for. 
 'auto' plots all possible.}
@@ -48,7 +50,7 @@ Alternatively, a character vector specifying the manifest and latent names to pl
 \item{polygonalpha}{Numeric for the opacity of the uncertainty region.}
 
 \item{facets}{when multiple subjects are included in multivariate plots, the default is to facet plots 
-by variable type. This can be set to NA for no facets, or \code{vars(Subject)} for facetting by subject.}
+by variable type. This can be set to NA for no facets, or "Subject" for facetting by subject.}
 
 \item{...}{not used.}
 }
@@ -56,22 +58,18 @@ by variable type. This can be set to NA for no facets, or \code{vars(Subject)} f
 A ggplot2 object. Side effect -- Generates plots.
 }
 \description{
-Plots Kalman filter output from ctKalman.
+Plots prediction output from ctPredict.
 }
 \examples{
-if(w32chk()){
-
-
-### Get output from ctKalman
-x<-ctKalman(ctstantestfit,subjects=2,timestep=.01)
+### Get output from ctPredict
+x<-ctPredict(ctstantestfit,subjects=2,timestep=.01)
 
 ### Plot with plot.ctKalmanDF
 plot(x, subjects=2)
 
 ###Single step procedure:
-ctKalman(ctstantestfit,subjects=2,
+ctPredict(ctstantestfit,subjects=2,
   kalmanvec=c('y','yprior'),
   elementNames=c('Y1','Y2'), 
   plot=TRUE,timestep=.01)
-}
 }

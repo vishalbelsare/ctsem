@@ -1,25 +1,82 @@
-#' Extract samples from a ctStanFit object
+#' Extract samples from a ctsem fit
 #'
-#' @param object ctStanFit object, samples may be from Stan's HMC, or the importance sampling approach of ctsem.
-#' @param subjectMatrices Calculate subject specific system matrices?
+#' Returns the posterior (or approximate posterior) draws of a fit's
+#' parameters, as arrays named for the model matrices.
+#'
+#' @param object A fit from \code{\link{ctFit}}, on either backend: sampled, or
+#' optimized with its approximate posterior draws.
+#' @param subjectMatrices Calculate subject specific system matrices? On a
+#' \code{backend='julia'} fit whose random effects are coordinates
+#' (\code{intoverpop='laplace'}, or a sampled fit), each draw's subject
+#' matrices are at that draw's plausible values -- the population draw with a
+#' draw of the subject's own effects from their posterior given its data -- so
+#' their spread over draws is the subject's whole uncertainty, as
+#' \code{\link{ctSubjectPars}} reports by default.
 #' @param cores Only used if subjectMatrices = TRUE . For faster computation use more cores.
 #' @param nsamples either 'all' or an integer denoting number of random samples to extract.
-#' @return Array of posterior samples.
+#' @param subjects either 'all', or the subjects to extract, as ids in the data
+#' (see \code{realid}).
+#' @param realid If TRUE (the default), subjects are read as the ids in the data,
+#' and integers that are not ids there are read as ctsem's numbering of the
+#' subjects, 1 to N, with a message. If FALSE, they are read as that numbering.
+#' @param state The latent state at which state dependent cells of the
+#' \code{pop_*} matrices are evaluated: \code{'T0MEANS'} (the default),
+#' \code{'mean'}, \code{'asymptotic'}, or a numeric state vector. Only
+#' \code{backend='julia'} can materialise the matrices anywhere other than the
+#' default, so anything else is an error on a stan fit rather than being
+#' silently ignored. Irrelevant to a linear model, whose matrices are the same
+#' everywhere. Note that it moves the \code{pop_*} arrays only: the subject
+#' matrices \code{subjectMatrices=TRUE} adds come from the filter, and are
+#' always at each subject's own last observed row.
+#' @param ... not used.
+#' @return A list of posterior sample arrays. The point the \code{pop_*}
+#' matrices were evaluated at is recorded in the \code{'evaluatedAt'} attribute;
+#' nothing is messaged, because the summaries call this repeatedly and say it
+#' once themselves. \code{\link{ctModelIsNonlinear}} answers whether the point
+#' matters for this model at all.
+#'
+#' Where parameters vary over subjects, the population of them, per draw:
+#' \code{popsd} (draws by parameters), \code{rawpopcov} and \code{rawpopcorr}
+#' (the raw scale's covariance and correlations, draws by parameters by
+#' parameters) and \code{popcov} (the covariance on the natural scale). On a
+#' \code{backend='julia'} fit they are named by parameter, and a model with
+#' several grouping levels gives each level's as \code{rawpopcov.<level>} and so
+#' on; its \code{popcov} combines \code{popsd} with the raw correlations, exact
+#' where a parameter's transform is affine.
 #' @aliases extract
 #' @examples
 #' \donttest{
 #' e = ctExtract(ctstantestfit)
+#' attr(e, 'evaluatedAt')
 #' }
 #' @export
-ctExtract <- function(object,subjectMatrices=FALSE,cores=2,nsamples='all'){
-  if(!class(object) %in% c('ctStanFit', 'stanfit')) stop('Not a ctStanFit or stanfit object')
-  
+ctExtract <- function(object, subjectMatrices=FALSE, cores=getOption("mc.cores", 2L), nsamples='all', subjects='all',
+  state=NULL, realid=TRUE, ...) UseMethod("ctExtract")
+
+#' @export
+ctExtract.ctStanFit <- function(object,subjectMatrices=FALSE,cores=getOption("mc.cores", 2L),nsamples='all', subjects='all',
+  state=NULL, realid=TRUE, ...){
+  # inherits(), not class() %in%: a fit carries both 'ctStanFit' and 'ctFit'
+  # since the ctFit rename, and `if` on a length-2 condition is an error in
+  # R >= 4.2 -- so this guard used to reject every fit it was given.
+  if(!inherits(object, c('ctStanFit', 'stanfit'))) stop('Not a ctStanFit or stanfit object')
+
+  # Stan's generated quantities computed these matrices once, during sampling,
+  # at the point the filter was at; there is no way to re-materialise them
+  # somewhere else afterwards. `state` used to reach here through `...` and be
+  # dropped, while ctExtract.ctJuliaFit honoured it -- so the same call returned
+  # a different linearisation on each backend and said nothing on either.
+  .ctContextRequireStateSupport(object, state)
+  if(!'all' %in% subjects && inherits(object, 'ctStanFit'))
+    subjects <- sort(as.vector(.ctResolveSubjects(object, subjects, realid)))
+
   
   
   if(length(object$stanfit$stanfit@sim)==0){
     samps <- object$stanfit$rawposterior
     if(!nsamples %in% 'all') samps <- samps[sample(1:nrow(samps),nsamples),,drop=FALSE]
     if(subjectMatrices && object$standata$savesubjectmatrices==0){
+      if(!'all' %in% subjects) object$standata<- standatact_specificsubjects(standata = object$standata,subjects = subjects)
       out = stan_constrainsamples(sm = object$stanmodel,standata = object$standata,
         samples = samps,
         cores = cores,savescores = FALSE,savesubjectmatrices = subjectMatrices,
@@ -45,6 +102,14 @@ ctExtract <- function(object,subjectMatrices=FALSE,cores=2,nsamples='all'){
   #   out$rawpopcovchol <-  array(out$rawpopc[,2,,],dim=dim(out$rawpopc)[-2])
   #   out$rawpopcovbase <-  array(out$rawpopc[,1,,],dim=dim(out$rawpopc)[-2])
   # }
-  
+
+  # Record rather than message: ctExtract() is called repeatedly by summary(),
+  # ctSummaryMatrices() and the plot helpers, and each of those says it once
+  # itself through .ctContextMessage(). The label is free; .ctContextAttach()
+  # is not -- it re-derives the cell table each time, which measured ~7 ms
+  # locally against ~0 for the rest of this function, and ctSummaryMatrices()
+  # attaches the same cells to its own output anyway.
+  attr(out, 'evaluatedAt') <- .ctContextPopLabel
+
   return(out)
 }

@@ -1,0 +1,1445 @@
+"""
+Running the sampler: chains, warmup, and what comes back.
+
+# Two parallel axes, and which gets the threads
+
+The gradient parallelises over units -- the log likelihood is a sum over them,
+so each chunk accumulates a partial value and partial gradient and they are
+summed. Chains parallelise too, and share nothing at all.
+
+Threads go to chains first, and the unit loop takes what is left.
+
+The unit axis, measured on a fit rather than on a warm re-evaluation: a
+5-latent, 200-subject, 12-occasion, 110-parameter model, `inits` fixed so every
+run starts from the same point, `estonly` so the uncertainty phase is not
+included, iterations capped at 15.
+
+    cores      1        2        4        8       16
+    fit      160.7 s  63.4 s   43.0 s   32.2 s   29.4 s
+    speedup    --      1.72x    2.53x    3.38x    3.70x
+
+**Read that as a shape, not as a scaling curve.** It came off an i9-12900KS,
+8 P-cores with SMT plus 8 E-cores without, so "8 cores" is eight heterogeneous
+threads and the sixteenth is nothing like the first. On 23 homogeneous cores the
+same axis reaches 5.28x at eight chunks. See the end of this docstring; every
+timing here taken on that machine has the same flaw.
+
+Three repeats of `cores = 1` agreed to 7%, and the sweep was run *descending*
+so that a speedup could not be confused with having run later in the session.
+Both matter, and neither is a formality:
+
+  - Run ascending on a contended machine, three identical `cores = 1` fits gave
+    271 s, 301 s and 125 s -- a 140% spread, wider than any effect being looked
+    for. Every fit-level number taken while another job shared the machine is
+    worthless, and several were.
+  - Times also fall with position in the session even when the work is
+    identical, so an ascending sweep confounds "more cores" with "ran later".
+    Ascending gave 4.18x at sixteen where descending gives 3.70x; the direction
+    survives the reversal, which is what makes it real.
+
+`logposterior` came back as -11644.64 from every one of those fits, at every
+chunk count. The split is over a sum, so it should be exact, and it is.
+
+**Chains do not gain linearly, and the reason for serving them first is not the
+one that used to be written here.** Measured on the same model, one converged
+fit reused so that every run starts from an identical estimate and Hessian,
+`maxdepth = 3` so both configurations do equal work, order balanced A B B A A B
+B A, and each cell repeated: two chains at once on T/2 chunks against the same
+two chains in turn on T chunks.
+
+    threads    8       16
+    gain     1.12x   1.20x
+
+against a baseline spread of 0.9-4.3%. Nowhere near the 2x that "linearly"
+implies.
+
+The ordering survives anyway, because the *other* axis has already stopped
+paying. Per-gradient cost from the same runs: one chain on 8 chunks 0.0122 s,
+one chain on 16 chunks 0.0134 s -- **10% slower on twice the threads**. So
+threads nine to sixteen are worth 1.20x given to a second chain and 0.91x given
+to the subject loop. That is the argument for the policy; the crossover sits
+where the unit loop saturates, between 8 and 16 chunks for this 200-subject
+target, and it will sit elsewhere for a different one.
+
+Two things temper it. The advantage is contingent on the chains being balanced,
+and **it inverts when they are not**: on the chain pair NUTS produced at the
+first seed tried, one chain adapted to a degenerate step size of 3.7e-9 while
+the other saturated `maxdepth`, a 2.08:1 imbalance, and running them at once was
+12% *slower* at 8 threads because the light chain finished early and left half
+the threads idle. One chain in 13 probed failed to adapt a usable step size, so
+roughly 15% of two-chain runs and 27% of four-chain runs are lopsided like that,
+and milder imbalance is universal. And capping `maxdepth` at 3 to equalise the
+work also removes most of the natural per-draw variation, so at the default of
+10 the imbalance -- and the loss to it -- is larger than measured here.
+
+**Two claims that stood here have been withdrawn, and why matters to whoever
+measures next.**
+
+This recorded eight processes on disjoint subject groups reaching 2.60x against
+3.38x for eight threads, concluding the ceiling was not the shared allocator.
+Both figures came from a development machine that is an i9-12900KS: 8 P-cores
+with SMT plus 8 E-cores without. "Eight threads" there is eight *heterogeneous*
+threads, an E-core being roughly half a P-core, so no curve measured on it can
+be read as N times one core. Every local timing in this file's history carries
+that flaw.
+
+Re-measured on 23 homogeneous cores, eight independent processes reach **8.19x**
+throughput: 0.14888 s per gradient alone, 0.14157-0.14548 s each with eight
+running. They do not interfere at all, though each allocates 544 MB per
+gradient.
+
+Nor is the subject loop bandwidth bound, which the 2.60x had been taken to
+suggest. Against two references measured in the same session -- a dependent FMA
+chain with no memory traffic, and a deliberately bandwidth-bound array sum --
+the real work lands near the arithmetic ceiling and beats the bandwidth one:
+
+    chunks    gradient   scores   Hessian   arithmetic   bandwidth
+    8           5.28x     5.00x    4.66x      7.76x        3.19x
+
+A bandwidth-bound workload cannot outrun the bandwidth-bound reference. By
+volume the loop uses about 3% of what the machine has, 3.3 GB/s against 110
+GB/s. What remains is garbage collection, 22-24% of gradient wall time.
+
+So threads versus processes on the unit axis is **open**, not settled against
+processes. What would settle it is the scatter/gather barrier a process split
+needs on every gradient -- not a scaling ceiling that turned out to be the
+measuring machine.
+
+Nothing needs deciding by the caller either way. A chain is an item of a
+pool region, so it holds a band of workspace slots and the unit loop inside it
+spends whatever that band holds; the arithmetic that used to be written out
+here is now a property of `_laplace_parallel`.
+
+Splitting units across *processes* rather than threads is a different question
+and the answer differs by phase. Sampling does on the order of `draws x
+(2^depth - 1)` gradients, each needing a scatter of `theta` and a gather of the
+gradient, so a per-gradient barrier is paid ~10^5 times; chains, which need no
+barrier at all until the end, are the better process axis there. Optimisation
+does hundreds to low thousands of gradients at seconds apiece, where a round
+trip carrying `2 x npar` doubles is lost in the noise -- so if the unit axis
+ever does hit a ceiling on threads, that is the phase where moving it to
+processes would pay, and it would cut per-worker memory rather than multiply it.
+
+# What crosses the bridge
+
+`save_effects` defaults to false, and that is a bandwidth decision rather than a
+statistical one. A hundred subjects with two effects each and four chains of a
+thousand draws is 800,000 numbers -- 6.4 MB, and the bridge is slow enough
+inbound that returning them costs longer than many fits do. The per-effect
+posterior mean and standard deviation come back always, because they are `ndim`
+numbers rather than `ndim * ndraws` and answer most of what the draws would be
+used for.
+
+The bridge, measured directly rather than inferred from one transfer:
+
+  - **~0.8 ms per message on Linux once the socket is tuned**, and ~41 or ~82 ms
+    before it, depending on whether one direction split its writes or both did.
+    Windows was always ~0.3 ms.
+  - **outbound ~870 MB/s** -- sending 32 MB costs 37 ms, so arguments are
+    effectively free.
+  - **inbound ~2.0 MB/s** -- the only per-byte term that matters.
+
+The fixed cost used to be the part that surprised, and it was not a latency at
+all: JuliaConnectoR assembles a message from many small writes, and on Linux
+that write-write-read pattern met Nagle on the sender and a delayed ACK on the
+receiver, stalling ~40 ms per message whatever it carried. `ctJuliaSetup` now
+turns both halves off; see `bridge_tuning.jl`. **The figures that motivated
+call-count batching were taken before that fix**, so read them as history: one
+gradient cost 0.417 s from R against 0.005 s in the engine, and the post-fit
+uncertainty phase measured ~99% bridge on Linux -- of which almost all was the
+stall. Batching narrow calls cut that phase 1.48-1.90x and is still worth having,
+since fewer messages is still fewer messages, but it is now worth milliseconds
+rather than seconds, and nothing here justifies contorting an interface to save
+a call.
+"""
+
+using LinearAlgebra
+using Random
+using Printf
+
+export ctsem_sample
+
+"""
+    _sample_initial_point(sampler, values, metric, rng, scale, logdensity!)
+
+A starting position drawn from the Laplace approximation itself.
+
+Chains must not all start at the same point -- R-hat compares between-chain to
+within-chain variance, and identical starts make it meaningless until the chains
+have forgotten them. Drawing from the fitted approximation gives genuinely
+different starts that are nonetheless all in the typical set, which is what the
+approximation is *for*. Falling back toward the mode on a non-finite draw keeps
+a bad approximation from preventing a start altogether.
+"""
+function _sample_initial_point(centre::Vector{Float64},
+    metric::CTSEMMetric, rng::AbstractRNG, scale::Float64, logdensity!,
+    gradient::Vector{Float64})
+    x = copy(centre)
+    logp = logdensity!(gradient, x)
+    isfinite(logp) || throw(ArgumentError(
+        "the log density is not finite at the supplied parameter values, so no " *
+        "chain can start there; check the estimate the sample was asked to start from"))
+    scale <= 0 && return (x, logp)
+    draw = zeros(length(centre))
+    for attempt in 0:6
+        shrink = scale * 0.5^attempt
+        for b in eachindex(metric.ranges)
+            r = metric.ranges[b]
+            C = metric.factors[b]
+            k = length(r)
+            for i in 1:k
+                draw[r[i]] = randn(rng)
+            end
+            for i in k:-1:1
+                acc = 0.0
+                for j in 1:i
+                    acc += C[i, j] * draw[r[j]]
+                end
+                x[r[i]] = centre[r[i]] + shrink * acc
+            end
+        end
+        candidate = logdensity!(gradient, x)
+        isfinite(candidate) && return (x, candidate)
+    end
+    copyto!(x, centre)
+    return (x, logdensity!(gradient, x))
+end
+
+"""The largest or smallest finite entry, or NaN when there is none."""
+function _finite_extremum(values::AbstractVector{Float64}, reduce)
+    finite = filter(isfinite, values)
+    return isempty(finite) ? NaN : reduce(finite)
+end
+
+"""
+One chain's output, and enough of its state to continue it later.
+
+`x`, `stepsize` and `metric` are the whole of what a chain needs to resume: the
+sampler is Markov in the position, and the tuning is the step size and the
+metric. The random stream is deliberately *not* preserved -- continuing on a
+fresh stream is still a valid chain, and reconstructing a `Xoshiro` across the R
+boundary would be a lot of fragile machinery for no statistical gain.
+"""
+struct _ChainResult
+    draws::Matrix{Float64}      # ndim x ndraws
+    accept::Vector{Float64}
+    divergent::Vector{Bool}
+    # Of those, the ones past the correlation bound (`_divergence_at_bound`).
+    bound::Vector{Bool}
+    depth::Vector{Int}
+    energy::Vector{Float64}
+    stepsize::Float64
+    warmup_divergent::Int
+    warmup_used::Int
+    x::Vector{Float64}
+    metric::CTSEMMetric
+end
+
+# How often warmup re-examines its divergence rate, what rate counts as
+# persisting, and how far the acceptance target may be pushed. The rate is
+# deliberately well above zero: an isolated divergence early in warmup, at a
+# step size dual averaging is still moving, says nothing worth acting on.
+const _ACCEPT_CHECK_STRIDE = 50
+const _ACCEPT_DIVERGENCE_RATE = 0.05
+const _ACCEPT_STEP = 0.05
+const _ACCEPT_MAX = 0.95
+const _ACCEPT_MAX_RAISES = 3
+
+"""
+    _sample_draws!(logdensity!, ws, rng, x, g, logp, eps, metric, ndraws,
+                   maxdepth, maxdelta, progress, callback)
+
+The post-warmup draw loop: `ndraws` NUTS transitions at a fixed step size and
+metric, recording the draw and its diagnostics.
+
+One loop rather than two. `_run_chain`'s sampling phase and the whole body of
+`_continue_chain` were line-for-line the same -- same `_nuts_transition!` call,
+same five field fills, same progress line, same forced final callback -- and
+differed only in which name held the metric. The two callers still differ in
+what they wrap around this, which is the part that carries meaning: `_run_chain`
+adapts first and reports the warmup it used, `_continue_chain` takes step size
+and metric as given so that the continuation is the same chain rather than a new
+one starting nearby.
+
+`logp` comes back in the returned tuple because the loop advances it and the
+caller's forced final callback has already been made here.
+"""
+function _sample_draws!(logdensity!, ws::_NUTSWorkspace, rng::AbstractRNG,
+    x::Vector{Float64}, g::Vector{Float64}, logp::Float64, eps::Float64,
+    metric::CTSEMMetric, ndraws::Int, maxdepth::Int, maxdelta::Float64,
+    progress::CTSEMProgress, callback::CTSEMCallback)
+
+    progress.label = "sampling"
+    progress.started = time()
+    ndim = length(x)
+    draws = Matrix{Float64}(undef, ndim, ndraws)
+    accept = Vector{Float64}(undef, ndraws)
+    divergent = Vector{Bool}(undef, ndraws)
+    bound = Vector{Bool}(undef, ndraws)
+    depth = Vector{Int}(undef, ndraws)
+    energy = Vector{Float64}(undef, ndraws)
+    for iteration in 1:ndraws
+        # On a coreset, the transition's end is tested against the full density
+        # and may be put back (`_surrogate_correct!`); otherwise both are no-ops.
+        _surrogate_begin!(logdensity!, x, g)
+        step = _nuts_transition!(ws, logdensity!, metric, rng, x, g, logp, eps,
+            maxdepth, maxdelta)
+        logp = _surrogate_correct!(logdensity!, x, g, step.logp, rng)
+        @inbounds for j in 1:ndim
+            draws[j, iteration] = x[j]
+        end
+        accept[iteration] = step.accept
+        divergent[iteration] = step.divergent
+        bound[iteration] = step.bound
+        depth[iteration] = step.depth
+        energy[iteration] = step.energy
+        if _due(progress)
+            _progress_line(progress, iteration, ndraws,
+                @sprintf("logp %11.2f", logp),
+                @sprintf("depth %4.1f", sum(view(depth, 1:iteration)) / iteration),
+                @sprintf("div %d", count(view(divergent, 1:iteration))))
+        end
+        _invoke_callback(callback, "sampling", iteration, ndraws, logp,
+            count(view(divergent, 1:iteration)))
+    end
+    # Forced: a rate-limited callback on a chain that finishes inside one
+    # interval would otherwise never report the finished state at all.
+    _invoke_callback(callback, "sampling", ndraws, ndraws, logp,
+        count(divergent); force=true)
+    logp = _surrogate_batch!(logdensity!, x, g, logp)
+    return (draws=draws, accept=accept, divergent=divergent, bound=bound, depth=depth,
+        energy=energy, logp=logp)
+end
+
+function _run_chain(logdensity!, centre::Vector{Float64},
+    metric::CTSEMMetric, rng::AbstractRNG,
+    nwarmup::Int, ndraws::Int, maxdepth::Int, target_accept::Float64,
+    maxdelta::Float64, init_scale::Float64, adapt_metric::Bool,
+    adapt::Union{Nothing,Vector{Bool}}; settle_tol::Float64=0.0,
+    init_eps::Float64=0.0,
+    resume::Union{Nothing,_ChainResult}=nothing,
+    progress::CTSEMProgress=CTSEMProgress(false),
+    callback::CTSEMCallback=CTSEMCallback(nothing))
+
+    ndim = length(centre)
+    ws = _NUTSWorkspace(ndim, maxdepth)
+    g = zeros(ndim)
+    # Continuing a chain: its position, step size and metric are the whole of
+    # its state, so warmup is skipped entirely rather than repeated.
+    if resume !== nothing
+        x = copy(resume.x)
+        logp = logdensity!(g, x)
+        return _continue_chain(logdensity!, ws, rng, x, g, logp,
+            resume.stepsize, resume.metric, ndraws, maxdepth, maxdelta, progress,
+            callback)
+    end
+    x, logp = _sample_initial_point(centre, metric, rng, init_scale,
+        logdensity!, g)
+    # A first coreset before warm-up, from draws of the normal the chain
+    # starts in, where the density fits one (sample_surrogate.jl).
+    if nwarmup > 0 && _surrogate_training(logdensity!)
+        logp = _surrogate_fit!(logdensity!,
+            _surrogate_seed(logdensity!, centre, metric, _SURROGATE_TRAIN), x, g, logp)
+    end
+
+    current = metric
+    # A step size the caller fixed, or this chain's own crude estimate.
+    #
+    # `_init_stepsize` doubles or halves from 1 until a *single* leapfrog step
+    # under a *single* momentum draw crosses an acceptance of one half, at the
+    # chain's own starting point -- so it answers differently in every chain,
+    # for reasons that carry no information. Dual averaging erases that over a
+    # warmup, which is why it was left alone; with `nwarmup = 0` there is
+    # nothing to erase it, and chains came back some fast and divergent and
+    # others fine.
+    #
+    # Given rather than estimated, every chain starts from the same number.
+    # It has to come from the caller rather than be shared here: computing it
+    # once per run inside the engine gives a *different* answer in a worker
+    # process than in this session, because a worker runs the subject loop at
+    # its own width and the last bits of the density differ -- and this
+    # ladder's `> log(0.5)` test turns that into a factor of two. Measured:
+    # 0.125 in-process against 0.0625 in a worker, on one fixture at one seed,
+    # which broke the processes-reproduce-in-process invariant.
+    eps = init_eps > 0 ? init_eps :
+        _init_stepsize(logdensity!, current, rng, x, g, logp, ws)
+    da = _DualAverage(eps, target_accept)
+    # Divergences since the last checkpoint, for the automatic raise below.
+    check_divergent = 0
+    # Counting starts after the init buffer, not at iteration 1. The rate this
+    # watches is meant to say "this geometry needs shorter steps"; over the
+    # first stride it says "the step size has not been adapted yet", which is
+    # true of every fit and is what the adaptation is for. Counting it raised
+    # `target_accept` on the strength of the transient, never lowered it again,
+    # and did so more often the longer the warmup -- so a longer warmup bought
+    # a permanently smaller step size and a slower sample.
+    check_start = _ADAPT_INIT_BUFFER
+    raises = 0
+    windows = adapt_metric ? _adapt_windows(nwarmup) : Int[]
+    window_draws = Vector{Vector{Float64}}()
+    # The warm-up states the density fits its second coreset from, where it
+    # wants one (`_surrogate_fit!`, sample_surrogate.jl), at `train_at`: a
+    # third of the way in; nothing kept otherwise.
+    trainstates = _surrogate_training(logdensity!) ? Vector{Vector{Float64}}() : nothing
+    train_at = _surrogate_train_at(nwarmup)
+    warmup_divergent = 0
+    warmup_used = nwarmup
+    settled = 0
+
+    iteration = 0
+    depths = 0
+    while iteration < nwarmup
+        iteration += 1
+        _surrogate_begin!(logdensity!, x, g)
+        step = _nuts_transition!(ws, logdensity!, current, rng, x, g, logp, eps,
+            maxdepth, maxdelta)
+        logp = _surrogate_correct!(logdensity!, x, g, step.logp, rng)
+        depths += step.depth
+        step.divergent && (warmup_divergent += 1)
+        # `warmup_divergent` counts everything, for the report; the rate that
+        # raises the target counts only what happened after the buffer.
+        (step.divergent && iteration > _ADAPT_INIT_BUFFER) &&
+            (check_divergent += 1)
+        eps = _dual_update!(da, step.accept)
+        if trainstates !== nothing
+            _surrogate_keep!(trainstates, x)
+            if iteration == train_at
+                logp = _surrogate_fit!(logdensity!, trainstates, x, g, logp)
+                trainstates = nothing
+            end
+        end
+        # Raise `target_accept` rather than only reporting divergences.
+        #
+        # A divergence means the integrator could not follow the geometry at the
+        # step size it was using, and the standard remedy -- a higher acceptance
+        # target, hence shorter steps -- was until now something the user had to
+        # apply by hand, after the run, having read a warning about it. Warmup
+        # already holds what is needed to apply it *during* the run, which is
+        # when it is worth something: the draws a too-large step size ruined are
+        # warmup draws, discarded either way.
+        #
+        # Checked on a fixed stride rather than at the metric windows, so it
+        # still works when warmup is too short to hold a window and the Laplace
+        # metric is used as it stands. Bounded at 0.95 and at three raises: past
+        # that the steps are short enough that trajectories lengthen to
+        # compensate, and geometry surviving 0.95 wants a reparameterisation
+        # rather than a smaller step. `_dual_restart!` because the averaging is
+        # chasing a new target from here, and its accumulated `hbar` is evidence
+        # about the old one.
+        if iteration > check_start &&
+                iteration - check_start >= _ACCEPT_CHECK_STRIDE
+            rate = check_divergent / (iteration - check_start)
+            if rate > _ACCEPT_DIVERGENCE_RATE && da.target < _ACCEPT_MAX &&
+                    raises < _ACCEPT_MAX_RAISES
+                da.target = min(_ACCEPT_MAX, da.target + _ACCEPT_STEP)
+                raises += 1
+                eps = _dual_restart!(da, eps)
+            end
+            check_divergent = 0
+            check_start = iteration
+        end
+        if _due(progress)
+            _progress_line(progress, iteration, nwarmup,
+                @sprintf("logp %11.2f", logp), @sprintf("eps %8.2e", eps),
+                @sprintf("depth %4.1f", depths / iteration),
+                @sprintf("div %d", warmup_divergent),
+                # Shown only once it has moved, so the ordinary run reads as it
+                # always did.
+                raises > 0 ? @sprintf("accept %.2f", da.target) : "")
+        end
+        # Its own cadence; see `ctsem_optimize`. Unconditional -- the callback
+        # rate-limits itself -- so a GUI watching a chain sees warmup progress
+        # even when nothing is being printed.
+        _invoke_callback(callback, "warmup", iteration, nwarmup, logp,
+            warmup_divergent)
+        isempty(windows) && continue
+        # Past the init buffer only. `_adapt_windows` lays the window ends out
+        # as though accumulation began at `_ADAPT_INIT_BUFFER + 1` -- that is
+        # what the buffer is for, and what Stan does by resetting its
+        # accumulator there -- but this loop accumulated from iteration 1, so
+        # the first estimate was taken over draws 1..100 rather than 76..100.
+        # Those first draws are the ones taken while the step size is still the
+        # crude one-leapfrog guess and the chain is still leaving its start, so
+        # they inflate the covariance with a transient the metric should not
+        # describe.
+        iteration > _ADAPT_INIT_BUFFER || continue
+        push!(window_draws, copy(x))
+        iteration in windows || continue
+        # Re-estimate from this window only. Earlier draws were taken under a
+        # different metric and a different step size, and pooling them biases
+        # the estimate toward wherever the chain used to be rather than where
+        # it is.
+        previous = current
+        current = _estimate_metric(window_draws, current; adapt=adapt)
+        empty!(window_draws)
+        eps = _dual_restart!(da, _init_stepsize(logdensity!, current, rng, x, g,
+            logp, ws))
+        # Stop warming up once the metric has stopped moving.
+        #
+        # Stan's schedule runs a fixed number of iterations whatever happens,
+        # which is the safe default and often twice what a well-started chain
+        # needs -- and here the chain *is* well started, from a fit, with a
+        # metric read off its curvature. Two consecutive windows that agree to
+        # within `settle_tol` mean the remaining windows would re-estimate the
+        # same matrix, so the terminal buffer is run and warmup ends.
+        #
+        # **Measured, and it loses badly.** On the N=200 augmented marginal
+        # route: adaptive warmup took 1795 s to reach min ESS 142.8 (hitting an
+        # 8000-draw budget without meeting its targets), against 559 s for min
+        # ESS 246.3 on the fixed schedule -- 0.080 against 0.441 ESS/s, a factor
+        # of 5.5 the wrong way. The reason the reasoning above is wrong: a
+        # metric that has stopped *moving* is not the same as a metric that is
+        # *good*. Two agreeing windows early mean the estimate has converged to
+        # what a few hundred draws can say, and that estimate is then used for
+        # every remaining draw, so the sampling phase pays for the whole run
+        # what the warmup saved once. Hence `settle_tol = 0` -- off -- as the
+        # default, and this comment rather than a removal, so the idea is not
+        # re-invented and re-measured.
+        if settle_tol > 0 && _metric_settled(previous, current, settle_tol)
+            settled += 1
+            if settled >= 2
+                remaining = min(nwarmup - iteration, _ADAPT_TERM_BUFFER)
+                for _ in 1:remaining
+                    iteration += 1
+                    _surrogate_begin!(logdensity!, x, g)
+                    step = _nuts_transition!(ws, logdensity!, current, rng, x, g,
+                        logp, eps, maxdepth, maxdelta)
+                    logp = _surrogate_correct!(logdensity!, x, g, step.logp, rng)
+                    step.divergent && (warmup_divergent += 1)
+                    eps = _dual_update!(da, step.accept)
+                end
+                warmup_used = iteration
+                break
+            end
+        else
+            settled = 0
+        end
+    end
+    eps = _dual_final(da)
+    # A warm-up that ended before `train_at` (an early stop) fits from what it
+    # kept; a coreset whose moves warm-up accepted too rarely is given up
+    # before sampling. `logp` and `g` are the density's in use at `x`.
+    trainstates === nothing || (logp = _surrogate_fit!(logdensity!,
+        trainstates, x, g, logp))
+    logp = _surrogate_batch!(logdensity!, x, g, logp)
+    # Forced: warmup may finish inside a callback interval (a short run, or
+    # the settle_tol early-stop above), and the transition to sampling is
+    # exactly the state a live watcher should not miss.
+    _invoke_callback(callback, "warmup", warmup_used, nwarmup, logp,
+        warmup_divergent; force=true)
+
+    sampled = _sample_draws!(logdensity!, ws, rng, x, g, logp, eps, current,
+        ndraws, maxdepth, maxdelta, progress, callback)
+    return _ChainResult(sampled.draws, sampled.accept, sampled.divergent,
+        sampled.bound, sampled.depth, sampled.energy, eps,
+        warmup_divergent, warmup_used, copy(x), current)
+end
+
+"""
+    _continue_chain(...)
+
+Draw another batch from a chain that has already warmed up.
+
+No warmup and no adaptation: the step size and metric come in fixed, which is
+what makes this a continuation of the same chain rather than a new one that
+happens to start nearby. Adapting again would break detailed balance across the
+join, because the transition kernel would then depend on the draws it had
+already produced.
+"""
+function _continue_chain(logdensity!, ws::_NUTSWorkspace, rng::AbstractRNG,
+    x::Vector{Float64}, g::Vector{Float64}, logp::Float64, eps::Float64,
+    metric::CTSEMMetric, ndraws::Int, maxdepth::Int, maxdelta::Float64,
+    progress::CTSEMProgress=CTSEMProgress(false),
+    callback::CTSEMCallback=CTSEMCallback(nothing))
+    sampled = _sample_draws!(logdensity!, ws, rng, x, g, logp, eps, metric,
+        ndraws, maxdepth, maxdelta, progress, callback)
+    return _ChainResult(sampled.draws, sampled.accept, sampled.divergent,
+        sampled.bound, sampled.depth, sampled.energy, eps, 0, 0, copy(x), metric)
+end
+
+"""
+    _sample_to_target(...)
+
+Sample until the effective sample size targets are met, or the draw budget runs
+out, whichever comes first.
+
+Draws arrive in batches, and after each one the diagnostics are recomputed over
+*everything so far*. Effective sample size and R-hat are properties of the whole
+run rather than of the latest batch, and stopping on a batch-local figure would
+be stopping on noise. Between batches every chain continues from where it
+stopped with its own step size and metric held fixed, so the result is one run
+of `total` draws rather than a concatenation of short ones.
+
+The per-chain state comes back with the draws, which is the same mechanism a
+caller uses to ask for more after looking at the answer.
+"""
+function _sample_to_target(density_for, centre, metric, nchains::Int,
+    parallel::Bool, seed::Integer, nwarmup::Int, ndraws::Int, maxdepth::Int,
+    target_accept::Float64, maxdelta::Float64, init_scale::Float64,
+    adapt_metric::Bool, adapt, settle_tol::Float64, min_ess::Float64,
+    mean_ess::Float64, max_draws::Int, rhat_target::Float64, npar::Int,
+    resume, verbose::Bool, overwrite::Bool=true; progress_callback=nothing,
+    progress_sink=nothing, init_eps::Float64=0.0, starts=nothing,
+    t0::Float64=time(), coordinate=nothing)
+
+    results = if resume === nothing
+        _sample_chains(nchains, parallel, seed, centre, metric, nwarmup, ndraws,
+            maxdepth, target_accept, maxdelta, init_scale, adapt_metric, adapt,
+            density_for; settle_tol=settle_tol, init_eps=init_eps,
+            progress=verbose, overwrite=overwrite,
+            progress_callback=progress_callback,
+            progress_sink=progress_sink, starts=starts)
+    else
+        _continue_chains(nchains, parallel, seed, ndraws, maxdepth, maxdelta,
+            density_for, resume; progress=verbose, overwrite=overwrite,
+            progress_callback=progress_callback, progress_sink=progress_sink)
+    end
+    held = Ref(results)
+    extend! = function (wanted, attempt)
+        held[] = _merge_chains(held[],
+            _continue_chains(nchains, parallel, seed + 1000 * attempt, wanted,
+                maxdepth, maxdelta, density_for, held[]; progress=verbose,
+                overwrite=overwrite, progress_callback=progress_callback,
+                progress_sink=progress_sink))
+        return nothing
+    end
+    run = _sample_until_target(() -> _pool_draws(held[], npar), extend!, nchains,
+        ndraws, min_ess, mean_ess, max_draws, rhat_target, verbose; t0=t0,
+        coordinate=coordinate)
+    return (results=held[], ndraws=run.total, trace=run.trace)
+end
+
+"""
+    _sample_until_target(pool, extend!, nchains, ndraws, min_ess, mean_ess,
+        max_draws, rhat_target, verbose)
+
+The stopping rule of `_sample_to_target`, for any sampler whose chains can be
+continued: `pool()` returns the population draws so far (`npar x (nchains *
+total)`, chain-major) and `extend!(wanted, attempt)` continues every chain by
+`wanted` draws with its tuning held fixed. The NUTS chains and the SAEM
+sampler's (`ctsem_saem_sample`) both stop here, so a run means the same thing
+whichever drew it.
+
+Returns the draws per chain at the end and a trace of every check: draws per
+chain, seconds since `t0`, the worst effective size (bulk or tail) and the
+worst R-hat -- which is how long a run took to reach a given size, whether or
+not R-hat then held it open.
+"""
+function _sample_until_target(pool, extend!, nchains::Int, ndraws::Int,
+    min_ess::Float64, mean_ess::Float64, max_draws::Int, rhat_target::Float64,
+    verbose::Bool; t0::Float64=time(), coordinate=nothing)
+    total = ndraws
+    attempt = 0
+    was_met = false
+    trace = (draws=Int[], secs=Float64[], ess=Float64[], rhat=Float64[])
+    while coordinate !== nothing || min_ess > 0 || mean_ess > 0
+        wanted = if coordinate !== nothing
+            # Another process judges these chains with others it is running:
+            # hand it this batch and continue by however many it says, where
+            # zero ends the run. Its rule is `_sample_verdict` too, over every
+            # chain at once, so the chains stay one length and pool whole.
+            reply = coordinate(pool(), total)
+            reply === nothing ? 0 : Int(round(Float64(first(reply))))
+        else
+            v = _sample_verdict(pool(), fill(total, nchains), ndraws, total,
+                min_ess, mean_ess, max_draws, rhat_target, was_met)
+            push!(trace.draws, total); push!(trace.secs, time() - t0)
+            push!(trace.ess, v.worst); push!(trace.rhat, v.rhat)
+            if verbose
+                println(_console(), "  ", total, " draws per chain: min ESS (bulk and tail) ",
+                    round(v.worst; digits=1), ", mean ESS ", round(v.average; digits=1),
+                    ", worst R-hat ", round(v.rhat; digits=3),
+                    v.confirmed ? " -- targets met" :
+                    v.met ? " -- targets met, confirming" : "")
+                v.budget && println(_console(), "  draw budget of ", max_draws,
+                    " per chain reached before the targets were met")
+            end
+            was_met = v.met
+            v.wanted
+        end
+        wanted <= 0 && break
+        attempt += 1
+        extend!(wanted, attempt)
+        total += wanted
+    end
+    return (total=total, trace=trace)
+end
+
+"""
+    _sample_verdict(pooled, nchains, ndraws, total, min_ess, mean_ess,
+        max_draws, rhat_target, was_met)
+
+One check of the stopping rule over `pooled` (`npar x sum(lengths)`, chain
+`c` the next `lengths[c]` columns): whether the targets are met, and if not
+how many more draws per chain to ask for, `wanted`, which is zero once the run
+should end. `total` is the draws per chain so far, their mean when chains
+differ, which is what the budget counts. The loop in `_sample_until_target`
+applies it to chains in one session, and `ctsem_sample_verdict` to chains in
+several processes, so the two stop alike.
+"""
+function _sample_verdict(pooled::AbstractMatrix, lengths::AbstractVector{<:Integer},
+    ndraws::Int, total::Real, min_ess::Float64, mean_ess::Float64, max_draws::Int,
+    rhat_target::Float64, was_met::Bool)
+    diagnostics = ctsem_sample_diagnostics(Matrix{Float64}(pooled), lengths)
+    finite_ess = filter(isfinite, diagnostics.ess)
+    finite_tail = filter(isfinite, diagnostics.ess_tail)
+    finite_rhat = filter(isfinite, diagnostics.rhat)
+    # The worse of bulk and tail: the 5% and 95% points a summary reports
+    # rest on the tail's draws, and a chain that has missed a tail leaves
+    # the bulk figure untouched.
+    worst = isempty(finite_ess) ? 0.0 :
+        min(minimum(finite_ess), isempty(finite_tail) ? Inf : minimum(finite_tail))
+    average = isempty(finite_ess) ? 0.0 : sum(finite_ess) / length(finite_ess)
+    rhat = isempty(finite_rhat) ? Inf : maximum(finite_rhat)
+    met = worst >= min_ess && average >= mean_ess && rhat <= rhat_target
+    # Confirmed once before stopping. Stopping the moment a target is first
+    # met is a rule correlated with the quantity it tests: effective size is
+    # estimated with error, so a first crossing is more often a favourable
+    # error than a real one, and the realised size settles below target. One
+    # extra batch removes most of that, and costs one batch.
+    confirmed = met && was_met
+    budget = !confirmed && total >= max_draws
+    wanted = 0
+    if !confirmed && !budget
+        # Ask for as many more as the shortfall suggests, bounded below by a
+        # quarter of the last batch -- a tiny follow-up costs a round of
+        # scheduling and moves the estimate hardly at all -- and above by four
+        # times it, so one badly mixing coordinate cannot demand an enormous
+        # single batch on the strength of an early, noisy estimate.
+        shortfall = max(min_ess / max(worst, 1.0), mean_ess / max(average, 1.0))
+        wanted = clamp(ceil(Int, ndraws * (shortfall - 1)), fld(ndraws, 4), ndraws * 4)
+        wanted = max(min(wanted, floor(Int, max_draws - total)), 0)
+    end
+    return (wanted=wanted, met=met, confirmed=confirmed, budget=budget,
+        worst=worst, average=average, rhat=rhat)
+end
+
+"""
+    ctsem_sample_verdict(pooled, lengths; ndraws, min_ess, mean_ess,
+        max_draws, rhat_target, was_met)
+
+`_sample_verdict` for a caller pooling chains that ran in separate processes,
+each continued by the `coordinate` keyword of `ctsem_sample`,
+`ctsem_sample_marginal` and `ctsem_saem_sample`. `lengths` are the chains'
+draw counts, which may differ, and the draws per chain the budget counts are
+their mean. `ndraws` is the first batch per chain, which sizes the next one as
+it does in one session.
+"""
+function ctsem_sample_verdict(pooled::AbstractMatrix, lengths::AbstractVector{<:Integer};
+    ndraws::Integer, min_ess::Real=0.0, mean_ess::Real=0.0,
+    max_draws::Integer=0, rhat_target::Real=1.01, was_met::Bool=false)
+    return _sample_verdict(pooled, lengths, Int(ndraws), sum(lengths) / length(lengths),
+        Float64(min_ess), Float64(mean_ess), max(Int(max_draws), Int(ndraws)),
+        Float64(rhat_target), was_met)
+end
+
+export ctsem_sample_verdict
+
+"""Draws from every chain, population part only, chain-major."""
+function _pool_draws(results::Vector{_ChainResult}, npar::Int)
+    ndraws = size(first(results).draws, 2)
+    pooled = Matrix{Float64}(undef, npar, length(results) * ndraws)
+    for (c, r) in enumerate(results)
+        @inbounds for t in 1:ndraws, j in 1:npar
+            pooled[j, (c - 1) * ndraws + t] = r.draws[j, t]
+        end
+    end
+    return pooled
+end
+
+"""
+    _check_sample_arguments(nchains, ndraws, target_accept; nwarmup=0)
+
+The checks every sampler makes of its chain and draw counts and its
+acceptance target.
+"""
+function _check_sample_arguments(nchains::Integer, ndraws::Integer, target_accept::Real;
+    nwarmup::Integer=0)
+    nchains >= 1 || throw(ArgumentError("nchains must be positive"))
+    ndraws >= 1 || throw(ArgumentError("ndraws must be positive"))
+    nwarmup >= 0 || throw(ArgumentError("nwarmup must be non-negative"))
+    0 < target_accept < 1 || throw(ArgumentError("target_accept must be in (0, 1)"))
+    return nothing
+end
+
+"""
+    _sample_pool(results, nchains, ndraws, nkeep; rows=nkeep)
+
+Each chain's draws (their first `nkeep` coordinates) and its per-draw record --
+acceptance, divergence, tree depth, energy -- pooled chain after chain, into a
+draws matrix of `rows` rows; the rows past `nkeep` are the caller's to fill, as
+the joint sampler fills its natural deviations.
+"""
+function _sample_pool(results, nchains::Int, ndraws::Int, nkeep::Int; rows::Int=nkeep)
+    total = nchains * ndraws
+    draws = Matrix{Float64}(undef, rows, total)
+    accept = Vector{Float64}(undef, total)
+    divergent = Vector{Bool}(undef, total)
+    bound = Vector{Bool}(undef, total)
+    depth = Vector{Int}(undef, total)
+    energy = Vector{Float64}(undef, total)
+    for c in 1:nchains
+        r = results[c]
+        for t in 1:ndraws
+            column = (c - 1) * ndraws + t
+            @inbounds for j in 1:nkeep
+                draws[j, column] = r.draws[j, t]
+            end
+            accept[column] = r.accept[t]
+            divergent[column] = r.divergent[t]
+            bound[column] = r.bound[t]
+            depth[column] = r.depth[t]
+            energy[column] = r.energy[t]
+        end
+    end
+    return (draws=draws, accept=accept, divergent=divergent, bound=bound, depth=depth,
+        energy=energy)
+end
+
+"""The effect summary of a run with no effects, as the marginal routes report it."""
+const _NO_EFFECT_SUMMARY = (mean=Float64[], sd=Float64[], cov=Float64[], rows=Int[],
+    cols=Int[])
+
+"""
+    _effect_summary(effect_sum, effect_sq, effect_cross, n, blocks)
+
+The natural deviations' posterior means, sds (on `n - 1`) and within-block
+covariances, from their running sums over `n` draws.
+"""
+function _effect_summary(effect_sum, effect_sq, effect_cross, n::Int, blocks)
+    mean = effect_sum ./ n
+    sd = sqrt.(max.(effect_sq ./ n .- mean .^ 2, 0.0) .* (n / max(n - 1, 1)))
+    cov = _effect_cross_cov(effect_cross, mean, n, blocks)
+    rows, cols = _effect_cross_index(blocks)
+    return (mean=mean, sd=sd, cov=cov, rows=rows, cols=cols)
+end
+
+"""
+    _sample_result(pooled; nchains, ndraws, npar, ndim, maxdepth, stepsize,
+        warmup_divergent, trace, saved_effects, effects, ebfmi, diagnostics)
+
+The record every sampler returns -- the joint and marginal NUTS samplers,
+tempered SMC and SAEM's kernel -- from its pooled draws and per-draw record
+(`pooled`: `draws`, `accept`, `divergent`, `depth`, `energy`, as
+`_sample_pool` returns them). R reads it by name (`R/ctBackendSample.R`), so
+it is built once, here: a field added for one sampler is added for all, and
+each `merge`s its own fields onto it. `diagnostics` defaults to the pooled
+draws'; SMC passes its chains' own, taken before its correction resamples them.
+"""
+function _sample_result(pooled; nchains::Int, ndraws::Int, npar::Int, ndim::Int,
+    maxdepth::Int, stepsize, warmup_divergent, trace, saved_effects::Bool=false,
+    effects=_NO_EFFECT_SUMMARY, ebfmi=_ebfmi(pooled.energy, nchains),
+    diagnostics=ctsem_sample_diagnostics(pooled.draws, nchains))
+    return (
+        draws=pooled.draws, npar=npar, ndim=ndim, nchains=nchains, ndraws=ndraws,
+        saved_effects=saved_effects, effect_mean=effects.mean, effect_sd=effects.sd,
+        effect_cov=effects.cov, effect_cov_rows=effects.rows,
+        effect_cov_cols=effects.cols, rhat=diagnostics.rhat, ess=diagnostics.ess,
+        ess_tail=diagnostics.ess_tail, accept=pooled.accept,
+        divergent=pooled.divergent, depth=pooled.depth, energy=pooled.energy,
+        stepsize=stepsize, warmup_divergent=warmup_divergent,
+        ndivergent=count(pooled.divergent),
+        # The divergences past the correlation bound (`_divergence_at_bound`),
+        # which the verdict reads as the posterior reaching the bound.
+        ndivergent_bound=count(pooled.bound), max_depth=maxdepth,
+        nsaturated=count(==(maxdepth), pooled.depth), ebfmi=ebfmi,
+        # `init=NaN` would be wrong rather than defensive: Julia's `min` and
+        # `max` propagate NaN, so it poisons every result instead of only the
+        # empty one.
+        worst_rhat=_finite_extremum(diagnostics.rhat, maximum),
+        min_ess=_finite_extremum(vcat(diagnostics.ess, diagnostics.ess_tail), minimum),
+        target_trace=trace,
+    )
+end
+
+"""
+    _with_sample_roots(f, laplace, values, kwargs, natural)
+
+`f()` with each full-rank level's effects standardised in a Cholesky ordered
+strongest-determined first for the run (`_with_root_orders`), the forward-mode
+gradients counted (`_with_forward_count`); a caller who passed any of the
+keywords named in `natural` (its own starts or state, in the natural order)
+keeps the natural order.
+"""
+function _with_sample_roots(f, laplace::CTSEMLaplaceObjective, values::AbstractVector,
+    kwargs, natural::Tuple)
+    npar = Int(get(kwargs, :npar, length(values)))
+    own = any(k -> get(kwargs, k, nothing) !== nothing, natural)
+    return _with_root_orders(laplace, collect(Float64, values)[1:npar], own) do
+        _with_forward_count(f)
+    end
+end
+
+"""
+    _run_chains(nchains, parallel, seed, label, closing, chain; kwargs...)
+
+Run `nchains` chains and collect their results: concurrently when `parallel`
+says the density allows it and there are threads for them, one after another
+otherwise.
+
+`chain(c, rng, reporter, watcher)` runs chain `c` and returns its
+`_ChainResult`. Everything around that is the same whether the chains are
+starting or continuing, and was written out twice: the results vector, the
+per-chain RNG, the restriction of reporting to chain 1, and the spawn-or-serial
+dispatch.
+
+Only the first chain reports. Four threads writing lines interleave into
+something unreadable, and a lock to prevent that would serialise the work being
+reported on; one chain is representative when they are all doing the same thing.
+The same restriction applies to the callback for a sharper reason than
+readability: several `Threads.@spawn`ed chains calling back into R at once is a
+concurrency hazard, not just noise. One representative chain is what a GUI gets,
+exactly as one representative chain is what the console gets.
+
+`closing` is the text the progress line is closed with. Closing it matters:
+nothing did, once, and the last in-place update was left open with no newline
+on it, so whatever R printed next landed inside it -- "div 0Laplace fit:
+trajectories are conditional...".
+
+The RNG is constructed here rather than by the caller so that both routes seed
+the same way -- `Xoshiro(seed + c)`, per chain, from the same base -- which is
+the property a run has to keep to be reproducible from its seed.
+"""
+function _run_chains(nchains::Int, parallel::Bool, seed::Integer,
+    label::String, closing::String, chain; progress::Bool=false,
+    overwrite::Bool=true, progress_callback=nothing, progress_sink=nothing)
+    results = Vector{_ChainResult}(undef, nchains)
+    runner = function (c)
+        reporter = CTSEMProgress(progress && c == 1; label=label,
+            overwrite=overwrite, sink=progress_sink)
+        watcher = CTSEMCallback(c == 1 ? progress_callback : nothing)
+        results[c] = chain(c, Random.Xoshiro(UInt64(seed) + UInt64(c)),
+            reporter, watcher)
+        _progress_done(reporter, closing)
+        return nothing
+    end
+    # `parallel = false` is a statement about the density, not a preference:
+    # `ctsem_sample_marginal` passes it because every chain evaluates one shared
+    # objective, whose workspaces are per chunk -- safe for one caller, a race
+    # for several. So it must mean one chain after another. A pool region cannot
+    # promise that, since it hands a chain to any worker that happens to be idle,
+    # and whether one is idle depends on what ran before: a `ctJuliaEvaluate()`
+    # or anything else outside a `cores` ceiling leaves the pool at full width.
+    # 6b8a87b1 dropped this branch, and from then two in-process chains on two
+    # threads drew order-1 different draws from the same seeds, and corrupted
+    # the Julia session badly enough that it later died.
+    if !parallel || nchains == 1
+        for c in 1:nchains
+            runner(c)
+        end
+        return results
+    end
+    # No objective here -- see the two-argument method. The store is sized by
+    # `ctsem_sample`, the caller that passes `parallel = true`, before any
+    # chain starts.
+    _laplace_parallel(1:nchains) do c
+        runner(c)
+        return true
+    end
+    return results
+end
+
+"""Continue every chain from its own state.
+
+No warmup and no adaptation, so the target accept rate, initial scale and
+adaptation flags are the inert values: this is the same chain going on, not a
+new one tuned again.
+"""
+function _continue_chains(nchains::Int, parallel::Bool, seed::Integer,
+    ndraws::Int, maxdepth::Int, maxdelta::Float64, density_for,
+    previous::Vector{_ChainResult}; progress::Bool=false,
+    overwrite::Bool=true, progress_callback=nothing, progress_sink=nothing)
+    return _run_chains(nchains, parallel, seed, "sampling",
+        @sprintf("%d draws", ndraws),
+        (c, rng, reporter, watcher) -> _run_chain(density_for(c),
+            previous[c].x, previous[c].metric, rng,
+            0, ndraws, maxdepth, 0.8, maxdelta, 0.0, false, nothing;
+            resume=previous[c], progress=reporter, callback=watcher);
+        progress=progress, overwrite=overwrite,
+        progress_callback=progress_callback, progress_sink=progress_sink)
+end
+
+"""Glue two batches of the same chains into one."""
+function _merge_chains(a::Vector{_ChainResult}, b::Vector{_ChainResult})
+    return [_ChainResult(hcat(a[c].draws, b[c].draws),
+        vcat(a[c].accept, b[c].accept), vcat(a[c].divergent, b[c].divergent),
+        vcat(a[c].bound, b[c].bound),
+        vcat(a[c].depth, b[c].depth), vcat(a[c].energy, b[c].energy),
+        b[c].stepsize, a[c].warmup_divergent, a[c].warmup_used,
+        b[c].x, b[c].metric) for c in eachindex(a)]
+end
+
+"""Have two successive metric estimates stopped disagreeing?"""
+
+function _metric_settled(a::CTSEMMetric, b::CTSEMMetric, tol::Real)
+    length(a.factors) == length(b.factors) || return false
+    for k in eachindex(a.factors)
+        A = a.factors[k]
+        B = b.factors[k]
+        size(A) == size(B) || return false
+        # Every entry, not just the diagonal. The diagonals are the scale the
+        # step size is tuned against, which is true and not sufficient: the
+        # off-diagonal structure is the whole reason for a block metric, and it
+        # goes on being learned after the scales have settled.
+        for j in axes(A, 2), i in axes(A, 1)
+            reference = max(abs(A[j, j]), abs(B[j, j]), eps(Float64))
+            abs(A[i, j] - B[i, j]) / reference > tol && return false
+        end
+    end
+    return true
+end
+
+"""Iterations of step-size-only adaptation after the metric has settled."""
+const _ADAPT_TERM_BUFFER = 50
+
+"""
+    _sample_chains(nchains, parallel, seed, centre, metric, ..., density_for)
+
+Run the chains, concurrently when there are threads for them.
+
+`density_for(c)` builds chain `c`'s log-density closure. It is a function of the
+chain rather than one shared closure because a target may need per-chain
+scratch: the joint sampler hands each chain its own adjoint workspace, since
+every chain filters every subject and they would otherwise share buffers.
+"""
+function _sample_chains(nchains::Int, parallel::Bool, seed::Integer,
+    centre::Vector{Float64}, metric::CTSEMMetric, nwarmup::Int, ndraws::Int,
+    maxdepth::Int, target_accept::Float64, maxdelta::Float64,
+    init_scale::Float64, adapt_metric::Bool, adapt::Union{Nothing,Vector{Bool}},
+    density_for; settle_tol::Float64=0.0, init_eps::Float64=0.0,
+    progress::Bool=false, overwrite::Bool=true, progress_callback=nothing,
+    progress_sink=nothing, starts=nothing)
+    # One reporter spans both phases -- `_run_chain` relabels it from "warmup"
+    # to "sampling" partway -- so it opens on "warmup" and the closing line
+    # names both rather than whichever phase it ended in.
+    return _run_chains(nchains, parallel, seed, "warmup",
+        @sprintf("%d warmup + %d draws", nwarmup, ndraws),
+        # Given starts, chain `c` begins exactly at its own (cycling), rather
+        # than at a draw around `centre`.
+        (c, rng, reporter, watcher) -> _run_chain(density_for(c),
+            starts === nothing ? centre : starts[mod1(c, length(starts))],
+            metric, rng, nwarmup, ndraws, maxdepth,
+            target_accept, maxdelta, starts === nothing ? init_scale : 0.0,
+            adapt_metric, adapt;
+            settle_tol=settle_tol, init_eps=init_eps, progress=reporter,
+            callback=watcher);
+        progress=progress, overwrite=overwrite,
+        progress_callback=progress_callback, progress_sink=progress_sink)
+end
+
+"""
+    ctsem_sample(laplace, values; kwargs...)
+
+Sample the joint posterior over population parameters and random effects.
+
+`values` is where to start -- a Laplace estimate, normally, which is also what
+the initial metric is read from. Everything else has a Stan-compatible default:
+four chains, 500 warmup and 500 sampling iterations each, target acceptance 0.8,
+maximum tree depth 10.
+
+Returns population draws as `npar x (nchains * ndraws)`, chain-major, with the
+random effects summarised rather than returned unless `save_effects` is set.
+Diagnostics come back alongside: split R-hat and effective sample size per
+parameter, divergences, tree depths, step sizes and E-BFMI.
+
+`adapt_metric=false` keeps the Laplace metric throughout, which is worth trying
+when warmup is short: it is already a good metric, and re-estimating it from a
+few hundred draws can be worse than leaving it alone.
+"""
+function _ctsem_sample(laplace::CTSEMLaplaceObjective, values::AbstractVector;
+    npar::Integer=length(values), nchains::Integer=4, nwarmup::Integer=500,
+    ndraws::Integer=500, maxdepth::Integer=10, target_accept::Real=0.8,
+    maxdelta::Real=1000.0, seed::Integer=20260828, init_scale::Real=1.0,
+    adapt_metric::Bool=true, adapt_effects::Bool=false, save_effects::Bool=false,
+    hessian::Union{Nothing,AbstractMatrix}=nothing, verbose::Bool=false,
+    min_ess::Real=0.0, mean_ess::Real=0.0, max_draws::Integer=0,
+    rhat_target::Real=1.01, settle_tol::Real=0.0, resume=nothing,
+    progress_overwrite::Bool=true, progress_callback=nothing,
+    progress_sink=nothing, stepsize::Real=0.0,
+    starts::Union{Nothing,AbstractMatrix}=nothing, saem::Bool=false,
+    saem_nestep::Integer=50, coordinate=nothing)
+
+    t0 = time()
+    nchains = Int(nchains); nwarmup = Int(nwarmup); ndraws = Int(ndraws)
+    _check_sample_arguments(nchains, ndraws, target_accept; nwarmup=nwarmup)
+
+    # `saem = true`: placed by SAEM's state, as `ctsem_saem_sample` is -- the
+    # chains start from its estimate and its chains' effects, and the metric is
+    # read there -- rather than from the point handed in.
+    placement = saem ? _saem_placement(laplace, collect(Float64, values)[1:Int(npar)];
+        nchains=nchains, seed=seed, nestep=saem_nestep, init_scale=init_scale) : nothing
+    if placement !== nothing
+        values = placement.theta
+        starts === nothing && (starts = placement.joint)
+    end
+    sampler = ctsem_sampler(laplace, npar)
+    start = collect(Float64, values)
+    # Builds the metric *and* solves each unit's conditional mode at `start`,
+    # leaving it on the Laplace object, which `ctsem_sample_start` then uses to
+    # place the effects. So the order of these two lines matters: reversed, the
+    # effects are placed at whatever the objective's last call left behind --
+    # zero on a fresh one -- and `ctsem_sample_metric` records what that was
+    # measured to do to a chain.
+    metric = ctsem_sample_metric(sampler, start; hessian=hessian)
+
+    # Grown before anything is spawned: a concurrent push! onto the shared
+    # workspace vector is a race, and one chain per slot is the whole reason
+    # chains can run at all.
+    # Chains and the loops inside them draw from one pool. There is no split to
+    # report because there is no longer a split: a chain takes a worker, and
+    # whatever workers are idle at any moment go to whichever chain's subject
+    # loop asks next. Saying "N threads each" would be a promise nothing makes.
+    width = _laplace_ensure_pool!(laplace)
+    parallel = nchains > 1 && Threads.nthreads() > 1
+    verbose && println(_console(), "Sampling: ", nchains, " chain(s), ", ctsem_sample_dimension(sampler),
+        " dimensions (", sampler.npar, " population + ",
+        ctsem_sample_dimension(sampler) - sampler.npar, " effects), ",
+        width, " worker(s) shared, metric in ",
+        length(metric.ranges), " block(s)")
+
+    # Which metric blocks warmup may re-estimate. The population block always
+    # benefits: its Laplace value is a local quadratic fit and the posterior is
+    # not quadratic. The effect blocks come from a conditional covariance that
+    # is *exact* for a linear model, and replacing one with a k x k estimate
+    # from a few hundred draws is as likely to add noise as to remove bias --
+    # measured at 356 effective draws keeping them against 261 re-estimating.
+    adapt = adapt_effects ? nothing : [b == 1 for b in eachindex(metric.ranges)]
+    centre = ctsem_sample_start(sampler, start)
+    chainstarts = _sample_joint_starts(starts, centre, sampler.npar)
+    run = _sample_to_target(
+        c -> ((g, x) -> ctsem_sample_density!(g, sampler, x;
+            )),
+        centre, metric, nchains, parallel, seed, nwarmup, ndraws, Int(maxdepth),
+        Float64(target_accept), Float64(maxdelta), Float64(init_scale),
+        adapt_metric, adapt, Float64(settle_tol), Float64(min_ess),
+        Float64(mean_ess), max(Int(max_draws), ndraws), Float64(rhat_target),
+        sampler.npar, resume, verbose, progress_overwrite;
+        progress_callback=progress_callback, progress_sink=progress_sink,
+        init_eps=Float64(stepsize), starts=chainstarts, t0=t0,
+        coordinate=coordinate)
+    results = run.results
+    ndraws = run.ndraws
+
+    ndim = sampler.ndim
+    npar = sampler.npar
+    total = nchains * ndraws
+    # The effects are reported, summarised and kept as natural deviations
+    # (`_laplace_deviations!`), not as the coordinates the sampler moves.
+    devstarts, ndev = _laplace_deviation_offsets(laplace)
+    kept = save_effects ? npar + ndev : npar
+    pooled = _sample_pool(results, nchains, ndraws, npar; rows=kept)
+    draws = pooled.draws
+    # Running mean and sum of squares for the effects, so their summary costs
+    # nothing whether or not the draws themselves are kept.
+    effect_sum = zeros(Float64, ndev)
+    effect_sq = zeros(Float64, ndev)
+    # And products within each group's block, for its posterior covariance.
+    blocks = _laplace_deviation_blocks(laplace)
+    effect_cross = zeros(Float64, _effect_cross_length(blocks))
+    dev = zeros(Float64, ndev)
+    for c in 1:nchains
+        r = results[c]
+        for t in 1:ndraws
+            column = (c - 1) * ndraws + t
+            Ls = _laplace_popchols(r.draws[1:npar, t], laplace.spec)
+            _laplace_deviations!(dev, laplace, Ls, view(r.draws, (npar + 1):ndim, t),
+                devstarts)
+            @inbounds for j in 1:ndev
+                effect_sum[j] += dev[j]
+                effect_sq[j] += dev[j] * dev[j]
+                save_effects && (draws[npar + j, column] = dev[j])
+            end
+            _effect_cross_add!(effect_cross, dev, blocks)
+        end
+    end
+    # The reported joint dimension is the parameters and the natural
+    # deviations, which is what `draws` holds when the effects are kept.
+    return merge(_sample_result(pooled; nchains=nchains, ndraws=ndraws, npar=npar,
+            ndim=npar + ndev, maxdepth=Int(maxdepth),
+            stepsize=[r.stepsize for r in results],
+            warmup_divergent=[r.warmup_divergent for r in results], trace=run.trace,
+            saved_effects=save_effects,
+            effects=_effect_summary(effect_sum, effect_sq, effect_cross, total, blocks)),
+        (placement=_saem_placement_summary(placement),))
+end
+
+"""
+    ctsem_sample(laplace, values; kwargs...)
+
+`_ctsem_sample` (documented there) with each full-rank level's effects
+standardised in a Cholesky ordered strongest-determined first for the run
+(`_with_root_orders`). A caller's own `starts` are in the natural order and keep
+it.
+"""
+ctsem_sample(laplace::CTSEMLaplaceObjective, values::AbstractVector; kwargs...) =
+    _with_sample_roots(() -> _ctsem_sample(laplace, values; kwargs...), laplace, values,
+        kwargs, (:starts,))
+
+"""
+    _marginal_chains_points(objective, densities, gradient_method, mode, ...)
+
+The marginal sampler's chains at once, each on an objective of its own
+(`_each_point!` in `mode`), warmed up and drawn, then extended together by the
+one stopping rule (`_sample_until_target`). A chain's coreset density, where it
+has one, is pointed at whichever copy runs it, since a later call may hand the
+chain to another worker. Before this the chains ran one after another in the
+session, so a filter objective with one subject -- a time series -- sampled on
+one core, and worker processes were the only way to run chains at once.
+"""
+function _marginal_chains_points(objective, densities, gradient_method::Symbol,
+    mode::Symbol, centre::Vector{Float64}, metric::CTSEMMetric, nchains::Int,
+    seed::Integer, nwarmup::Int, ndraws::Int, maxdepth::Int, target_accept::Float64,
+    maxdelta::Float64, init_scale::Float64, adapt_metric::Bool, min_ess::Float64,
+    mean_ess::Float64, max_draws::Int, rhat_target::Float64, npar::Int, verbose::Bool,
+    starts, init_eps::Float64, t0::Float64)
+    held = Ref(Vector{_ChainResult}(undef, nchains))
+    first = held[]
+    _each_point!(objective, nchains, mode) do c, obj, _
+        _marginal_chain_first!(first, c, obj, densities, gradient_method, centre,
+            metric, seed, nwarmup, ndraws, maxdepth, target_accept, maxdelta,
+            init_scale, adapt_metric, starts, init_eps)
+    end
+    extend! = function (wanted, attempt)
+        previous = held[]
+        more = Vector{_ChainResult}(undef, nchains)
+        _each_point!(objective, nchains, mode) do c, obj, _
+            _marginal_chain_more!(more, previous, c, obj, densities, gradient_method,
+                wanted, attempt, seed, maxdepth, maxdelta)
+        end
+        held[] = _merge_chains(previous, more)
+        return nothing
+    end
+    run = _sample_until_target(() -> _pool_draws(held[], npar), extend!, nchains, ndraws,
+        min_ess, mean_ess, max_draws, rhat_target, verbose; t0=t0)
+    return (results=held[], ndraws=run.total, trace=run.trace)
+end
+
+"""Chain `c`'s density on the objective `obj` that runs it."""
+function _marginal_chain_density(obj, densities, gradient_method::Symbol, c::Int)
+    densities === nothing && return (g, x) -> _marginal_density!(obj, gradient_method, g, x)
+    d = densities[c]
+    d.objective = obj
+    return d
+end
+
+"""Chain `c`'s warm-up and first draws, into `out[c]`, on the stream
+`_run_chains` gives chain `c`."""
+function _marginal_chain_first!(out, c::Int, obj, densities, gradient_method::Symbol,
+    centre, metric, seed, nwarmup, ndraws, maxdepth, target_accept, maxdelta,
+    init_scale, adapt_metric, starts, init_eps)
+    ld = _marginal_chain_density(obj, densities, gradient_method, c)
+    start = starts === nothing ? centre : starts[mod1(c, length(starts))]
+    out[c] = _run_chain(ld, start, metric, Random.Xoshiro(UInt64(seed) + UInt64(c)),
+        nwarmup, ndraws, maxdepth, target_accept, maxdelta,
+        starts === nothing ? init_scale : 0.0, adapt_metric, nothing; init_eps=init_eps)
+    return nothing
+end
+
+"""Chain `c` continued by `wanted` draws, into `more[c]`."""
+function _marginal_chain_more!(more, previous, c::Int, obj, densities,
+    gradient_method::Symbol, wanted, attempt, seed, maxdepth, maxdelta)
+    ld = _marginal_chain_density(obj, densities, gradient_method, c)
+    more[c] = _run_chain(ld, previous[c].x, previous[c].metric,
+        Random.Xoshiro(UInt64(seed + 1000 * attempt) + UInt64(c)), 0, wanted, maxdepth,
+        0.8, maxdelta, 0.0, false, nothing; resume=previous[c])
+    return nothing
+end
+
+"""
+    _sample_joint_starts(starts, centre, npar)
+
+Chains' starting points on the joint vector from a caller's `starts`: one
+column a chain, either `npar` long (the parameters, the effects then at the
+centre's modes) or the joint vector's whole length. `nothing` for none.
+"""
+function _sample_joint_starts(starts, centre::Vector{Float64}, npar::Integer)
+    starts === nothing && return nothing
+    ndim = length(centre)
+    size(starts, 1) in (npar, ndim) || throw(DimensionMismatch(
+        "starts must have $npar (parameters) or $ndim (parameters and effects) rows"))
+    return [begin
+        x = copy(centre)
+        x[1:size(starts, 1)] .= view(starts, :, c)
+        x
+    end for c in axes(starts, 2)]
+end
+
+export ctsem_sample_marginal
+
+"""
+    ctsem_sample_marginal(objective, values; kwargs...)
+
+Sample the population parameters with the random effects already integrated out.
+
+The counterpart to `ctsem_sample`, and usually the faster one. Where that
+samples `theta` and every subject's effects jointly -- `npar + sum_U dim(u_U)`
+coordinates, so 207 for two hundred subjects with one effect each -- this
+samples `theta` alone, because the objective it is given has already done the
+integral. The dimension therefore does not grow with the subject count at all.
+
+Two objectives qualify and both work here unchanged, because `ctsem_evaluate`
+and `ctsem_hessian` are defined for each:
+
+  * a `CTSEMObjective` built from an augmented model, where the filter carries
+    the effects as states and integrates them analytically;
+  * a `CTSEMLaplaceObjective`, where the Laplace approximation does it.
+
+The geometry is much kinder. The joint target has a `L(theta) u` product in it,
+which is the funnel that leaves E-BFMI at 0.16-0.49 and costs most of the
+sampling efficiency; a `theta`-only target has no such product. Measured against
+Stan on identical data, Stan samples the augmented marginal in 674s where the
+joint sampler takes 1114s at two hundred subjects -- and the two agree on every
+posterior mean and standard deviation to three decimals, which is what says the
+difference is dimension rather than correctness.
+
+# Chains run one after another here
+
+The joint sampler gives each chain its own adjoint workspace, because every
+chain filters every subject and they would otherwise share buffers. `ctsem_
+evaluate` has no such per-chain slot: its workspaces are per *chunk*, and chunks
+partition subjects, which is safe for one caller and a race for several. So
+chains are sequential and each gradient uses the subject-loop parallelism
+instead. That is the smaller of the two axes -- about twofold against linear --
+and it is a real cost, but the dimension collapse is worth far more than the
+axis is.
+
+# The Laplace objective is stateful, and that matters more here
+
+`CTSEMLaplaceObjective` retains each unit's inner mode between calls and
+warm-starts the next solve from it. Across an optimizer's trajectory that is
+free accuracy; across a sampler's it makes the density a function of where the
+chain has *been* as well as where it is. The inner problem is concave in `u` for
+these models, so the warm start converges to the same mode either way and the
+dependence does not bite -- but it is an assumption rather than a guarantee, and
+`test_sampler.jl`'s "the inner mode does not depend on how the chain got there"
+pins it: the same `theta`, evaluated after three different histories (a nearby
+warm start, a warm start from far away, and a cold start with no prior call at
+all), gives the same value, gradient and retained modes to numerical tolerance.
+"""
+function ctsem_sample_marginal(objective, values::AbstractVector;
+    nchains::Integer=4, nwarmup::Integer=500, ndraws::Integer=500,
+    maxdepth::Integer=10, target_accept::Real=0.8, maxdelta::Real=1000.0,
+    seed::Integer=20260828, init_scale::Real=1.0, adapt_metric::Bool=true,
+    hessian::Union{Nothing,AbstractMatrix}=nothing, gradient_method=:adjoint,
+    verbose::Bool=false, min_ess::Real=0.0, mean_ess::Real=0.0,
+    max_draws::Integer=0, rhat_target::Real=1.01, settle_tol::Real=0.0,
+    resume=nothing, progress_overwrite::Bool=true, progress_callback=nothing,
+    progress_sink=nothing, nparameters::Integer=0, stepsize::Real=0.0,
+    starts::Union{Nothing,AbstractMatrix}=nothing, coordinate=nothing,
+    coreset::Bool=true)
+
+    t0 = time()
+    forward0 = ctsem_forward_gradients()
+    explosive0 = ctsem_explosive_passes()
+    nchains = Int(nchains); nwarmup = Int(nwarmup); ndraws = Int(ndraws)
+    _check_sample_arguments(nchains, ndraws, target_accept; nwarmup=nwarmup)
+
+    centre = collect(Float64, values)
+    # `ndim` for every coordinate sampled, which is what this entry returns
+    # draws for; `nparameters` (a keyword) for how many of them are model
+    # parameters, which is fewer only on the state-explicit route. `npar` kept
+    # as the name of the returned count so the R side reads what it always did.
+    ndim = length(centre)
+    npar = ndim
+    logdensity! = (g, x) -> _marginal_density!(objective, gradient_method, g, x)
+    # The chains run at once where the objective can be split between them
+    # (`_points_mode`): on the pool, a copy per worker of the objective as a
+    # sum over units (the marginal route's view, a unit a subject); on a filter
+    # objective with fewer subjects than the pool, deep copies. One after
+    # another otherwise, and wherever a resume, another process's coordination
+    # or the settling rule asks for `_sample_to_target`'s own loop.
+    mode = (nchains > 1 && resume === nothing && coordinate === nothing &&
+        settle_tol <= 0) ? _points_mode(objective, true; gradient_method=gradient_method) :
+        :serial
+    # Where the objective is a sum of units' terms, each chain samples on a
+    # coreset of them after its warm-up, its draws' endpoints tested against
+    # the full density (sample_surrogate.jl); `coreset = false` is the oracle.
+    # Built on what the chains will run on, the view on the pool, since a
+    # chain's density is pointed at its worker's copy of that
+    # (`_marginal_chain_density`) and holds it by type.
+    on = mode == :pool ? _ctsem_units_of(objective) : objective
+    densities = coreset && _smc_coreset_capable(objective) ?
+        [_SurrogateDensity(on, gradient_method, ndim,
+            hash((UInt64(seed), c, :surrogate)); floor=target_accept)
+            for c in 1:nchains] : nothing
+    density_for = densities === nothing ? (_ -> logdensity!) : (c -> densities[c])
+
+    # One dense block: at this dimension the whole covariance is affordable to
+    # estimate and to factorize, and there is no sparsity to exploit -- the
+    # population parameters are all coupled.
+    H = hessian === nothing ? ctsem_hessian(objective, centre) : Matrix(hessian)
+    information = Symmetric((-(H .+ transpose(H))) ./ 2)
+    # `nparameters` is set when the coordinates past it are not parameters at
+    # all: the state-explicit route hands this entry `[theta; innovations]`,
+    # and treating the whole vector as one dense population block was wrong in
+    # three separate ways.
+    #
+    # It inverted the arrow-shaped joint Hessian at the joint mode -- and that
+    # mode is degenerate in the state directions, which is why the fit is
+    # sampled rather than optimised. Measured on a 12-subject, 10-occasion
+    # model: a 155x155 information matrix with **16 non-positive eigenvalues**.
+    # `_bounded_inverse` floors those at 1e-8 of the largest, so the metric
+    # came back claiming a standard deviation of about 8.6 in sixteen
+    # directions along which the density actually *increases*. A worse start
+    # than no information at all.
+    #
+    # The innovations are standardised -- their prior is N(0, 1) and the
+    # posterior is tighter wherever data informs them -- so the identity is
+    # both defensible and an upper bound, where the floored inverse was
+    # neither. The parameters keep a dense block, from the `(1:nparameters)`
+    # sub-block of the information, which is their curvature conditional on
+    # the states: the same choice, and for the same reason, as
+    # `ctsem_sample_metric` makes for the joint route's population block.
+    #
+    # It is also the difference between an O(ndim^3) eigendecomposition of
+    # everything and an O(nparameters^3) one: `nstate` grows with rows times
+    # latents, so the dense form was cubic in the size of the data.
+    # A parameter-only Hessian with no `nparameters` to say so would fall into
+    # the dense branch and index it as though it covered every coordinate, so
+    # the matrix decides when the caller did not.
+    nfixed = nparameters > 0 ? Int(nparameters) :
+        (size(information, 1) < ndim ? size(information, 1) : 0)
+    metric = if 0 < nfixed < ndim
+        keep = 1:nfixed
+        popcov = _bounded_inverse(Symmetric(Matrix(information[keep, keep])))
+        ranges = vcat([keep], [i:i for i in (nfixed + 1):ndim])
+        covariances = vcat([popcov],
+            [ones(1, 1) for _ in (nfixed + 1):ndim])
+        _metric_from_covariances(ranges, covariances)
+    else
+        _metric_from_covariances([1:ndim], [_bounded_inverse(information)])
+    end
+
+    chainstarts = _sample_joint_starts(starts, centre, size(something(starts, centre), 1))
+    verbose && println(_console(), "Sampling: ", nchains, " chain(s), ", npar,
+        " dimensions (effects integrated out), chains ",
+        mode == :serial ? "sequential" : "concurrent", ", metric in 1 block")
+
+    run = if mode != :serial
+        _marginal_chains_points(objective, densities, gradient_method, mode, centre,
+            metric, nchains, seed, nwarmup, ndraws, Int(maxdepth),
+            Float64(target_accept), Float64(maxdelta), Float64(init_scale),
+            adapt_metric, Float64(min_ess), Float64(mean_ess),
+            max(Int(max_draws), ndraws), Float64(rhat_target), npar, verbose,
+            chainstarts, Float64(stepsize), t0)
+    else
+        _sample_to_target(density_for, centre, metric, nchains, false,
+            seed, nwarmup, ndraws, Int(maxdepth), Float64(target_accept),
+            Float64(maxdelta), Float64(init_scale), adapt_metric, nothing,
+            Float64(settle_tol), Float64(min_ess), Float64(mean_ess),
+            max(Int(max_draws), ndraws), Float64(rhat_target), npar, resume,
+            verbose, progress_overwrite; progress_callback=progress_callback,
+            progress_sink=progress_sink, init_eps=Float64(stepsize),
+            starts=chainstarts, t0=t0, coordinate=coordinate)
+    end
+    results = run.results
+    ndraws = run.ndraws
+    return merge(_sample_result(_sample_pool(results, nchains, ndraws, npar);
+            nchains=nchains, ndraws=ndraws, npar=npar, ndim=npar, maxdepth=Int(maxdepth),
+            stepsize=[r.stepsize for r in results],
+            warmup_divergent=[r.warmup_divergent for r in results], trace=run.trace),
+        (forward_gradients=ctsem_forward_gradients() - forward0,
+            explosive_passes=ctsem_explosive_passes() - explosive0,
+            nunits=_smc_coreset_capable(objective) ? length(_smc_unit_cost(objective)) : 0),
+        _surrogate_record(densities))
+end

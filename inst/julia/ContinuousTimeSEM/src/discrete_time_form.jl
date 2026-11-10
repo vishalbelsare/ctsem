@@ -1,0 +1,525 @@
+using ComponentArrays
+using LinearAlgebra
+using ForwardDiff
+
+################################################################################
+# Discrete-time EKF log-likelihood and gradient function
+################################################################################
+
+"""
+Distinct `Δt` values an `ExpTable` holds for one `JAx`.
+
+Sized for the shared wave schedule: a panel measured at the same irregular
+times for every subject has as many distinct intervals as it has waves, and a
+diary design with a handful of gap lengths has fewer still. Fully irregular
+times overflow the table and replace entries round-robin, which costs a scan of
+this many scalars per substep on top of the exponential they would have paid
+anyway.
+"""
+const _CTSEM_EXP_TABLE = 32
+
+"""
+    ExpTable{T}(n)
+
+The exponentials `exp(JAx * Δt)` seen for one `JAx`, keyed by `Δt`.
+
+A panel design hands the filter the same `JAx` at every row of every subject
+and a small set of intervals, in an order the last-value cache this replaces
+could not exploit: a shared schedule of nineteen irregular waves missed on
+every one of 3800 rows, because no row's interval equalled the previous one.
+Here a lookup compares `JAx` once and then scans `dts[1:count]`.
+
+The table is a separate mutable object from the `DiscretizationCache` that
+holds it so that the subjects of one chunk can share a single table: the
+reverse pass installs its chunk's table into each subject workspace before
+filtering it (see `_ctsem_adjoint_chunk!`). One task runs a chunk, so that
+sharing is race-free; two chunks never touch the same table.
+
+A change of `JAx` -- a new trial point, a state-dependent model, a subject
+whose drift carries a TI-predictor effect -- empties the table. Nothing here
+assumes linearity; the `JAx` comparison is exact, and under `ForwardDiff.Dual`
+it compares partials as well as values (see `_blocks_identical`).
+"""
+mutable struct ExpTable{T}
+    JAx::Matrix{T}
+    valid::Bool
+    dts::Vector{T}
+    outs::Vector{Matrix{T}}
+    count::Int
+    next::Int
+end
+
+function ExpTable(::Type{T}, n::Int, capacity::Int=_CTSEM_EXP_TABLE) where {T}
+    return ExpTable{T}(zeros(T, n, n), false, zeros(T, capacity),
+        [zeros(T, n, n) for _ in 1:capacity], 0, 1)
+end
+
+"""
+    DiscretizationCache{T}
+
+Cache for the two expensive, row-invariant pieces of
+`_compute_discrete_time_form!`.
+
+  * **`exp`**: `eJAx = exp(JAx * Δt)`, in an `ExpTable` keyed by `Δt` for the
+    current `JAx`. It covers the balanced panel, the shared irregular schedule
+    and the few-distinct-gaps diary design, and correctly misses on genuinely
+    irregular observation times.
+  * **`lyap`**: the asymptotic-diffusion solve `X` depends on `JAx` and the
+    diffusion covariance and **not on `Δt` at all**, so for any model whose
+    drift and diffusion are not state-dependent it is the same at every row of
+    every subject. This is the important one: `schur!` was 38% of the primal
+    filter's runtime and 60 of its 68 MB of allocations on a 20-latent model.
+    A last-value entry is enough for it.
+
+A state-dependent model changes `JAx` per row, so both simply miss every time
+and pay only the comparison.
+"""
+mutable struct DiscretizationCache{T}
+    exp_table::ExpTable{T}
+    lyap_JAx::Matrix{T}
+    lyap_Q::Matrix{T}
+    lyap_out::Matrix{T}
+    lyap_valid::Bool
+    # The Lyapunov operator's conditioning at `lyap_JAx`, which decides whether
+    # the noise takes the series route (see `series_discretization.jl`). Kept
+    # with the solution because a hit skips the factorization it is read from.
+    lyap_conditioning::Float64
+    # The series route's powers of the drift, for the noise over the diffusing
+    # block and the intercept over the affine one, built once for a drift
+    # (`SeriesTable`).
+    series_noise::SeriesTable{T}
+    series_intercept::SeriesTable{T}
+end
+
+function DiscretizationCache(::Type{T}, n::Int, k::Int) where {T}
+    return DiscretizationCache{T}(ExpTable(T, n),
+        zeros(T, k, k), zeros(T, k, k), zeros(T, k, k), false, 0.0,
+        SeriesTable(T, k, true), SeriesTable(T, n, false))
+end
+
+# The series kernels from the cache's tables where there is a cache of the
+# kernels' own element type, by Horner's rule otherwise.
+_series_intercept_cached!(series, cache, JAx, h, p::Int) =
+    _series_intercept!(series, JAx, h, p)
+function _series_intercept_cached!(series::SeriesKernelBuffer{T},
+    cache::DiscretizationCache{T}, JAx, h, p::Int) where {T}
+    tab = cache.series_intercept
+    _series_table_key!(tab, JAx, nothing, p)
+    return _series_intercept_table!(series, tab, h, p)
+end
+_series_noise_cached!(series, cache, J, Q, h, p::Int) = _series_noise!(series, J, Q, h, p)
+function _series_noise_cached!(series::SeriesKernelBuffer{T},
+    cache::DiscretizationCache{T}, J, Q, h, p::Int) where {T}
+    tab = cache.series_noise
+    _series_table_key!(tab, J, Q, p)
+    # The adjoint's tape reads the diffusion block back from `series.Q`, which
+    # Horner's kernel fills; so does this.
+    _copy_block!(series.Q, Q, p, p)
+    return _series_noise_table!(series, tab, h, p)
+end
+
+"""
+    _blocks_identical(a, b, d1, d2)
+
+Whether the leading `d1 x d2` blocks of `a` and `b` are identical.
+
+Plain `==` is the right comparison here **including for `ForwardDiff.Dual`
+entries**, which is worth stating because it is easy to assume otherwise:
+ForwardDiff defines `==` on same-tag duals as
+`==(value(x), value(y)) && ==(partials(x), partials(y))` (see `dual.jl`), so
+two duals agreeing in value but not in derivative correctly compare unequal.
+If that were value-only, these caches would reuse a matrix exponential whose
+derivative belongs to a different point -- a silently wrong gradient on the
+default ForwardDiff path. `test_adjoint_primitives.jl` pins that ForwardDiff
+behaviour, so a change to it fails there rather than here.
+"""
+@inline function _blocks_identical(a, b, d1::Int, d2::Int)
+    @inbounds for j in 1:d2, i in 1:d1
+        a[i, j] == b[i, j] || return false
+    end
+    return true
+end
+
+@inline function _copy_block!(dest, src, d1::Int, d2::Int)
+    @inbounds for j in 1:d2, i in 1:d1
+        dest[i, j] = src[i, j]
+    end
+    return dest
+end
+
+# `nothing` disables caching, for the convenience constructor below and any
+# caller that has no workspace to hang a cache on.
+@inline _exp_cache_lookup(::Nothing, JAx, Δt, n::Int) = 0
+@inline _exp_cache_store!(::Nothing, JAx, Δt, out, n::Int) = nothing
+@inline _lyap_cache_hit(::Nothing, JAx, Q, k::Int) = false
+@inline _lyap_cache_store!(::Nothing, JAx, Q, out, k::Int, conditioning) = nothing
+
+"""
+The table slot holding `exp(JAx * Δt)`, or 0 on a miss.
+
+`Δt` is compared as a scalar before anything else, so a schedule of irregular
+intervals pays one comparison per live entry and never a matrix comparison
+beyond the single `JAx` check.
+"""
+@inline function _exp_cache_lookup(cache::DiscretizationCache, JAx, Δt, n::Int)
+    table = cache.exp_table
+    if table.valid && _blocks_identical(table.JAx, JAx, n, n)
+        @inbounds for e in 1:table.count
+            if table.dts[e] == Δt
+                _CTSEM_OPCOUNT.exp_cache_hit[] += 1
+                return e
+            end
+        end
+    end
+    _CTSEM_OPCOUNT.exp_cache_miss[] += 1
+    return 0
+end
+
+@inline function _exp_cache_store!(cache::DiscretizationCache, JAx, Δt, out, n::Int)
+    table = cache.exp_table
+    if !(table.valid && _blocks_identical(table.JAx, JAx, n, n))
+        _copy_block!(table.JAx, JAx, n, n)
+        table.valid = true
+        table.count = 0
+        table.next = 1
+    end
+    capacity = length(table.dts)
+    if table.count < capacity
+        e = table.count + 1
+        table.count = e
+    else
+        e = table.next
+        table.next = e == capacity ? 1 : e + 1
+    end
+    @inbounds table.dts[e] = Δt
+    _copy_block!(table.outs[e], out, n, n)
+    return nothing
+end
+
+@inline function _lyap_cache_hit(cache::DiscretizationCache, JAx, Q, k::Int)
+    hit = cache.lyap_valid && _blocks_identical(cache.lyap_JAx, JAx, k, k) &&
+        _blocks_identical(cache.lyap_Q, Q, k, k)
+    (hit ? _CTSEM_OPCOUNT.lyap_cache_hit : _CTSEM_OPCOUNT.lyap_cache_miss)[] += 1
+    return hit
+end
+
+@inline function _lyap_cache_store!(cache::DiscretizationCache, JAx, Q, out, k::Int,
+    conditioning)
+    _copy_block!(cache.lyap_JAx, JAx, k, k)
+    _copy_block!(cache.lyap_Q, Q, k, k)
+    _copy_block!(cache.lyap_out, out, k, k)
+    cache.lyap_conditioning = conditioning
+    cache.lyap_valid = true
+    return nothing
+end
+
+
+"""
+    _ctsem_add_process_noise!(state, indices, qfactor, cov, z, offset, k, scale, T)
+
+Add one substep's process noise to `state`, over the diffusing coordinates
+`indices` only.
+
+`cov[indices[i], indices[j]]` is copied into `qfactor`, lower-Cholesky factored
+in place, and applied to `k` noise components read from `z` at `offset`. The
+increment is scaled by `scale` -- `sqrt(dt)` where `cov` is a rate (the Euler
+branches) and one where it already integrates the interval (the exponential
+branches).
+
+One routine because there were four, identical but for those three choices: the
+particle filter and the state-explicit pass, each in both branches. The
+arithmetic is a triangular product with an index offset, which is exactly the
+shape where a slip is silent -- the states stay finite, the trajectory stays
+plausible, and only the likelihood is wrong.
+
+Deliberately not `@inbounds`, though the loops are hot. Neither original
+carried it, nothing here measured that it helps, and the index that would run
+off the end is `offset + j` -- the state pass walks `at` through a supplied
+vector, so an overrun is exactly the case that should raise a BoundsError
+rather than read whatever is next in memory. Silence is the failure mode this
+whole routine exists to make less likely.
+
+The noise source is an offset into `z` rather than a callback so that both
+callers keep their existing storage: the particle filter refills `z[1:k]` per
+substep from its RNG and passes `offset = 0`, and the state pass walks a
+supplied vector and passes its running `at`. `T(z[...])` is what promotes a
+Float64 innovation to the working type on the AD path, and is an identity for
+the particle filter, which is already Float64.
+
+Everything else about the two remains different, and deliberately: what they
+carry (N particles against one realised trajectory), where the noise comes from
+(drawn against supplied, which is what makes the state pass differentiable), and
+what they accumulate (importance weights against a conditional log density).
+"""
+@inline function _ctsem_add_process_noise!(state, indices, qfactor,
+        cov, z, offset::Int, k::Int, scale, ::Type{T}) where {T}
+    for j in 1:k, i in 1:k
+        qfactor[i, j] = cov[indices[i], indices[j]]
+    end
+    _ctsem_lower_chol!(qfactor, k)
+    for i in 1:k
+        acc = zero(T)
+        for j in 1:i
+            acc += qfactor[i, j] * T(z[offset + j])
+        end
+        state[indices[i]] += scale * acc
+    end
+    return nothing
+end
+
+"""
+    _ctsem_deterministic_step!(ws, n)
+
+Advance the state by the discrete-time transition already in `ws.discrete_ca`.
+
+The deterministic half of a substep, into scratch first: the product has to be
+formed from the whole pre-step state before any of it is overwritten. Shared by
+the particle filter and the state-explicit pass, which wrote it out identically.
+"""
+@inline function _ctsem_deterministic_step!(ws, n::Int)
+    _ctsem_mulvec!(ws.bufferQ.r, ws.discrete_ca.dDRIFT, ws.state)
+    for i in 1:n
+        ws.state[i] = ws.bufferQ.r[i] + ws.discrete_ca.dINT[i]
+    end
+    return nothing
+end
+
+"""
+    _compute_discrete_time_form!(discrete_ca, buffer, DIFFUSIONcov, pars, Δt, exp_buffer, lyap_buffer)
+
+Compute continuous-to-discrete dynamics for one EKF time interval.
+
+The function writes the discrete drift, intercept, and process covariance into
+`discrete_ca` using the supplied scratch buffers. `DIFFUSIONcov` is the
+continuous-time process covariance and `Δt` is the elapsed time.
+"""
+function _compute_discrete_time_form!(discrete_ca, buffer, DIFFUSIONcov, pars, Δt, exp_buffer, lyap_buffer)
+    n = size(DIFFUSIONcov, 1)
+    diffusion_state_indices = collect(1:n)
+    diffusion_buffer = _make_square_buffer(eltype(DIFFUSIONcov), n)
+    affine_buffer = _make_square_buffer(eltype(DIFFUSIONcov), n)
+    discretization_buffer = _make_discretization_buffer(eltype(DIFFUSIONcov), n)
+    return _compute_discrete_time_form!(
+        discrete_ca,
+        buffer,
+        DIFFUSIONcov,
+        pars,
+        Δt,
+        exp_buffer,
+        lyap_buffer,
+        zeros(eltype(DIFFUSIONcov), n),
+        diffusion_state_indices,
+        diffusion_buffer,
+        discretization_buffer,
+        exp_buffer.dim,
+        nothing,
+        affine_buffer,
+    )
+end
+
+function _compute_discrete_time_form!(discrete_ca, buffer, DIFFUSIONcov, pars, Δt, exp_buffer,
+    lyap_buffer, state, diffusion_state_indices, diffusion_buffer,
+    discretization_buffer, dim::Int, cache=nothing,
+    affine_buffer=diffusion_buffer, affine_extra=_CTSEM_NO_AFFINE_EXTRA)
+    d = dim
+    # Stan propagates the local affine EKF model, not the raw DRIFT matrix:
+    # f(x) = DRIFT * x + CINT, J = JAx, c = f(x) - J * x.
+    slot = _exp_cache_lookup(cache, pars.JAx, Δt, d)
+    if slot != 0
+        _copy_block!(discrete_ca.eJAx, cache.exp_table.outs[slot], d, d)
+    else
+        copyto!(exp_buffer.As, pars.JAx)
+        rmul!(exp_buffer.As, Δt)
+        my_exp!(discrete_ca.eJAx, exp_buffer.As, buffer.intermediate, exp_buffer, dim)
+        _exp_cache_store!(cache, pars.JAx, Δt, discrete_ca.eJAx, d)
+    end
+    copyto!(discrete_ca.dDRIFT, discrete_ca.eJAx)
+
+    # The Lyapunov solve is restricted to the genuine diffusion block. Static
+    # augmented coordinates have no diffusion and are excluded, as in Stan's
+    # derrind subset; their covariance still propagates through full eJAx.
+    fill!(discrete_ca.dDIFFUSION, zero(eltype(discrete_ca.dDIFFUSION)))
+    kdim = length(diffusion_state_indices)
+    fill!(discrete_ca.dINT, zero(eltype(discrete_ca.dINT)))
+
+    # The local affine offset, over the leading block of genuine dynamics.
+    #
+    # `x(Δt) = e^{JΔt} x0 + J^-1 (e^{JΔt} - I) c` needs J inverted, and J is
+    # exactly singular on a static coordinate a random effect augments the
+    # state with -- zero row and zero column -- so the solve cannot run over
+    # the whole system. Restricting it to the leading block is exact, not an
+    # approximation: order the states [d, s] and J is block triangular with
+    # zero static rows, while c is genuinely zero there (both DRIFT and CINT
+    # are padded with zeros on those rows), so the sub-solve equals the full
+    # one. The static-to-dynamic coupling still arrives through the full eJAx
+    # computed above.
+    #
+    # The block is `affine_buffer`'s own dimension -- Stan's `1:nlatent`, not
+    # its `derrind`. It used to be `diffusion_state_indices`, which also drops
+    # a latent that merely has no diffusion of its own and no coupling to
+    # anything that has some; c is NOT zero on such a row, so its CINT left the
+    # likelihood entirely and the parameter's gradient was exactly zero.
+    # Because the block is a leading one, this indexes directly with no gather.
+    naff = affine_buffer.dim
+    # Views bound once: indexing `pars.DRIFT` in a loop rebuilds the view from
+    # the layout on every iteration.
+    DRIFT = pars.DRIFT
+    JAx = pars.JAx
+    CINT = pars.CINT
+    @inbounds for i in 1:naff
+        affine = CINT[i]
+        for j in 1:d
+            affine += (DRIFT[i, j] - JAx[i, j]) * state[j]
+        end
+        affine_buffer.r[i] = affine
+    end
+    # The moment-matched prediction's correction to the drift's mean
+    # (`_ekf_moment_cells!`); empty otherwise.
+    if !isempty(affine_extra)
+        @inbounds for i in 1:naff
+            affine_buffer.r[i] += affine_extra[i]
+        end
+    end
+    @inbounds for j in 1:naff, i in 1:naff
+        affine_buffer.intermediate[i, j] = JAx[i, j]
+    end
+    @inbounds for i in 1:naff
+        correction = -affine_buffer.r[i]
+        for q in 1:naff
+            correction += discrete_ca.eJAx[i, q] * affine_buffer.r[q]
+        end
+        affine_buffer.s[i] = correction
+    end
+    # `affine_buffer.dim` is a `Val` fixed at construction; building one from a
+    # runtime length here was a dynamic dispatch and an allocation on every
+    # prediction substep (Profile.Allocs, dev1).
+    _solve_square_system!(affine_buffer.intermediate, affine_buffer.s,
+        affine_buffer.piv, affine_buffer.dim)
+    # The solve divides by J's pivots, which the factorization has just left on
+    # the diagonal. Where the smallest is small against the interval the result
+    # has lost its digits, and the integral is taken as a series instead; see
+    # `series_discretization.jl`.
+    series = discretization_buffer.series
+    icpt = discretization_buffer.series_icpt
+    icpt.intercept = _series_needed(
+        _series_min_pivot(affine_buffer.intermediate, naff), Δt)
+    if icpt.intercept
+        Phi = _series_intercept_cached!(icpt, cache, pars.JAx, Δt, naff)
+        @inbounds for i in 1:naff
+            acc = zero(eltype(discrete_ca.dINT))
+            for j in 1:naff
+                acc += Phi[i, j] * affine_buffer.r[j]
+            end
+            discrete_ca.dINT[i] = acc
+        end
+    else
+        @inbounds for i in 1:naff
+            discrete_ca.dINT[i] = affine_buffer.s[i]
+        end
+    end
+
+    @inbounds for j in 1:kdim, i in 1:kdim
+        ii = diffusion_state_indices[i]
+        jj = diffusion_state_indices[j]
+        discretization_buffer.input[i, j] = JAx[ii, jj]
+        diffusion_buffer.intermediate[i, j] = DIFFUSIONcov[ii, jj]
+    end
+    dynamic_jacobian = view(discretization_buffer.input, 1:kdim, 1:kdim)
+    # `diffusion_buffer.intermediate` holds the diffusion covariance here and
+    # is overwritten immediately below, so the cache has to copy it now.
+    if _lyap_cache_hit(cache, dynamic_jacobian, diffusion_buffer.intermediate, kdim)
+        _copy_block!(diffusion_buffer.out, cache.lyap_out, kdim, kdim)
+        conditioning = cache.lyap_conditioning
+    else
+        my_lyap!(diffusion_buffer.out, dynamic_jacobian, diffusion_buffer.intermediate, lyap_buffer)
+        conditioning = _series_lyap_conditioning(lyap_buffer)
+        _lyap_cache_store!(cache, dynamic_jacobian, diffusion_buffer.intermediate,
+            diffusion_buffer.out, kdim, conditioning)
+    end
+    # `X - A X A'` cancels two terms of size |X|, which grows as the operator's
+    # smallest eigenvalue sum over the interval shrinks; there the integral is
+    # taken as a series instead, as for the intercept above.
+    series.noise = _series_needed(conditioning, Δt)
+    if series.noise
+        V = _series_noise_cached!(series, cache, dynamic_jacobian,
+            diffusion_buffer.intermediate, Δt, kdim)
+        @inbounds for j in 1:kdim, i in 1:kdim
+            discrete_ca.dDIFFUSION[diffusion_state_indices[i], diffusion_state_indices[j]] =
+                V[i, j]
+        end
+        return
+    end
+    @inbounds for r in 1:kdim, i in 1:kdim
+        value = zero(eltype(diffusion_buffer.intermediate))
+        for q in 1:kdim
+            value += discrete_ca.eJAx[diffusion_state_indices[i], diffusion_state_indices[q]] *
+                diffusion_buffer.out[q, r]
+        end
+        diffusion_buffer.intermediate[i, r] = value
+    end
+    @inbounds for j in 1:kdim, i in 1:kdim
+        value = diffusion_buffer.out[i, j]
+        for r in 1:kdim
+            value -= diffusion_buffer.intermediate[i, r] *
+                discrete_ca.eJAx[diffusion_state_indices[j], diffusion_state_indices[r]]
+        end
+        discrete_ca.dDIFFUSION[diffusion_state_indices[i], diffusion_state_indices[j]] = value
+    end
+    return 
+end
+
+"""
+    _compute_one_step_form!(discrete_ca, DIFFUSIONcov, pars, state,
+                            diffusion_state_indices, dim)
+
+The discrete-time case, where there is nothing to discretize.
+
+A discrete-time model's DRIFT, CINT and DIFFUSION are already the one-step
+quantities, so the three expensive pieces of the continuous form collapse: the
+transition is `JAx` itself, the process noise is the diffusion covariance, and
+the intercept is the local affine offset with no solve around it. `Δt` plays no
+part -- a discrete model advances one step per row whatever the recorded
+interval, which is also what Stan does.
+
+The affine offset runs over every state, not only the diffusing ones: there
+is no solve here to keep away from the singular augmented block, and a state
+left out of it silently loses its CINT -- which is what an isolated
+deterministic latent (no diffusion, no coupling to a diffusing state) falls
+victim to, since `.ctJuliaDerrind()` excludes it.
+
+That makes this function depend on DRIFT being the *true* one-step map on
+every row, including the static coordinates a random effect augments the
+state with. Their diagonal must be 1, not 0: a static state carries forward
+whole. `.ctJuliaAugmentRandomEffects()` sets it, matching what
+`ctJacobian()` does to the copy of DRIFT it builds JAx from, and the offset
+then cancels to zero on those rows the way it should. When it was left at 0
+the offset came out as `-x[i]` and cancelled the state the transition had
+just carried, zeroing every random-effect coordinate at every step.
+"""
+function _compute_one_step_form!(discrete_ca, DIFFUSIONcov, pars, state,
+    diffusion_state_indices, dim::Int, affine_extra=_CTSEM_NO_AFFINE_EXTRA)
+    d = dim
+    copyto!(discrete_ca.eJAx, pars.JAx)
+    copyto!(discrete_ca.dDRIFT, pars.JAx)
+
+    DRIFT = pars.DRIFT
+    JAx = pars.JAx
+    CINT = pars.CINT
+    @inbounds for i in 1:d
+        affine = CINT[i]
+        for j in 1:d
+            affine += (DRIFT[i, j] - JAx[i, j]) * state[j]
+        end
+        isempty(affine_extra) || (affine += affine_extra[i])
+        discrete_ca.dINT[i] = affine
+    end
+
+    fill!(discrete_ca.dDIFFUSION, zero(eltype(discrete_ca.dDIFFUSION)))
+    kdim = length(diffusion_state_indices)
+    @inbounds for j in 1:kdim, i in 1:kdim
+        ii = diffusion_state_indices[i]
+        jj = diffusion_state_indices[j]
+        discrete_ca.dDIFFUSION[ii, jj] = DIFFUSIONcov[ii, jj]
+    end
+    return discrete_ca
+end

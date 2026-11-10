@@ -1,0 +1,2288 @@
+using ForwardDiff
+using ChainRulesCore
+using DiffResults
+using LinearAlgebra
+
+export extended_kalman_log_likelihood_continuous, grad_log_likelihood_ekf_continuous
+export res_and_grad_likelihood_ekf_continuous
+export ContinuousEKFGradientWorkspace, grad_log_likelihood_ekf_continuous!
+export res_and_grad_likelihood_ekf_continuous!
+
+################################################################################
+# Continuous-time Extended Kalman filter
+################################################################################
+
+# Mutable although nothing writes to it: a mutable argument passes a dynamic
+# dispatch by reference, where an immutable one is copied to the heap (see
+# `_ekf_run`). Its filter workspace is the task's, not its own
+# (`_get_or_init_objective_workspace!`).
+mutable struct ContinuousEKFObjective{P,D,TS,TD,TI,MT}
+    params::P
+    data::D
+    timesteps::TS
+    tdpreds::TD
+    tipreds::TI
+    subject::Int
+    max_timestep::MT
+    # Each row's count of steps for the iterated measurement update, frozen
+    # for a fit (`ctsem_relin_plan`); empty, every row iterates to its mode.
+    relin::Vector{Int}
+end
+
+function _validate_continuous_ekf_inputs(timesteps::Vector, data::Matrix)
+    isempty(timesteps) && throw(ArgumentError("timesteps must contain at least one observation"))
+    length(timesteps) == size(data, 2) || throw(DimensionMismatch(
+        "timesteps length must equal the number of data columns",
+    ))
+    @inbounds for idx in 2:length(timesteps)
+        timesteps[idx] >= timesteps[idx - 1] || throw(ArgumentError(
+            "timesteps must be nondecreasing within one subject; evaluate separate subjects in separate EKF workspaces",
+        ))
+    end
+    return nothing
+end
+
+"""
+The substep policy a subject objective stores: `maxtimestep` as a `Float64`,
+or a per-row mesh as a `Vector{Int}` (entry 1 is unused; entry `t` is the
+count for the interval ending at row `t`). See `_ctsem_substeps`.
+"""
+function _validate_substep_rule(rule::Real, nrows::Int)
+    rule > 0 || throw(ArgumentError("max_timestep must be positive"))
+    return Float64(rule)
+end
+function _validate_substep_rule(mesh::AbstractVector, nrows::Int)
+    length(mesh) == nrows || throw(DimensionMismatch(
+        "a substep mesh needs one entry per row: got $(length(mesh)) for $nrows rows"))
+    @inbounds for t in 2:nrows
+        mesh[t] >= 1 || throw(ArgumentError("substep counts must be at least 1 (row $t)"))
+    end
+    return Int[Int(m) for m in mesh]
+end
+
+_ctsem_float_data(x::AbstractArray{<:Union{Integer,Float32}}) = Float64.(x)
+_ctsem_float_data(x::AbstractArray) = x
+
+function ContinuousEKFObjective(params::EKFParameters, data::Matrix, timesteps::Vector;
+    tdpreds::AbstractMatrix=zeros(eltype(data), 0, size(data, 2)),
+    # Not typed `::AbstractVector`: a subject with a sampled (missing) TI
+    # predictor cell holds a `TIMissingRecipe` here instead, see
+    # `_ctsem_tipred_vector` in parameter_transforms.jl. Every subject without
+    # one still gets a plain `Vector{Float64}`, unchanged from before this
+    # existed.
+    tipreds=eltype(data)[], subject::Integer=1,
+    max_timestep=Inf, relin_steps::AbstractVector{<:Integer}=Int[])
+    _validate_continuous_ekf_inputs(timesteps, data)
+    (isempty(relin_steps) || length(relin_steps) == length(timesteps)) ||
+        throw(DimensionMismatch("an iteration plan needs one entry per row"))
+    size(tdpreds, 2) == size(data, 2) || throw(DimensionMismatch("TD predictor columns must match observations"))
+    # Data as Float64 whatever R sent: an integer TD predictor or indicator
+    # column is a different type for the whole filter, which then compiled
+    # again for a model that differed from another only in that.
+    data = _ctsem_float_data(data)
+    timesteps = _ctsem_float_data(timesteps)
+    tdpreds = _ctsem_float_data(tdpreds)
+    tipreds isa AbstractVector{<:Integer} && (tipreds = _ctsem_float_data(tipreds))
+    rule = _validate_substep_rule(max_timestep, length(timesteps))
+    return ContinuousEKFObjective{typeof(params),typeof(data),typeof(timesteps),typeof(tdpreds),typeof(tipreds),typeof(rule)}(
+        params, data, timesteps, tdpreds, tipreds, Int(subject), rule,
+        Int[Int(k) for k in relin_steps])
+end
+
+# A task's filter workspace for one element type, and the parameters it was
+# built for. The key is a singleton per type, so a lookup allocates nothing,
+# and the parameters are held at their own type: `EKFParameters` is immutable,
+# and compared through an untyped field it was boxed on every call.
+struct _CTSEMFilterWorkspaceKey{T,P} end
+mutable struct _CTSEMFilterWorkspace{P}
+    params::P
+    ws::Any
+end
+
+"""
+    _get_or_init_objective_workspace!(objective, T)
+
+The filter workspace a subject runs in: the running task's, one per element
+type, from its scratch store (`_ctsem_scratch`), rebuilt when the task next
+filters another model. A workspace depends only on the shared `EKFParameters`
+and `T`, never on the subject (as `_laplace_ekf_workspace!` and the adjoint's
+`ekf_ws` already rely on), and a task filters one subject at a time, so one
+serves every subject the task runs.
+
+Held per subject instead, as it was, an objective kept a copy for each:
+1.1 MB a subject on a 433-parameter, 1046-subject model, and after an exact
+Hessian a dual copy of 13 times that per subject, for the rest of the session
+-- 15 GB on that model, and the bulk of what a 17,687-subject fit was killed
+for. Per task it is a copy a thread, and a model released by R takes its
+workspaces with it once each task has filtered another.
+"""
+function _get_or_init_objective_workspace!(objective::ContinuousEKFObjective{P},
+    ::Type{T}) where {P,T}
+    store = _ctsem_scratch()
+    held = get(store, _CTSEMFilterWorkspaceKey{T,P}(), nothing)
+    if held === nothing
+        built = _CTSEMFilterWorkspace{P}(objective.params,
+            _init_continuous_ekf_workspace(T, objective.params))
+        store[_CTSEMFilterWorkspaceKey{T,P}()] = built
+        return built.ws::ContinuousEKFWorkspace{T}
+    end
+    slot = held::_CTSEMFilterWorkspace{P}
+    # `isa ContinuousEKFWorkspace{T}` rather than reading `eltype(ws.all_params)`
+    # off a workspace whose type is not known here, which allocated on every
+    # subject of every evaluation.
+    if slot.params !== objective.params || !(slot.ws isa ContinuousEKFWorkspace{T})
+        slot.ws = _init_continuous_ekf_workspace(T, objective.params)
+        slot.params = objective.params
+    end
+    return slot.ws::ContinuousEKFWorkspace{T}
+end
+
+"""
+    _ekf_run(ws, objective, p, tipreds, trace)
+
+`_extended_kalman_filter_continuous!` for one subject objective, behind a
+function barrier: every argument is a reference.
+
+A subject's own workspace comes out of an untyped field, so a call on it is a
+dynamic dispatch, and a dynamic call boxes every immutable argument it is
+handed -- here the subject's `EKFParameters`, copied to the heap on every
+subject of every evaluation (gC8's five-node quadrature: 1.7 of its 6.6 MB an
+evaluation, from that one line). Handing over the mutable objective instead
+leaves the dispatch with nothing to copy but the returned value -- and that
+too comes back through the workspace (`ws.loglik`), so the barrier returns
+`nothing` and boxes nothing: the value itself, returned through it, was the
+last allocation of a subject's pass.
+"""
+@inline function _ekf_run(ws::ContinuousEKFWorkspace{T}, o::ContinuousEKFObjective, p,
+    tipreds, trace) where {T}
+    _ekf_run!(ws, o, p, tipreds, trace)
+    return ws.loglik[]::T
+end
+
+@noinline function _ekf_run!(ws::ContinuousEKFWorkspace, o::ContinuousEKFObjective, p,
+    tipreds, trace)
+    ws.loglik[] = _extended_kalman_filter_continuous!(ws, p, o.data, o.timesteps,
+        o.params, o.tdpreds, tipreds, o.subject, o.max_timestep, trace, nothing, nothing,
+        o.relin)
+    return nothing
+end
+
+function (objective::ContinuousEKFObjective)(p::AbstractVector{T}) where {T}
+    ws = _get_or_init_objective_workspace!(objective, eltype(p))
+    # Identity for the common case (see `_ctsem_tipred_vector`); only a
+    # subject with a sampled TI predictor cell does any work here.
+    tipred_vec = _ctsem_tipred_vector(objective.tipreds, p, ws.tipred_row)
+    return _ekf_run(ws, objective, p, tipred_vec, nothing)::T
+end
+
+"""
+    ContinuousEKFGradientWorkspace(values, params, timesteps, data)
+
+Create reusable ForwardDiff and EKF workspaces for repeated continuous-time EKF
+gradient evaluations.
+
+The workspace is valid for parameter vectors with the same length and scalar
+type as `values`, and for the same `params`, `timesteps`, and `data`.
+"""
+struct ContinuousEKFGradientWorkspace{O,C,R,DR}
+    objective::O
+    cfg::C
+    result::R
+    diff_result::DR
+end
+
+function ContinuousEKFGradientWorkspace(values::AbstractVector, params::EKFParameters, timesteps::Vector, data::Matrix)
+    objective = ContinuousEKFObjective(params, data, timesteps)
+    cfg = ForwardDiff.GradientConfig(objective, values)
+    result = similar(values)
+    diff_result = DiffResults.GradientResult(values)
+    return ContinuousEKFGradientWorkspace(objective, cfg, result, diff_result)
+end
+
+function _check_gradient_workspace_args(result::AbstractVector, values::AbstractVector)
+    @boundscheck length(result) == length(values) || throw(DimensionMismatch("result length must match values length"))
+    return nothing
+end
+
+"""
+    _ekf_predict_step!(ws, pars, Δt)
+
+Advance the EKF state and covariance by one continuous-time prediction step.
+
+The continuous dynamics in `pars` are discretized for the interval `Δt`, and the
+prediction is written back into `ws.state` and `ws.P_predict`.
+
+With `DIFFUSIONcov`, the diffusion covariance the caller already built, which
+the subject filter does once per pass when nothing writes DIFFUSION per row
+(`ContinuousEKFWorkspace`'s `diffusion_static`); without, it is built here
+from `pars.DIFFUSION`, which every other caller relies on. Passed rather than
+remembered on the workspace, so no caller can read one left by another pass.
+"""
+@inline function _ekf_predict_step!(ws::ContinuousEKFWorkspace, pars, Δt)
+    ContinuousTimeSEM.sdcovsqrt2cov!(ws.bufferQ, pars.DIFFUSION, ws.sp.covmatcode, ws.state_dim)
+    return _ekf_predict_step!(ws, pars, Δt, ws.bufferQ.out)
+end
+
+@inline function _ekf_predict_step!(ws::ContinuousEKFWorkspace, pars, Δt,
+    DIFFUSIONcov::AbstractMatrix)
+    # Map continuous-time dynamics to discrete time. Discretization provides:
+    #   A_d = dDRIFT, b_d = dINT, Q_d = dDIFFUSION
+    # The moment-matched prediction's correction to the mean
+    # (`_ekf_moment_cells!`), empty when this substep is the EKF's.
+    extra = view(ws.moment_c, 1:(ws.moment_now[] ? length(ws.moment_c) : 0))
+    if ws.continuous_time
+        _compute_discrete_time_form!(ws.discrete_ca, ws.bufferQ, DIFFUSIONcov, pars, Δt,
+            ws.exp_buffer, ws.lyap_buffer, ws.state, ws.diffusion_state_indices,
+            ws.diffusion_buffer, ws.discretization_buffer, ws.state_dim,
+            ws.discretization_cache, ws.affine_buffer, extra)
+    else
+        _compute_one_step_form!(ws.discrete_ca, DIFFUSIONcov, pars, ws.state,
+            ws.diffusion_state_indices, ws.state_dim, extra)
+    end
+
+    # Predict mean and covariance.
+    #   x_{t|t-1} = A_d * x_{t-1|t-1} + b_d
+    #   P_{t|t-1} = A_d * P_{t-1|t-1} * A_d' + Q_d
+    _ctsem_mulvec!(ws.bufferQ.r, ws.discrete_ca.dDRIFT, ws.state)
+    @. ws.state = ws.bufferQ.r + ws.discrete_ca.dINT
+
+    # Stan ridges the incoming posterior covariance before every propagation
+    # (`etacov = quad_form_sym(makesym(etacov,verbose,1), eJAx')` in
+    # ctModelWriter.R): the +1e-10 diagonal ridge is baked into the transition
+    # itself, not just applied defensively before a Cholesky call. ws.P_update
+    # is fully overwritten again before this predict step is next entered
+    # (either by the measurement update or by a copy from ws.P_predict for the
+    # next substep), so ridging it in place here is safe and matches Stan row
+    # for row rather than only at the final innovation-covariance Cholesky.
+    _ridge_diagonal!(ws.P_update.data, ws.state_dim, 1e-10)
+
+    # The plain matrix, never the `Symmetric` wrapper. `mul!` with a
+    # `Symmetric` operand is OpenBLAS's `symm`, which takes a process-wide lock
+    # for its work buffer on every call, so threads filtering different
+    # subjects queued for it: profiled on dev1, SAEM's sweep over 800 subjects
+    # at 8 threads spent a third of its samples in that mutex, from this line,
+    # and gained 1.5x where equal work gained 8.5x. Measured in isolation, `symm`
+    # on a 4x4 was 77 times slower per call with eight threads calling it than
+    # with one -- and `gemm` locks the same way on most CPUs, dev1's being the
+    # exception that made it look safe (see `_CTSEM_SMALL_PRODUCT`). So the
+    # wrapper's upper triangle is filled in and the product taken on `.data`
+    # by the engine's own kernels.
+    _copy_lower_to_upper!(ws.P_update.data, ws.state_dim)
+    _ctsem_mul!(ws.bufferQ.intermediate, ws.discrete_ca.dDRIFT, ws.P_update.data)
+    _mul_right_transpose!(ws.P_predict.data, ws.bufferQ.intermediate, ws.discrete_ca.dDRIFT, ws.state_dim, ws.state_dim, ws.state_dim)
+    ws.P_predict.data .+= ws.discrete_ca.dDIFFUSION
+    _copy_lower_to_upper!(ws.P_predict.data, ws.state_dim)
+    ws.hyb.active && ws.hyb.q > 0 &&
+        _ekf_gaussian_call(ws, _hybrid_predict!, _ekf_hybrid_refused, ws.hyb,
+            ws.discrete_ca.dDRIFT, pars.JAx, ws.discretization_buffer.series_icpt,
+            ws.affine_buffer.dim, Δt, ws.state_dim, ws.continuous_time)
+    return nothing
+end
+
+@inline function _copy_lower_to_upper!(matrix, state_dim::Int)
+    n = state_dim
+    @inbounds for col in 1:n
+        for row in (col + 1):n
+            matrix[col, row] = matrix[row, col]
+        end
+    end
+    return matrix
+end
+
+"""
+    _ridge_diagonal!(mat, d, amount)
+
+Add `amount` to each of the first `d` diagonal entries of `mat` in place.
+
+Shared by the predict step and `_ekf_masked_update_step!` so the Stan-matching
+`makesym()` ridge is applied identically everywhere instead of being
+duplicated as separate loops.
+"""
+@inline function _ridge_diagonal!(mat, d::Int, amount)
+    @inbounds for i in 1:d
+        mat[i, i] += amount
+    end
+    return mat
+end
+
+"""
+    _symmetrize_and_ridge!(mat, d)
+
+Average `mat` with its transpose over its first `d`×`d` block (guarding
+against asymmetry from floating-point roundoff), then apply the same
+`+1e-10` ridge as `_ridge_diagonal!`.
+"""
+@inline function _symmetrize_and_ridge!(mat, d::Int)
+    @inbounds for j in 1:d
+        for i in (j + 1):d
+            symmetric_value = (mat[i, j] + mat[j, i]) / 2
+            mat[i, j] = symmetric_value
+            mat[j, i] = symmetric_value
+        end
+    end
+    return _ridge_diagonal!(mat, d, 1e-10)
+end
+
+@inline _ctsem_observed(x) = !ismissing(x) && isfinite(x)
+
+"""
+    _ekf_update_observed!(ws, pars, data, obs_col, log2π_const, trace, generate,
+        context)
+
+Update the filter using only observed manifest entries in one row. `context`
+is the row's measurement context, through which a measurement nonlinear in the
+state is evaluated again at each iterate (`_ekf_iterated_rows!`).
+
+A fully missing row leaves the predicted state/covariance in place and
+contributes zero to the likelihood -- matching Stan's own
+`if(si==0 || nobs_y[rowi] > 0 || dosmoother)` gate around the whole
+measurement block. Otherwise this calls `_ekf_masked_update_step!` with the
+observed row indices (`1:manifest_dim` when every row is observed, a
+`Vector{Int}` otherwise): there is one Kalman-update implementation, not a
+separate fast path for the fully-observed case, since Julia compiles a
+distinct, `UnitRange`-specialised method for the former that is exactly as
+allocation-free and BLAS-eligible as a hand-written fast path would be.
+"""
+function _ekf_update_observed!(ws::ContinuousEKFWorkspace, pars,
+    data::AbstractMatrix, obs_col::Int, log2π_const, trace=nothing, generate=nothing,
+    context=nothing, steps::Int=-1, learn=nothing)
+    m_full = ws.manifest_dim
+    n_observed = 0
+    @inbounds for i in 1:m_full
+        _ctsem_observed(data[i, obs_col]) && (n_observed += 1)
+    end
+    if n_observed == 0
+        copyto!(ws.P_update.data, ws.P_predict.data)
+        return zero(eltype(ws.state))
+    end
+    ws.growth.steps = 0
+
+    if n_observed == m_full
+        observed = 1:m_full
+    else
+        # A view of the workspace's row buffer. The length varies row to
+        # row, but the ceiling is the manifest dimension, so a fixed buffer
+        # and a count give the same thing without allocating. The adjoint tape
+        # copies these indices into its own record rather than keeping the
+        # array, so reusing the buffer cannot reach backwards into a recorded
+        # row -- which is the only thing that would make this unsafe.
+        idx = 0
+        @inbounds for i in 1:m_full
+            if _ctsem_observed(data[i, obs_col])
+                idx += 1
+                ws.observed_buf[idx] = i
+            end
+        end
+        observed = view(ws.observed_buf, 1:n_observed)
+    end
+
+    # Binary rows first, on the predicted covariance, then the Gaussian ones
+    # from there. The two groups are conditionally independent given the state,
+    # so the order is statistically irrelevant, and taking binary first means
+    # the Gaussian block still reads its prior from `P_predict` exactly as it
+    # always has -- no change at all to a model without binary indicators.
+    #
+    # It also means the update record, taken *after* the binary block, holds
+    # exactly what the Gaussian block saw, so `_reverse_update!` needed no
+    # changes at all. The binary chain gets its own record, from the true prior.
+    binary_rows = _ekf_binary_subset(ws, observed)
+    record = _record_binary!(trace, ws, pars, data, obs_col, binary_rows,
+        ws.state_dim)
+    binary_loglik = _ekf_binary_rows!(ws, pars, data, obs_col, observed, generate,
+        record)
+    binary_loglik === nothing && return nothing
+    gaussian = _ekf_gaussian_subset(ws, observed)
+
+    # A measurement nonlinear in the state is linearised at the row's posterior
+    # mode rather than its prior mean. Not while generating: the row's draw is
+    # taken from the prior's linearisation, before there is an observation to
+    # iterate on. Nor beside deviations the filter integrates, whose model is
+    # linear (`CTSEMHybrid`): the steps do not carry their columns.
+    ws.relinearise && _CTSEM_RELINEARISE[] && generate === nothing &&
+        context !== nothing && !isempty(gaussian) && !(ws.hyb.active && ws.hyb.q > 0) &&
+        return _ekf_iterated_rows!(ws, pars, data, obs_col, gaussian, binary_loglik,
+            log2π_const, trace, context, steps, learn)
+
+    # Recorded after the binary block and before the Gaussian one:
+    # `_ekf_masked_update_step!` overwrites ws.state in place, and the reverse
+    # pass needs the mean it started from.
+    _record_update!(trace, ws, pars, data, obs_col, gaussian,
+        ws.state, ws.P_predict.data, ws.state_dim)
+
+    if isempty(gaussian)
+        # Every observed row was binary: nothing for the Kalman update to do,
+        # but `P_update` is what the next predict step reads.
+        copyto!(ws.P_update.data, ws.P_predict.data)
+        return binary_loglik
+    end
+
+    factor = _ekf_masked_update_step!(ws, pars, data, obs_col, gaussian, generate,
+        Val(false))
+    issuccess(factor) || return nothing
+    return binary_loglik + _kalman_loglikelihood_cholesky!(
+        view(ws.ll_buffer, 1:length(gaussian)),
+        factor, view(ws.ỹ, 1:length(gaussian)), log2π_const)
+end
+
+"""Whether manifest variable `i` is integrated rather than filtered linearly."""
+@inline _ekf_is_categorical(types, i::Int) = i <= length(types) && types[i] > 0
+
+"""Which of `observed` are categorical. Empty when the model has none.
+
+Always a view of the same buffer, including when it is empty: returning a
+`Vector{Int}` on one branch and a view on the other would make the return type
+a union at a call that runs once per row, where it used to be concrete.
+"""
+@inline function _ekf_binary_subset(ws::ContinuousEKFWorkspace, observed)
+    types = ws.sp.manifesttype
+    isempty(types) && return view(ws.binary_buf, 1:0)
+    n = 0
+    @inbounds for i in observed
+        if _ekf_is_categorical(types, i)
+            n += 1
+            ws.binary_buf[n] = i
+        end
+    end
+    return view(ws.binary_buf, 1:n)
+end
+
+"""Which of `observed` are Gaussian. `observed` itself when none are not."""
+@inline function _ekf_gaussian_subset(ws::ContinuousEKFWorkspace, observed)
+    types = ws.sp.manifesttype
+    isempty(types) && return observed
+    any_categorical = false
+    @inbounds for i in observed
+        if _ekf_is_categorical(types, i)
+            any_categorical = true
+            break
+        end
+    end
+    any_categorical || return observed
+    n = 0
+    @inbounds for i in observed
+        if !_ekf_is_categorical(types, i)
+            n += 1
+            ws.gaussian_buf[n] = i
+        end
+    end
+    return view(ws.gaussian_buf, 1:n)
+end
+
+"""
+    _ekf_binary_rows!(ws, pars, data, obs_col, observed, generate, record)
+
+Apply every categorical observation in this row, one at a time, returning their
+total log marginal likelihood. Zero when the model has no categorical
+indicators, which is the branch every existing model takes. `record` is the
+row's binary record on a traced pass (`_record_binary!`), `nothing` otherwise.
+
+Several categorical indicators at one row are conditionally independent given
+the state, so applying them in sequence -- each an exact scalar update, with a
+Gaussian projection between -- is both cheaper and more accurate than one joint
+linearisation.
+"""
+function _ekf_binary_rows!(ws::ContinuousEKFWorkspace, pars,
+    data::AbstractMatrix, obs_col::Int, observed, generate=nothing,
+    record=nothing)
+    T = eltype(ws.state)
+    # By the workspace's type, so a model without categorical indicators never
+    # compiles the categorical update; see `_ekf_categorical_call`.
+    _ekf_has_categorical(ws) || return zero(T)
+    return _ekf_categorical_call(ws, _ekf_categorical_rows!, ws, pars, data,
+        obs_col, observed, generate, record)::Union{Nothing,T}
+end
+
+function _ekf_categorical_rows!(ws::ContinuousEKFWorkspace, pars,
+    data::AbstractMatrix, obs_col::Int, observed, generate, record)
+    T = eltype(ws.state)
+    types = ws.sp.manifesttype
+    n = ws.state_dim
+    total = zero(T)
+    prior = ws.catprior
+    @inbounds for j in 1:n
+        prior[j] = ws.state[j]
+    end
+    @inbounds for i in observed
+        _ekf_is_categorical(types, i) || continue
+        # The direction the observation informs is the measurement's Jacobian,
+        # as in the Gaussian update; see `_ekf_categorical_offset`.
+        λ = view(pars.Jy, i, :)
+        μ = _ekf_categorical_offset(pars, i, prior, n)
+        τ = _ordinal_thresholds!(ws, pars, i)
+        y = generate === nothing ? data[i, obs_col] :
+            _generate_binary!(generate, ws, pars, λ, μ, i, obs_col, n, τ,
+                Int(types[i]))
+        contribution = _ekf_binary_update!(ws, λ, μ, y, n,
+            τ, Int(types[i]), record)
+        isfinite(contribution) || return nothing
+        total += contribution
+    end
+    return total
+end
+
+"""
+    _ekf_categorical_offset(pars, i, prior, n)
+
+The intercept of observation `i`'s linear predictor once its measurement is
+linearised at the row's prior state `prior`: `MANIFESTMEANS[i] + (LAMBDA[i, :]
+- Jy[i, :])' prior`, so that with the Jacobian `Jy[i, :]` as its direction the
+predictor is the measurement's value at the prior plus `Jy[i, :]` times the
+state's move since -- the first-order expansion the Gaussian update makes, in
+which `LAMBDA` and `MANIFESTMEANS` (evaluated at the prior) give the predicted
+value and `Jy` the direction.
+
+The categorical update used `LAMBDA` as the direction and `MANIFESTMEANS` as
+the intercept. Those coincide with this wherever the measurement is linear in
+the state, and are wrong wherever it is not: a link that reads the state
+(`MANIFESTMEANS = 'exp(eta) * s'`, with `LAMBDA` zero) informed nothing, and an
+individually varying intercept under `intoverpop = 'augmented'`, whose carrier
+state `MANIFESTMEANS` reads and `LAMBDA` does not, was never updated by the
+item it is the intercept of. Measured on two censored items with a limit no
+observation reached, against the same items Gaussian: 237 nats apart under a
+nonlinear link, 7.1 under 'augmented' random intercepts; equal to 1e-11 after.
+"""
+@inline function _ekf_categorical_offset(pars, i::Int, prior, n::Int)
+    μ = pars.MANIFESTMEANS[i]
+    LAMBDA = pars.LAMBDA
+    Jy = pars.Jy
+    @inbounds for j in 1:n
+        μ += (LAMBDA[i, j] - Jy[i, j]) * prior[j]
+    end
+    return μ
+end
+
+"""
+    _generate_binary!(gen, ws, pars, λ, μ, row, obs_col, n, thresholds, kind)
+
+Draw one categorical observation from its own prior predictive, write it out,
+and return it so the filter conditions on what it drew.
+
+The marginal probability of each category is `∫ P(k | η) φ(η; η̂, s²) dη`, which
+the quadrature already computes as that category's marginal likelihood -- so the
+draw needs no extra integration, only a uniform. That comes from the same
+standard normal R supplied for this cell, through `Φ`, which keeps generation
+entirely governed by `set.seed()`.
+
+Binary keeps its own two-outcome branch because its data are `0`/`1` while
+ordinal categories are `1..K`; sharing the loop would mean subtracting one on
+the way out and is not worth the confusion.
+"""
+function _generate_binary!(gen, ws::ContinuousEKFWorkspace, pars, λ, μ,
+    row::Int, obs_col::Int, n::Int, thresholds, kind::Int)
+    T = eltype(ws.state)
+    nodes, weights = _binary_rule()
+    P = ws.P_predict.data
+    s2 = zero(T)
+    ηbar = μ
+    @inbounds for i in 1:n
+        acc = zero(T)
+        for j in 1:n
+            acc += P[i, j] * λ[j]
+        end
+        s2 += λ[i] * acc
+        ηbar += λ[i] * ws.state[i]
+    end
+    s2 = max(s2, zero(T))
+    s = sqrt(s2)
+    r = gen.offset + obs_col
+    u = _standard_normal_cdf(gen.base[row, r])
+
+    local y::T
+    if kind == CTSEM_OBS_CENSORED
+        # No inversion needed and no quadrature: within its limits a censored
+        # observation is Gaussian, so the marginal is `N(ηbar, s² + σ²)` in
+        # closed form and censoring is what the instrument does to the draw.
+        # The standard normal deviate is used directly rather than through its
+        # own CDF, which keeps the draw exact rather than approximated.
+        lower, upper, sd = _censor_limits(thresholds, T)
+        half, power = _censor_response(thresholds, T)
+        draw = ηbar + sqrt(s2 + sd * sd) * T(gen.base[row, r])
+        y = T(_censored_record(draw, lower, upper, half, power))
+    elseif kind == CTSEM_OBS_COUNT
+        # A count's marginal `∫ Poisson(y | e^η) φ(η; ηbar, s²) dη` has no closed
+        # form, so it is drawn in the two stages that define it -- the linear
+        # predictor, then the count given it -- rather than by inverting it.
+        # Inverting was tried and is a bad trade: the walk costs a Gauss-Hermite
+        # quadrature per value, so an ordinary count of four hundred costs some
+        # ten thousand transcendentals, and past a rate of a few hundred every
+        # term underflows and it cannot arrive at an answer at all.
+        #
+        # The dispersion is another Gaussian contribution to the same scalar, so
+        # here it is literally another term in the predictor's standard
+        # deviation. A draw from a narrower distribution than the model scores
+        # would make generate and fit disagree about what the model is.
+        #
+        # The Poisson's own noise is randomness the cell's deviate cannot
+        # supply: reusing `z` for both stages ties them comonotonically and adds
+        # their spreads linearly instead of in quadrature, measured 40% too wide
+        # at `s = 0.05`. Hence `gen.rng`, seeded in R. Both draws are taken
+        # whichever branch `_ctsem_draw_count` follows, so the stream advances
+        # by the same amount per observation regardless of the rate and a
+        # changed parameter cannot shift every later draw.
+        σc = _count_dispersion(thresholds, T)
+        η = ηbar + sqrt(s2 + σc * σc) * T(gen.base[row, r])
+        ucount = rand(gen.rng)
+        zcount = randn(gen.rng)
+        y = _ctsem_draw_count(exp(min(η, T(_CTSEM_COUNT_MAX_LOG_RATE[]))),
+            ucount, zcount)
+    elseif kind == CTSEM_OBS_BINARY || isempty(thresholds)
+        # `thresholds` rather than `()`: an item with asymptotes has them in
+        # there, and passing an empty slot would draw from the two parameter
+        # marginal while the likelihood scored the three parameter one. The
+        # fallback goes through the likelihood for the same reason.
+        logZ, _, _ = _binary_moments(ηbar, s, one(T), nodes, weights,
+            thresholds, CTSEM_OBS_BINARY)
+        p = isfinite(logZ) ? exp(logZ) :
+            exp(_category_loglikelihood(ηbar, one(T), thresholds,
+                CTSEM_OBS_BINARY))
+        y = u < p ? one(T) : zero(T)
+    else
+        # Walk the categories accumulating marginal mass until it passes `u`.
+        # The last category is the fallback, which also absorbs whatever the
+        # quadrature left of the total short of one.
+        K = length(thresholds) + 1
+        y = T(K)
+        cumulative = zero(T)
+        @inbounds for k in 1:(K - 1)
+            logZ, _, _ = _binary_moments(ηbar, s, k, nodes, weights,
+                thresholds, CTSEM_OBS_ORDINAL)
+            cumulative += isfinite(logZ) ? exp(logZ) : zero(T)
+            if u < cumulative
+                y = T(k)
+                break
+            end
+        end
+    end
+    gen.out[row, r] = y
+    return y
+end
+
+"""
+    _ekf_masked_update_step!(ws, pars, data, obs_col, observed, generate, relin)
+
+Apply one EKF measurement update using only the manifest rows listed in
+`observed` (an arbitrary subset, or `1:manifest_dim` for full observation).
+
+Every quantity that is conceptually manifest_dim-by-manifest_dim (or
+manifest_dim-long) is a `view` into a `ContinuousEKFWorkspace` buffer here,
+restricted to `observed`, so no new matrices are allocated regardless of how
+many rows call this or how many manifest variables are observed in them.
+
+Matches Stan's own distinction between the manifest function and its
+Jacobian: `pars.LAMBDA` (evaluated at the current state) predicts the
+manifest mean for the innovation, while `pars.Jy` (its Jacobian) propagates
+covariance -- these coincide for models with a fixed/linear LAMBDA but can
+differ for state-dependent measurement models.
+
+`Val(true)` is a measurement linearised away from the prior mean
+(`_ekf_iterated_rows!`): its loading is Jy and its intercept `ws.mm_eff`. A
+flag rather than the two passed in, which cost a linear model's filter 7-10
+per cent where the views were arguments instead of built here.
+"""
+function _ekf_masked_update_step!(ws::ContinuousEKFWorkspace, pars,
+    data::AbstractMatrix, obs_col::Int, observed::AbstractVector{Int}, generate,
+    ::Val{RELIN}) where {RELIN}
+    m = length(observed)
+    n = ws.state_dim
+
+    Lv = RELIN ? view(pars.Jy, observed, :) : view(pars.LAMBDA, observed, :)
+    μv = RELIN ? view(ws.mm_eff, 1:m) : view(pars.MANIFESTMEANS, observed)
+    predview = view(ws.bufferΘ.r, 1:m)
+    # Plain loops over the observed rows: `m` is a runtime quantity, and a
+    # `Val` built from it would be a dynamic dispatch and an allocation per row.
+    state = ws.state
+    @inbounds for i in 1:m
+        acc = zero(eltype(predview))
+        for j in 1:n
+            acc += Lv[i, j] * state[j]
+        end
+        predview[i] = acc
+    end
+    yv = view(ws.ỹ, 1:m)
+    @inbounds for i in 1:m
+        yv[i] = data[observed[i], obs_col] - (predview[i] + μv[i])
+    end
+
+    # Stan's generated model never Cholesky-factorizes a covariance matrix
+    # directly: every use passes through `makesym()`, which unconditionally
+    # adds 1e-10 to the diagonal (see ctModelWriter.R, `out[coli,coli] =
+    # mat[coli,coli] + 1e-10`). Two separate makesym() calls feed into the
+    # innovation covariance: one ridges the predicted state covariance etacov
+    # itself before it is projected through Jy (`ycov[o,o] =
+    # quad_form_sym(makesym(etacov,verbose,1), Jy[o,]') + MANIFESTcov[o,o]`),
+    # and a second ridges ycov again right before the Cholesky/division used
+    # for the Kalman gain. Only replicating the second one (as a single ridge
+    # on the innovation covariance) understates Stan's regularisation whenever
+    # Jy isn't the identity, and for models with MANIFESTVAR fixed to exactly
+    # zero and LAMBDA the identity, the innovation covariance is numerically
+    # identical to the predicted state covariance P, which then sits exactly
+    # on the PD/non-PD boundary whenever a trial DIFFUSION or T0VAR estimate
+    # is small. Without both ridges, this Julia port hits that boundary far
+    # more readily than Stan does, which both corrupts L-BFGS's line search
+    # (trial points get rejected that Stan would have accepted) and forces
+    # the optimizer to search a narrower, more boundary-constrained trust
+    # region overall. The ridge on P_predict here is transient (mirroring
+    # makesym()'s non-mutating copy): it is removed again below before
+    # ws.P_predict is reused, unridged, for the Kalman gain and
+    # covariance-update terms that Stan's `etacov * Jy[od,]'` also computes
+    # from the unridged etacov.
+    _copy_lower_to_upper!(ws.P_predict.data, ws.state_dim)
+    _ridge_diagonal!(ws.P_predict.data, n, 1e-10)
+    Hv = view(pars.Jy, observed, :)
+    # PHt = P_{t|t-1} * Jy[observed,:]' (n x m); since P is symmetric,
+    # transpose(PHt) is simultaneously Jy[observed,:] * P_{t|t-1}, so this one
+    # buffer covers both orientations of that product.
+    PHt = view(ws.K, :, 1:m)
+    _ctsem_mulNT!(PHt, ws.P_predict.data, Hv)
+    Sv = view(ws.S.UL.data, 1:m, 1:m)
+    _ctsem_mul!(Sv, Hv, PHt)
+    Rv = view(ws.bufferΘ.out, observed, observed)
+    Sv .+= Rv
+    _ridge_diagonal!(ws.P_predict.data, n, -1e-10)
+    _symmetrize_and_ridge!(Sv, m)
+    # Hand-written rather than LAPACK: see `small_linalg.jl`. This runs once per
+    # observed row, and `potrf` on a matrix this size is almost entirely the
+    # process-global lock OpenBLAS takes to get its scratch buffer -- which is
+    # what stopped the subject loop from threading.
+    # One return type from both branches, and that is the whole point.
+    #
+    # The two used to be `CTSEMCholesky` and LAPACK's `Cholesky`, so the
+    # ternary's value was a `Union` of two non-isbits structs and every
+    # observed row boxed one. Line-level allocation tracking put 120 KB per 300
+    # subject evaluations here and the same again on the reverse's copy of this
+    # ternary -- together about a quarter of what a subject evaluation
+    # allocates, for a branch that is not even taken by default, since
+    # `_CTSEM_SMALL_CHOLESKY` is `typemax` unless someone sets it.
+    #
+    # Both routes factor `Sv` in place into its upper triangle, so wrapping
+    # LAPACK's result in the same struct is a relabelling rather than a
+    # conversion -- no copy, and the `ldiv!`/`rdiv!` methods below read `.U`
+    # either way.
+    factor = if m <= _CTSEM_SMALL_CHOLESKY[]
+        _ctsem_cholesky(Sv, m)
+    else
+        CTSEMCholesky(Sv, m, issuccess(cholesky!(Sv, check=false)))
+    end
+    # No early `return nothing`. The factor already carries whether it
+    # succeeded, and returning `nothing` on one path made this function's
+    # return type `Union{Nothing,CTSEMCholesky}` -- so the struct was boxed on
+    # the way out of *every* observed row, successful or not. Line-level
+    # tracking put 120 KB per 300 subject evaluations on the `return factor`
+    # below, which is the tell: the cost was at the boundary, not inside.
+    #
+    # The caller checks `issuccess` instead, which is the same question asked
+    # of a value that is always the same type.
+    issuccess(factor) || return factor
+
+    # Data generation, if asked for: draw this row's observation from its own
+    # prior predictive and carry on as though it had been read. Taken here
+    # rather than earlier because S is the innovation covariance the update is
+    # about to use, already factorized -- so the drawn innovation is L z by
+    # construction and cannot drift from the covariance the filter then
+    # conditions on.
+    generate === nothing ||
+        _generate_row!(generate, ws, factor, yv, predview, μv, observed, obs_col)
+
+    # State update: x_{t|t} = x_{t|t-1} + PHt * (S^{-1} * ỹ)
+    row_sq = view(ws.bufferΘ.row_sq, 1:m)
+    ldiv!(row_sq, factor, yv)
+    _ctsem_mul!(ws.state, PHt, row_sq, one(eltype(ws.state)), one(eltype(ws.state)))
+
+    # Covariance update (Joseph form):
+    #   G_t = PHt * S^{-1}; A_t = I - G_t * Jy[observed,:]
+    #   P_{t|t} = A_t * P_{t|t-1} * A_t' + G_t * Theta[observed,observed] * G_t'
+    KRv = view(ws.KR, :, 1:m)
+    copyto!(KRv, PHt)
+    rdiv!(KRv, factor)
+    _ctsem_mul!(ws.bufferQ.intermediate, KRv, Hv)
+    oneT = one(eltype(ws.K))
+    zeroT = zero(oneT)
+    @inbounds for j in 1:n, i in 1:n
+        ws.bufferQ.intermediate[i, j] = (i == j ? oneT : zeroT) - ws.bufferQ.intermediate[i, j]
+    end
+    _ctsem_mul!(ws.bufferQ.out, ws.bufferQ.intermediate, ws.P_predict.data)
+    _ctsem_mulNT!(ws.P_update.data, ws.bufferQ.out, ws.bufferQ.intermediate)
+
+    GR = view(ws.K, :, 1:m)  # PHt is no longer needed; reuse the same scratch for G_t * Theta
+    _ctsem_mul!(GR, KRv, Rv)
+    _ctsem_mulNT!(ws.bufferQ.out, GR, KRv)
+    ws.P_update.data .+= ws.bufferQ.out
+    _copy_lower_to_upper!(ws.P_update.data, ws.state_dim)
+    # The integrated deviations' share of this update (`CTSEMHybrid`).
+    ws.hyb.active && ws.hyb.q > 0 &&
+        _ekf_gaussian_call(ws, _hybrid_update!, _ekf_hybrid_refused, ws.hyb, Lv, factor,
+            KRv, yv, observed, n)
+    return factor
+end
+
+"""
+Stopping rule of the iterated update (`_ekf_iterated_rows!`): the largest move
+of an iterate, in prior standard deviations, under which it is the mode, and
+the most iterations a row takes before it is updated where it got to.
+"""
+const _CTSEM_RELIN_TOL = 1e-9
+const _CTSEM_RELIN_MAXIT = 50
+
+"""
+How near the converged mode, in prior sds, a row's frozen count of steps must
+bring its last iterate (`ctsem_relin_plan`). A scalar prototype put the log
+likelihood within 1e-3 nats a subject of the converged one at the plan's own
+values, at a third to a fifth of the steps.
+"""
+const _CTSEM_RELIN_PLAN_TOL = 1e-3
+
+# No plan: every row iterates to its mode. Never written to.
+const _CTSEM_NO_RELIN = Int[]
+
+"""A row's frozen count of steps, or -1 (iterate to the mode) without a plan."""
+@inline _ctsem_relin_steps(plan::Vector{Int}, t::Int) = isempty(plan) ? -1 : plan[t]
+
+# Whether a nonlinear measurement's update is iterated; `ctsem_set_relinearise!`.
+const _CTSEM_RELINEARISE = Ref(true)
+
+# Whether nonlinear dynamics are predicted by moments; `ctsem_set_moment_predict!`.
+const _CTSEM_MOMENT_PREDICT = Ref(true)
+
+# No mean correction to the discretisation's affine offset. Never written to.
+const _CTSEM_NO_AFFINE_EXTRA = Float64[]
+
+"""
+    ctsem_set_relinearise!(on)
+
+Whether a measurement nonlinear in the state has each row's Gaussian update
+iterated to the row's posterior mode (`true`, the default) or linearised once
+at the prior mean, as the extended Kalman filter does (`false`): the oracle for
+comparing the two. Read at every row, so it holds from the next evaluation.
+"""
+function ctsem_set_relinearise!(on::Bool)
+    _CTSEM_RELINEARISE[] = on
+    return on
+end
+
+"""
+    _ctsem_measurement_nonlinear(sp, update_indices, n)
+
+Whether an update-group transform that writes a Jy cell reads the state: the
+measurement is then nonlinear in the state, and its update is iterated
+(`_ekf_iterated_rows!`). Asked by evaluating each such transform at two states
+with everything else held, since the transforms' recorded supports
+(`_ctsem_complex_transform_supports`) are their parameter reads only. A
+transform that throws at the probe is taken to read the state, which costs only
+the iterations.
+"""
+function _ctsem_measurement_nonlinear(sp::EKFParameters,
+    update_indices::AbstractVector{Int}, n::Int)
+    isempty(update_indices) && return false
+    jy = Set(_ctsem_component_positions(sp, :Jy))
+    any(i -> i in jy, update_indices) || return false
+    probe = collect(range(0.31, step=0.013, length=length(sp.mutables)))
+    pars = CTSEMPars(probe, sp.parameter_axis)
+    ntd = hasproperty(pars, :TDPREDEFFECT) ? size(pars.TDPREDEFFECT, 2) : 0
+    tdpreds = collect(range(0.19, step=0.007, length=ntd))
+    a = reshape(collect(range(0.23, step=0.011, length=n)), n, 1)
+    b = a .+ 0.05
+    ctxa = CTSEMRowContext(a, pars, tdpreds, _CTSEMProbePredictors(), 0.5, 0.25, 1, 2)
+    ctxb = CTSEMRowContext(b, pars, tdpreds, _CTSEMProbePredictors(), 0.5, 0.25, 1, 2)
+    transforms = sp.update_transforms
+    for k in eachindex(update_indices)
+        update_indices[k] in jy || continue
+        moved = try
+            !(transforms[k](ctxa) == transforms[k](ctxb))
+        catch
+            true
+        end
+        moved && return true
+    end
+    return false
+end
+
+"""
+    ctsem_set_moment_predict!(on)
+
+Whether dynamics nonlinear in the state are predicted by moments (`true`, the
+default: `_ekf_moment_cells!`) or linearised at the mean, as the extended
+Kalman filter does (`false`): the oracle for comparing the two. Read at every
+substep, so it holds from the next evaluation.
+"""
+function ctsem_set_moment_predict!(on::Bool)
+    _CTSEM_MOMENT_PREDICT[] = on
+    return on
+end
+
+"""
+    _ctsem_dynamics_nonlinear(sp, predict_indices, n)
+
+Whether the drift's Jacobian is nonlinear in the state: some JAx cell the
+predict group writes is not affine in it. Each prediction substep is then
+moment-matched (`_ekf_moment_cells!`). Where the Jacobian is affine in the
+state -- a drift quadratic or bilinear in it, as a random effect on the
+dynamics carried as a state makes it -- `E J(x)` is `J(m)`, the moments'
+covariance is the EKF's, and all moment matching changes is the mean's
+second-order term, which measured as nothing: a logistic's likelihood moved
+from 0.4 to 1.0 nats of the particle filter's, and an augmented random drift's
+population sd from 0.80 of the truth to 0.79, at 16 times the fit's time
+(`review/FILTER-moment-prediction-2026-10-26.md`). Asked by running the whole
+group, in order, at three states on a line with everything else held, so that a
+JAx cell reading the state through another cell of the group -- a PARS cell
+that reads it -- counts, and taking the cells' second differences. A group
+that throws at the probe is taken to be nonlinear, which costs only the
+cubature.
+"""
+function _ctsem_dynamics_nonlinear(sp::EKFParameters,
+    predict_indices::AbstractVector{Int}, n::Int)
+    isempty(predict_indices) && return false
+    jset = Set(_ctsem_component_positions(sp, :JAx))
+    any(i -> i in jset, predict_indices) || return false
+    probe = collect(range(0.31, step=0.013, length=length(sp.mutables)))
+    a = reshape(collect(range(0.23, step=0.011, length=n)), n, 1)
+    values = Vector{Vector{Float64}}(undef, 3)
+    for k in 1:3
+        pk = copy(probe)
+        parsk = CTSEMPars(pk, sp.parameter_axis)
+        ntd = hasproperty(parsk, :TDPREDEFFECT) ? size(parsk.TDPREDEFFECT, 2) : 0
+        tdpreds = collect(range(0.19, step=0.007, length=ntd))
+        state = a .+ 0.4 * (k - 1) .* reshape(collect(range(1.0, step=0.37, length=n)), n, 1)
+        ctx = CTSEMRowContext(state, parsk, tdpreds, _CTSEMProbePredictors(), 0.5, 0.25,
+            1, 2)
+        try
+            apply_complex_transforms_at_indices!(pk, predict_indices,
+                sp.predict_transforms, ctx)
+        catch
+            return true
+        end
+        values[k] = pk
+    end
+    for i in predict_indices
+        i in jset || continue
+        v1, v2, v3 = values[1][i], values[2][i], values[3][i]
+        abs(v1 - 2v2 + v3) > 1e-8 * (1 + abs(v1) + abs(v2) + abs(v3)) && return true
+    end
+    return false
+end
+
+"""
+    _ctsem_moment_classes(sp, predict_indices, avg, n)
+
+The averaged cells `avg` (`_ctsem_moment_cells`) grouped by the states each
+reads (`CTSEMMomentClass`): a moment-matched prediction integrates each class
+over those states alone (`_ekf_moment_cells!`). Asked as
+`_ctsem_dynamics_nonlinear` asks, by running the whole group with one state
+moved at a time, so a cell reading a state through another cell of the group
+counts; a group that throws at the probe reads every state in every cell. A
+cell that reads no state -- only a time-dependent predictor -- is in no class
+and keeps its value at the mean. A class evaluates its cells and the group's
+cells they read (`_ctsem_complex_transform_supports`), in group order, where
+the group is interpreted, and the whole group where it is compiled closures,
+whose subsets would each be a type of their own.
+"""
+function _ctsem_moment_classes(sp::EKFParameters, predict_indices::AbstractVector{Int},
+    avg::AbstractVector{Int}, n::Int)
+    probe = collect(range(0.31, step=0.013, length=length(sp.mutables)))
+    base = reshape(collect(range(0.23, step=0.011, length=n)), n, 1)
+    parsp = CTSEMPars(copy(probe), sp.parameter_axis)
+    ntd = hasproperty(parsp, :TDPREDEFFECT) ? size(parsp.TDPREDEFFECT, 2) : 0
+    run = function (state)
+        pk = copy(probe)
+        parsk = CTSEMPars(pk, sp.parameter_axis)
+        tdpreds = collect(range(0.19, step=0.007, length=ntd))
+        ctx = CTSEMRowContext(state, parsk, tdpreds, _CTSEMProbePredictors(), 0.5, 0.25,
+            1, 2)
+        apply_complex_transforms_at_indices!(pk, predict_indices, sp.predict_transforms, ctx)
+        return pk
+    end
+    reads = falses(n, length(avg))
+    try
+        at = run(base)
+        for k in 1:n
+            moved = copy(base)
+            moved[k, 1] += 0.37
+            pk = run(moved)
+            for (q, i) in enumerate(avg)
+                reads[k, q] = !(pk[i] == at[i])
+            end
+        end
+    catch
+        fill!(reads, true)
+    end
+    position = Dict(p => g for (g, p) in enumerate(predict_indices))
+    supports, _ = _ctsem_complex_transform_supports(sp.predict_transforms, predict_indices,
+        sp, n, ntd)
+    interpreted = sp.predict_transforms isa Vector{CTSEMExpr}
+    drift = _ctsem_component_positions(sp, :DRIFT)
+    nr = size(parsp.DRIFT, 1)
+    members = Dict{Vector{Int},Vector{Int}}()
+    order = Vector{Int}[]
+    for q in eachindex(avg)
+        R = findall(view(reads, :, q))
+        isempty(R) && continue
+        haskey(members, R) || (members[R] = Int[]; push!(order, R))
+        push!(members[R], q)
+    end
+    classes = CTSEMMomentClass[]
+    point0 = 0
+    col0 = 0
+    dval0 = 0
+    for R in order
+        cells = members[R]
+        if interpreted
+            needed = Set(position[avg[q]] for q in cells)
+            stack = collect(needed)
+            while !isempty(stack)
+                g = pop!(stack)
+                for p in supports[g]
+                    h = get(position, p, 0)
+                    (h == 0 || h in needed) && continue
+                    push!(needed, h)
+                    push!(stack, h)
+                end
+            end
+            sub = sort!(collect(needed))
+            exprs = sp.predict_transforms[sub]
+        else
+            sub = collect(eachindex(predict_indices))
+            exprs = CTSEMExpr[]
+        end
+        dr = NTuple{3,Int}[]
+        for q in cells
+            t = findfirst(==(avg[q]), drift)
+            t === nothing && continue
+            push!(dr, (q, (t - 1) % nr + 1, (t - 1) ÷ nr + 1))
+        end
+        r = length(R)
+        push!(classes, CTSEMMomentClass(R, cells, sub, predict_indices[sub], exprs, dr,
+            point0, col0, dval0))
+        point0 += 2r
+        col0 += r
+        dval0 += 2r * length(dr)
+    end
+    return classes
+end
+
+"""The points, factor columns and point DRIFT values a substep's classes take."""
+function _ctsem_moment_sizes(classes::Vector{CTSEMMomentClass})
+    isempty(classes) && return 0, 0, 0
+    last = classes[end]
+    r = length(last.states)
+    return last.point0 + 2r, last.col0 + r, last.dval0 + 2r * length(last.drift)
+end
+
+"""
+    _ctsem_moment_cells(sp, predict_indices)
+
+The predict group's cells a moment-matched prediction averages over its
+cubature points -- those of JAx, DRIFT and CINT -- and the rest, which keep
+their values at the mean (`_ekf_moment_cells!`).
+"""
+function _ctsem_moment_cells(sp::EKFParameters, predict_indices::AbstractVector{Int})
+    marker = CTSEMPars(zeros(Int, length(sp.mutables)), sp.parameter_axis)
+    averaged = Set{Int}(_ctsem_component_positions(sp, :JAx))
+    union!(averaged, _ctsem_component_positions(sp, :DRIFT))
+    hasproperty(marker, :CINT) && union!(averaged, _ctsem_component_positions(sp, :CINT))
+    avg = Int[i for i in predict_indices if i in averaged]
+    oth = Int[i for i in predict_indices if !(i in averaged)]
+    return avg, oth
+end
+
+"""
+    _ekf_moment_cells!(ws, pars, sp, all_params, ctx, trace)
+
+The predict group's dynamics linearised by moments rather than at the mean:
+the assumed-density (Gaussian) prediction. For `x ~ N(m, P)` the moments of
+`dx = f(x) dt + G dW` evolve as
+
+    dm/dt = E f(x),    dP/dt = E[J(x)] P + P E[J(x)]' + G G'
+
+(Stein's lemma for `E[f(x) (x - m)']`), which is the EKF's prediction with
+`J(m)` replaced by `E J(x)` and `f(m)` by `E f(x)`. So the substep's
+discretisation runs as it always does on the group's JAx, DRIFT and CINT cells
+averaged by third-degree cubature, plus a correction to the mean the averaged
+matrices miss, `c = E[DRIFT(x) (x - m)]`, which the discretisation adds to its
+affine offset (`ws.moment_c`). The rule integrates the mean exactly for a drift
+cubic in the state and the slope for one quadratic, where the EKF drops the
+curvature terms: on a cubic damping the EKF's likelihood was 36 nats from the
+particle filter's at the true values and this one 2.4
+(`scripts/iekf-2026-10/gaussian_prediction_1d.R`).
+
+Each cell is averaged over the states it reads alone, by the spherical rule of
+their Gaussian: the cells reading the same `r` states (`CTSEMMomentClass`) at
+the `2r` points `m +- sqrt(r) B e_j`, weights `1 / 2r`, where
+`B = P[:, R] U^-1` and `U'U` is `P` over those states (`_moment_class_factor!`):
+the read states at the rule's points and the rest at their regression on them,
+which is what the mean correction's `x - m` needs. A rule over every state the
+group reads put a cell reading one of `s` states at radius `sqrt(s)` rather
+than one: integrated over the cells' own states, a model whose states do not
+interact gives each one's likelihood, which the joint rule did not, and a cell
+costs `2r` evaluations rather than the group's `2s` each.
+
+The class's cells, and the group's cells they read, are evaluated at each of
+its points on the tape (`_record_moment_group!`, reversed by
+`_reverse_moment!`); then the averages are written into the averaged cells
+and the group's other cells put back to their values at the mean, where the
+caller evaluated it first. Returns false, leaving the mean's evaluation as it
+was, where a class's covariance does not factor. `P` is the state's
+covariance, the substep's incoming one unless the mesh's defect asks at
+another (`_record_substep_defect!`); its lower triangle is read.
+"""
+function _ekf_moment_cells!(ws::ContinuousEKFWorkspace{T}, pars, sp, all_params, ctx,
+    trace, P::AbstractMatrix=ws.P_update.data) where {T}
+    n = ws.state_dim
+    idx = ws.predict_param_indices
+    avg = ws.moment_avg
+    oth = ws.moment_oth
+    classes = ws.moment_classes
+    m = ws.moment_m
+    B = ws.moment_B
+    D = ws.moment_d
+    c = ws.moment_c
+    acc = ws.moment_acc
+    dvals = ws.moment_dvals
+    for cl in classes
+        if !_moment_class_factor!(B, P, cl.states, cl.col0, n)
+            fill!(c, zero(T))
+            return false
+        end
+    end
+    @inbounds for i in 1:n
+        m[i] = ws.state[i]
+    end
+    saved = ws.moment_saved
+    @inbounds for k in eachindex(oth)
+        saved[k] = all_params[oth[k]]
+    end
+    # A cell in no class reads no state and keeps its value at the mean.
+    @inbounds for k in eachindex(avg)
+        acc[k] = all_params[avg[k]]
+    end
+    fill!(c, zero(T))
+    first = 0
+    @inbounds for cl in classes
+        r = length(cl.states)
+        w = inv(T(2r))
+        rad = sqrt(T(r))
+        nd = length(cl.drift)
+        for q in cl.cells
+            acc[q] = zero(T)
+        end
+        for p in 1:(2r)
+            point = cl.point0 + p
+            col = cl.col0 + ((p + 1) >> 1)
+            scale = isodd(p) ? rad : -rad
+            for a in 1:n
+                v = scale * B[a, col]
+                D[a, point] = v
+                ws.state[a] = m[a] + v
+            end
+            g = _record_moment_group!(trace, 1, idx, all_params, ctx)
+            point == 1 && (first = g)
+            if isempty(cl.exprs)
+                apply_complex_transforms_at_indices!(all_params, idx, sp.predict_transforms,
+                    ctx)
+            else
+                apply_complex_transforms_at_indices!(all_params, cl.indices, cl.exprs, ctx)
+            end
+            for q in cl.cells
+                acc[q] += w * all_params[avg[q]]
+            end
+            base = cl.dval0 + (p - 1) * nd
+            for t in 1:nd
+                q, a, b = cl.drift[t]
+                v = all_params[avg[q]]
+                dvals[base + t] = v
+                c[a] += w * v * D[b, point]
+            end
+        end
+    end
+    @inbounds for i in 1:n
+        ws.state[i] = m[i]
+    end
+    @inbounds for k in eachindex(avg)
+        all_params[avg[k]] = acc[k]
+    end
+    @inbounds for k in eachindex(oth)
+        all_params[oth[k]] = saved[k]
+    end
+    _record_moment!(trace, ws, first)
+    return true
+end
+
+"""Entry `(a, b)` of a symmetric matrix from its lower triangle."""
+@inline _ctsem_lower(P, a::Int, b::Int) = a >= b ? P[a, b] : P[b, a]
+
+"""
+    _moment_class_factor!(B, P, R, col0, n)
+
+A class's factor columns, `B[:, col0 .+ (1:r)] = P[:, R] U^-1`, where `U'U` is
+`P` over the states `R` ridged as the filter ridges a covariance
+(`_ridge_diagonal!`): its rows `R` are `U'`, Cholesky's lower factor, and the
+others are the regression of every state on those, so the offsets
+`+-sqrt(r) B[:, j]` put `R` at the spherical rule's points and the rest where
+their conditional means put them. O(n r^2). False where `P` over `R` does not
+factor.
+"""
+function _moment_class_factor!(B::AbstractMatrix{T}, P::AbstractMatrix, R::Vector{Int},
+    col0::Int, n::Int) where {T}
+    r = length(R)
+    @inbounds for j in 1:r
+        cj = col0 + j
+        Rj = R[j]
+        d = _ctsem_lower(P, Rj, Rj) + T(1e-10)
+        for q in 1:(j - 1)
+            d -= B[Rj, col0 + q]^2
+        end
+        (d > zero(d) && isfinite(d)) || return false
+        ljj = sqrt(d)
+        # Every row but the class's earlier states, which are above the
+        # factor's diagonal: the class's later states and the other states
+        # alike, by the same recurrence.
+        for a in 1:n
+            k = findfirst(==(a), R)
+            if k !== nothing && k <= j
+                B[a, cj] = k == j ? ljj : zero(T)
+                continue
+            end
+            t = _ctsem_lower(P, a, Rj)
+            for q in 1:(j - 1)
+                t -= B[a, col0 + q] * B[Rj, col0 + q]
+            end
+            B[a, cj] = t / ljj
+        end
+    end
+    return true
+end
+
+"""
+    _ekf_iterated_rows!(ws, pars, data, obs_col, gaussian, binary_loglik,
+        log2π_const, trace, context)
+
+A row's Gaussian update with the measurement linearised at the row's posterior
+mode rather than its prior mean: the iterated extended Kalman filter. Each
+iterate `x_i` evaluates the update group there (through `context`, whose state
+is `ws.state`) and moves to the mean of the update linearised at it,
+
+    x_{i+1} = x_p + P H_i' S_i^-1 (y - h(x_i) - H_i (x_p - x_i)),
+
+Gauss-Newton on the row's posterior, until no state moves by
+`_CTSEM_RELIN_TOL` prior standard deviations. Where a step is no shorter than
+the one before it -- an oscillation, as across the two basins of a loading
+that is not monotone -- the row's steps are halved from then on
+(`x_{i+1} = x_i + α (x_GN - x_i)`), which leaves the fixed point where it was. The update linearised at the last
+iterate is then the row's, from the prior -- its gain, its covariance and its
+log likelihood, the Gaussian marginal of `y` under the measurement linearised
+there. That is the ordinary update with `Jy` as the loading and
+`MANIFESTMEANS + (LAMBDA - Jy) x_i` as the intercept (the categorical
+update's offset, `_ekf_categorical_offset`), so it runs through
+`_ekf_masked_update_step!`; a linear measurement would give the EKF's update
+exactly, and is never iterated (`_ctsem_measurement_nonlinear`).
+
+Within a fit each row takes a frozen count of steps (`steps`, from the plan
+`ctsem_relin_plan` learns at the fit's start and again at its optimum, as the
+substep mesh is chosen): a fixed computation, so the objective is smooth
+however few the steps, where stopping on a tolerance makes the count jump as
+the parameters move. -1, a row with no plan or one whose steps had to be
+halved, iterates to the mode; `learn`, a vector, has the row's count written
+into it at `obs_col`: the fewest steps whose iterate is within
+`_CTSEM_RELIN_PLAN_TOL` prior sds of the mode, or -1.
+
+Against a grid filter's exact likelihood on one latent, under `(1 + c x) x`,
+`exp`, logistic and cubic measurements, the error a subject fell by 3 to 50
+times wherever the measurement noise was small beside the nonlinearity, and was
+about the EKF's at large noise; a single relinearisation was often worse than
+none, so the rows iterate to the mode. MANIFESTVAR stays as the prior
+evaluated it, so the iterates climb one posterior.
+
+Each iterate is taped (`_record_relin!`, then its update group) and the final
+update as a relinearised one; their reverse carries the prior mean's cotangent
+beside the iterate's (`_reverse_relin!`, `_reverse_update!`).
+"""
+function _ekf_iterated_rows!(ws::ContinuousEKFWorkspace, pars, data::AbstractMatrix,
+    obs_col::Int, gaussian, binary_loglik, log2π_const, trace, context, steps::Int=-1,
+    learn=nothing)
+    n = ws.state_dim
+    m = length(gaussian)
+    all_params = getdata(pars)
+    state = ws.state
+    xp = ws.xprior
+    @inbounds for j in 1:n
+        xp[j] = state[j]
+    end
+    first = true
+    if steps >= 0 && learn === nothing
+        for _ in 1:steps
+            _ekf_relin_offset!(ws, pars, gaussian, n)
+            _ekf_relin_mean!(ws, pars, data, obs_col, gaussian) || return nothing
+            _record_relin!(trace, ws, pars, data, obs_col, gaussian, first, 1.0)
+            @inbounds for j in 1:n
+                state[j] = ws.xnext[j]
+            end
+            first = false
+            _record_group!(trace, 3, ws.update_param_indices, all_params, context)
+            apply_complex_transforms_at_indices!(all_params, ws.update_param_indices,
+                ws.sp.update_transforms, context)
+        end
+    else
+        α = 1.0
+        last = eltype(state)(Inf)
+        settled = false
+        taken = 0
+        learn === nothing || _ekf_relin_keep!(ws, 0, n)
+        for _ in 1:_CTSEM_RELIN_MAXIT
+            _ekf_relin_offset!(ws, pars, gaussian, n)
+            _ekf_relin_mean!(ws, pars, data, obs_col, gaussian) || return nothing
+            step = _ekf_relin_step(ws, n)
+            if step <= _CTSEM_RELIN_TOL
+                settled = true
+                break
+            end
+            step >= last && (α = max(α / 2, 1 / 1024))
+            last = step
+            _record_relin!(trace, ws, pars, data, obs_col, gaussian, first, α)
+            @inbounds for j in 1:n
+                state[j] += α * (ws.xnext[j] - state[j])
+            end
+            first = false
+            taken += 1
+            learn === nothing || _ekf_relin_keep!(ws, taken, n)
+            _record_group!(trace, 3, ws.update_param_indices, all_params, context)
+            apply_complex_transforms_at_indices!(all_params, ws.update_param_indices,
+                ws.sp.update_transforms, context)
+        end
+        learn === nothing ||
+            (learn[obs_col] = settled && α == 1.0 ? _ekf_relin_need(ws, taken, n) : -1)
+    end
+    _ekf_relin_offset!(ws, pars, gaussian, n)
+    _record_update!(trace, ws, pars, data, obs_col, gaussian, xp, ws.P_predict.data, n,
+        first ? 1 : 2)
+    @inbounds for j in 1:n
+        state[j] = xp[j]
+    end
+    factor = _ekf_masked_update_step!(ws, pars, data, obs_col, gaussian, nothing,
+        Val(true))
+    issuccess(factor) || return nothing
+    return binary_loglik + _kalman_loglikelihood_cholesky!(view(ws.ll_buffer, 1:m),
+        factor, view(ws.ỹ, 1:m), log2π_const)
+end
+
+"""The measurement's intercept linearised at the current state over the
+observed rows, `MANIFESTMEANS + (LAMBDA - Jy) x`, into `ws.mm_eff`."""
+@inline function _ekf_relin_offset!(ws::ContinuousEKFWorkspace, pars, observed, n::Int)
+    MM = pars.MANIFESTMEANS
+    LAMBDA = pars.LAMBDA
+    Jy = pars.Jy
+    state = ws.state
+    mm = ws.mm_eff
+    @inbounds for i in eachindex(observed)
+        o = observed[i]
+        acc = MM[o]
+        for j in 1:n
+            acc += (LAMBDA[o, j] - Jy[o, j]) * state[j]
+        end
+        mm[i] = acc
+    end
+    return nothing
+end
+
+"""
+    _ekf_relin_mean!(ws, pars, data, obs_col, observed)
+
+The mean of the update linearised at the current state, from the row's prior
+`ws.xprior` and `ws.P_predict`, into `ws.xnext`: the state half of
+`_ekf_masked_update_step!`, with its ridges, on `Jy` and `ws.mm_eff`. False
+where the innovation covariance does not factor or the mean is not finite.
+"""
+function _ekf_relin_mean!(ws::ContinuousEKFWorkspace, pars, data::AbstractMatrix,
+    obs_col::Int, observed)
+    m = length(observed)
+    n = ws.state_dim
+    T = eltype(ws.state)
+    H = view(pars.Jy, observed, :)
+    xp = ws.xprior
+    yv = view(ws.ỹ, 1:m)
+    @inbounds for i in 1:m
+        acc = ws.mm_eff[i]
+        for j in 1:n
+            acc += H[i, j] * xp[j]
+        end
+        yv[i] = data[observed[i], obs_col] - acc
+    end
+    _copy_lower_to_upper!(ws.P_predict.data, n)
+    _ridge_diagonal!(ws.P_predict.data, n, 1e-10)
+    PHt = view(ws.K, :, 1:m)
+    _ctsem_mulNT!(PHt, ws.P_predict.data, H)
+    Sv = view(ws.S.UL.data, 1:m, 1:m)
+    _ctsem_mul!(Sv, H, PHt)
+    Sv .+= view(ws.bufferΘ.out, observed, observed)
+    _ridge_diagonal!(ws.P_predict.data, n, -1e-10)
+    _symmetrize_and_ridge!(Sv, m)
+    factor = if m <= _CTSEM_SMALL_CHOLESKY[]
+        _ctsem_cholesky(Sv, m)
+    else
+        CTSEMCholesky(Sv, m, issuccess(cholesky!(Sv, check=false)))
+    end
+    issuccess(factor) || return false
+    a = view(ws.bufferΘ.row_sq, 1:m)
+    ldiv!(a, factor, yv)
+    xn = ws.xnext
+    @inbounds for j in 1:n
+        xn[j] = xp[j]
+    end
+    _ctsem_mulvec!(xn, PHt, a, one(T), one(T))
+    return all(isfinite, xn)
+end
+
+"""Keep the iterate `ws.state` as the `k`-th of the row (`k = 0` the prior
+mean), for `_ekf_relin_need`."""
+@inline function _ekf_relin_keep!(ws::ContinuousEKFWorkspace, k::Int, n::Int)
+    H = ws.relin_hist
+    @inbounds for j in 1:n
+        H[j, k + 1] = ws.state[j]
+    end
+    return nothing
+end
+
+"""The fewest steps whose iterate is within `_CTSEM_RELIN_PLAN_TOL` prior sds of
+the last, the mode, of the `taken` kept."""
+function _ekf_relin_need(ws::ContinuousEKFWorkspace, taken::Int, n::Int)
+    H = ws.relin_hist
+    P = ws.P_predict.data
+    @inbounds for k in 0:taken
+        near = true
+        for j in 1:n
+            if abs(H[j, k + 1] - H[j, taken + 1]) >
+                    _CTSEM_RELIN_PLAN_TOL * sqrt(abs(P[j, j]) + 1e-10)
+                near = false
+                break
+            end
+        end
+        near && return k
+    end
+    return taken
+end
+
+"""The Gauss-Newton step from `ws.state` to `ws.xnext`: its largest move of a
+state, in that state's prior standard deviations."""
+@inline function _ekf_relin_step(ws::ContinuousEKFWorkspace, n::Int)
+    P = ws.P_predict.data
+    step = zero(eltype(ws.state))
+    @inbounds for j in 1:n
+        step = max(step, abs(ws.xnext[j] - ws.state[j]) / sqrt(abs(P[j, j]) + 1e-10))
+    end
+    return step
+end
+
+"""
+    _ekf_update_step!(ws, pars, data, obs_col)
+
+Apply one EKF measurement update assuming every manifest row is observed.
+
+A thin convenience wrapper around `_ekf_masked_update_step!` with
+`observed = 1:manifest_dim`, kept for callers (e.g. `benchmark_setup.jl`)
+that already know their data has no missingness and so have no need to
+compute an observed-row count first.
+"""
+@inline function _ekf_update_step!(ws::ContinuousEKFWorkspace, pars, data::AbstractMatrix, obs_col::Int)
+    return _ekf_masked_update_step!(ws, pars, data, obs_col, 1:ws.manifest_dim, nothing,
+        Val(false))
+end
+
+@inline function _apply_td_impulse!(ws::ContinuousEKFWorkspace, pars, tdpreds)
+    isempty(tdpreds) && return nothing
+    # A predictor effect the filter integrates moves its column with the state
+    # (`_hybrid_td_impulse!`).
+    ws.hyb.active && ws.hyb.q > 0 &&
+        _ekf_gaussian_call(ws, _hybrid_td_impulse!, _ekf_hybrid_refused, ws.hyb, tdpreds)
+    # Not at a `Val(length(tdpreds))`: a runtime `Val` made it a dynamic call,
+    # which boxed both views on every row with a TD predictor.
+    _ctsem_mulvec!(ws.bufferQ.r, pars.TDPREDEFFECT, tdpreds)
+    ws.state .+= ws.bufferQ.r
+    _ctsem_mul!(ws.bufferQ.intermediate, pars.Jtd, ws.P_predict.data)
+    _mul_right_transpose!(ws.bufferQ.out, ws.bufferQ.intermediate, pars.Jtd,
+        ws.state_dim, ws.state_dim, ws.state_dim)
+    copyto!(ws.P_predict.data, ws.bufferQ.out)
+    return nothing
+end
+
+# A finite-but-huge sentinel (e.g. -1e100) is invisible to the isfinite()
+# checks in ctsem_optimize's fg!, and under ForwardDiff it silently
+# contributes an exact-zero gradient for whatever subject/row triggered it
+# (0 * finite == 0), rather than flagging the evaluation as invalid. That let
+# Optim's L-BFGS accept trial points whose reported gradient had quietly
+# dropped one subject's true partials, corrupting the line search/curvature
+# updates without ever producing a NaN or Inf anywhere else. NaN poisons both
+# the primal value and, via IEEE's 0 * NaN == NaN, every ForwardDiff partial
+# once this subject's contribution is summed into the total objective, so the
+# existing isfinite(value)/isfinite(gradient) guards in fg! correctly reject
+# the whole trial point instead of silently accepting a corrupted gradient.
+@inline _invalid_ekf_loglikelihood(ws::ContinuousEKFWorkspace) =
+    -one(eltype(ws.state)) * NaN
+
+# The raw population covariance matrix as a `k` by `k` view. This is what the
+# reverse pass needs recorded -- the point the construction was evaluated at,
+# which cannot be recovered from `subject_values`. Read the same way
+# `_apply_population_block!` reads it, so the forward pass and the tape cannot
+# disagree about the layout. A model with no separate population covariance
+# (`isempty(ws.sp.population_indices)`) has none.
+@inline function _population_raw_block(ws, all_params)
+    k = length(ws.sp.population_indices)
+    return reshape(view(all_params, ws.sp.population_range), k, k)
+end
+
+"""
+    _apply_population_block!(ws, all_params)
+
+Add the population covariance to the initial covariance of the states it
+accounts for.
+
+T0VAR is the model's own initial covariance: what is left of a state's
+variance once a subject's random effects are known. The population block is
+the spread of those effects, so the initial covariance over subjects is the
+sum, which is what the Laplace route integrates to and why this adds rather
+than overwrites. An individually varying T0MEANS gets no carrier state, so
+those indices are not disjoint from the model's own latents, which is why this
+is indexed rather than appended; `T0VARredundancies()` (R) has already fixed
+their free T0VAR cells, leaving the floor on the diagonal and zero elsewhere,
+so a state the block spans covaries with one it does not only where the model
+fixes a T0VAR cell to say so. A carrier state's T0VAR is zero.
+
+No allocation and no extra buffer. `bufferQ` is sized to the state dimension,
+the block is a subset of the states so it is no larger, and `sdcovsqrt2cov!`
+touches only the leading `d` by `d` of the buffer it is given. `bufferQ` is
+free at this point: its T0VAR contents are already in `P_predict`.
+"""
+@inline function _apply_population_block!(ws, all_params)
+    return _place_population_block!(ws.P_predict.data, all_params,
+        ws.sp.population_indices, ws.sp.population_range,
+        ws.sp.population_covmatcode, ws.sp.population_scale, ws.population_buffer)
+end
+
+# A square buffer's dimension, as it was built.
+@inline _square_dim(buffer::SquareBuffer, k::Int) = buffer.dim
+@inline _square_dim(buffer, k::Int) = k
+
+"""
+    _place_population_block!(P, all_params, indices, range, covmatcode, scale,
+        buffer)
+
+Add the constructed population block to the rows and columns of the states it
+accounts for. See `_apply_population_block!` for why the sum.
+
+Called by the filter and by the summary, deliberately: they used to each build
+the initial covariance their own way, and that is how the two came to disagree
+about what a fit had estimated. One placement, two callers.
+"""
+@inline function _place_population_block!(P, all_params, indices, range,
+        covmatcode, scale, buffer)
+    isempty(indices) && return nothing
+    k = length(indices)
+    raw = reshape(view(all_params, range), k, k)
+    # The buffer's own `Val`, which is `k` by construction (and checked there):
+    # `Val(k)` is a runtime value, so the call was a dynamic dispatch boxing the
+    # buffer and the `raw` view, twice per subject evaluation.
+    ContinuousTimeSEM.sdcovsqrt2cov!(buffer, raw, covmatcode, _square_dim(buffer, k))
+    # The state-unit conversion, here and nowhere else. Row a and column b by
+    # their own factors, which is the same `quad_form_diag(rawpopcov,
+    # popstatescale)` the stan program writes at the one line that places this
+    # block.
+    @inbounds for b in 1:k, a in 1:k
+        P[indices[a], indices[b]] += scale[a] * scale[b] * buffer.out[a, b]
+    end
+    return nothing
+end
+
+"""
+    _ctsem_stationary!(P, x, ws, pars)
+
+Start the latent processes from the distribution they settle into: write the
+stationary mean over `x[1:naff]` and the stationary covariance over rows and
+columns `1:naff` of `P`, and return whether the system has one.
+
+The mean is `-DRIFT \\ CINT` over the leading block of genuine dynamics, the
+block the prediction's intercept solve uses. The covariance solves
+`DRIFT X + X DRIFT' + DIFFUSIONcov = 0` over the diffusion states, the block the
+prediction's Lyapunov solve uses; every other entry of those rows and columns
+is zero -- a latent outside the diffusion block is driven by no noise and sits
+at its mean, and the carrier states of random effects that do not enter the
+dynamics are independent of them. So the two agree with what the prediction
+itself converges to over a long interval, which is the point.
+
+**Only defined for dynamics that are the subject's constants.** R refuses a
+model whose DRIFT, CINT or DIFFUSION over these states reads a state or a time
+dependent predictor -- which includes a random effect carried as an augmented
+state -- because there is then no single system to be stationary in. Random
+effects on the dynamics go through `intoverpop='laplace'`, where each subject's
+values are fixed for its filter and this is exactly its stationary
+distribution. The caller runs the predict group first, so a cell written by a
+transform holds its value rather than `UNSET_PARAMETER`.
+
+`false` when `DRIFT` is singular, or when the solution is not a covariance --
+the drift is unstable and there is no stationary distribution -- and the
+caller treats the point as invalid. The stability test is the Lyapunov one:
+with the noise reaching every diffusion state, `X` is semi-definite exactly when
+the drift over them is stable.
+
+Scratch: `affine_buffer` for the mean, `diffusion_buffer` and the leading block
+of `discretization_buffer.input` for the covariance, `bufferQ` for the
+diffusion covariance. None holds anything at the point either caller runs
+this.
+"""
+function _ctsem_stationary!(P, x, ws, pars)
+    n = ws.state_dim
+    dyn = ws.diffusion_state_indices
+    k = length(dyn)
+    ab = ws.affine_buffer
+    naff = ab.dim
+
+    # Views bound once: indexing `pars.DRIFT` in the loop rebuilds the view
+    # from the layout on every iteration.
+    DRIFT = pars.DRIFT
+    CINT = pars.CINT
+    @inbounds for j in 1:naff, i in 1:naff
+        ab.intermediate[i, j] = DRIFT[i, j]
+    end
+    @inbounds for i in 1:naff
+        ab.s[i] = -CINT[i]
+    end
+    _solve_square_system!(ab.intermediate, ab.s, ab.piv, ab.dim)
+
+    ContinuousTimeSEM.sdcovsqrt2cov!(ws.bufferQ, pars.DIFFUSION, ws.sp.covmatcode,
+        ws.state_dim)
+    db = ws.diffusion_buffer
+    A = view(ws.discretization_buffer.input, 1:k, 1:k)
+    @inbounds for j in 1:k, i in 1:k
+        A[i, j] = DRIFT[dyn[i], dyn[j]]
+        db.intermediate[i, j] = ws.bufferQ.out[dyn[i], dyn[j]]
+    end
+    my_lyap!(db.out, A, db.intermediate, ws.lyap_buffer)
+
+    @inbounds for i in 1:naff
+        isfinite(ab.s[i]) || return false
+    end
+    _ctsem_semidefinite(db.out, db.intermediate, k) || return false
+
+    @inbounds for i in 1:naff
+        x[i] = ab.s[i]
+    end
+    @inbounds for j in 1:n, i in 1:naff
+        P[i, j] = zero(eltype(P))
+        P[j, i] = zero(eltype(P))
+    end
+    @inbounds for j in 1:k, i in 1:k
+        P[dyn[i], dyn[j]] = db.out[i, j]
+    end
+    return true
+end
+
+@inline _ctsem_in_closure(inclosure::Vector{Bool}, i::Int) =
+    i <= length(inclosure) && @inbounds(inclosure[i])
+
+"""
+    _ctsem_closure_drift(DRIFT, inclosure, i, j)
+
+Entry `(i, j)` of the drift the stationary elements are solved with: DRIFT
+within the closure (`CTSEMStationaryElements`), and every state outside it
+decoupled, with a rate of one and no input. The closure is shut under driving,
+so the system this makes is block diagonal and its closure block is the
+closure's own autonomous system: the moments solved over the whole of it are
+the closure's, whatever the states outside it do -- a random walk, a trait, a
+process that never settles -- where the undecoupled system has none.
+"""
+@inline function _ctsem_closure_drift(DRIFT, inclosure::Vector{Bool}, i::Int, j::Int)
+    (_ctsem_in_closure(inclosure, i) && _ctsem_in_closure(inclosure, j)) &&
+        return @inbounds DRIFT[i, j]
+    return (i == j && !_ctsem_in_closure(inclosure, i)) ? -one(eltype(DRIFT)) :
+        zero(eltype(DRIFT))
+end
+
+"""Entry `(i, j)`, by latent, of a covariance held over the diffusion states
+`dyn`: zero for a latent outside them, which no noise reaches."""
+@inline function _ctsem_dyn_entry(X, dyn, i::Int, j::Int)
+    p = findfirst(==(i), dyn)
+    q = findfirst(==(j), dyn)
+    (p === nothing || q === nothing) && return zero(eltype(X))
+    return @inbounds X[p, q]
+end
+
+"""
+    _ctsem_stationary_elements_mean!(x, ws, pars, se)
+
+The marked T0MEANS cells at their stationary values, asymCINT: `-DRIFT \\ CINT`
+over the closure system (`_ctsem_closure_drift`), written over `x` at the
+marked latents only. The whole solution stays in `ws.affine_buffer.s`, where
+the record reads it. `false` when the closure's drift is singular.
+"""
+function _ctsem_stationary_elements_mean!(x, ws, pars, se::CTSEMStationaryElements)
+    isempty(se.means) && return true
+    ab = ws.affine_buffer
+    naff = ab.dim
+    inclosure = se.inclosure
+    DRIFT = pars.DRIFT
+    CINT = pars.CINT
+    @inbounds for j in 1:naff, i in 1:naff
+        ab.intermediate[i, j] = _ctsem_closure_drift(DRIFT, inclosure, i, j)
+    end
+    @inbounds for i in 1:naff
+        ab.s[i] = _ctsem_in_closure(inclosure, i) ? -CINT[i] : zero(eltype(ab.s))
+    end
+    _solve_square_system!(ab.intermediate, ab.s, ab.piv, ab.dim)
+    @inbounds for i in se.means
+        isfinite(ab.s[i]) || return false
+    end
+    @inbounds for i in se.means
+        x[i] = ab.s[i]
+    end
+    return true
+end
+
+"""
+    _ctsem_stationary_elements_cov!(P, ws, pars, se)
+
+The marked T0VAR cells at their stationary values, asymDIFFUSION's: each block
+of `se.blocks` has its covariance replaced by the stationary one, solved over
+the closure system as the mean is, through the congruence `P <- M P M'` with
+`M = Lx Lp^-1` on the block's rows, `Lx` and `Lp` the Cholesky factors of the
+stationary block and of `P`'s. The block becomes the stationary one exactly,
+its covariances with every other state are carried along, and `P` stays a
+covariance whatever T0VAR's free cells hold. For a block of one latent this
+scales its row and column, keeping T0VAR's correlations.
+
+Scratch: the diffusion and Lyapunov buffers as `_ctsem_stationary!` uses them,
+and `ws.discretization_buffer`, twice the state dimension square: `input`'s
+leading block for the drift and its right half for `P` as it was, `output` for
+the two factors and `scratch` for `M` and the rows in transit, each packed
+block after block down the diagonal, where the record reads them. `false` when
+the closure's drift is unstable or `P`'s block is not positive definite.
+"""
+function _ctsem_stationary_elements_cov!(P, ws, pars, se::CTSEMStationaryElements)
+    isempty(se.blocks) && return true
+    T = eltype(P)
+    n = ws.state_dim
+    dyn = ws.diffusion_state_indices
+    k = length(dyn)
+    inclosure = se.inclosure
+    DRIFT = pars.DRIFT
+    ContinuousTimeSEM.sdcovsqrt2cov!(ws.bufferQ, pars.DIFFUSION, ws.sp.covmatcode,
+        ws.state_dim)
+    db = ws.diffusion_buffer
+    buf = ws.discretization_buffer
+    A = view(buf.input, 1:k, 1:k)
+    @inbounds for j in 1:k, i in 1:k
+        A[i, j] = _ctsem_closure_drift(DRIFT, inclosure, dyn[i], dyn[j])
+        db.intermediate[i, j] = (_ctsem_in_closure(inclosure, dyn[i]) &&
+            _ctsem_in_closure(inclosure, dyn[j])) ? ws.bufferQ.out[dyn[i], dyn[j]] :
+            zero(T)
+    end
+    my_lyap!(db.out, A, db.intermediate, ws.lyap_buffer)
+    _ctsem_semidefinite(db.out, db.intermediate, k) || return false
+
+    Pold = view(buf.input, 1:n, (n + 1):(2n))
+    @inbounds for j in 1:n, i in 1:n
+        Pold[i, j] = P[i, j]
+    end
+    LX = view(buf.output, 1:n, 1:n)
+    LP = view(buf.output, 1:n, (n + 1):(2n))
+    M = view(buf.scratch, 1:n, 1:n)
+    rows = view(buf.scratch, 1:n, (n + 1):(2n))
+    o = 0
+    for B in se.blocks
+        b = length(B)
+        r = (o + 1):(o + b)
+        lx = view(LX, r, r)
+        lp = view(LP, r, r)
+        mb = view(M, r, r)
+        @inbounds for q in 1:b, p in 1:b
+            lx[p, q] = _ctsem_dyn_entry(db.out, dyn, B[p], B[q])
+            lp[p, q] = Pold[B[p], B[q]]
+        end
+        _ctsem_lower_chol!(lx, b)
+        _ctsem_lower_chol!(lp, b) || return false
+        @inbounds for q in 1:b, p in 1:b
+            if p < q
+                lx[p, q] = zero(T)
+                lp[p, q] = zero(T)
+            end
+            mb[p, q] = lx[p, q]
+        end
+        _ctsem_right_solve_lower!(mb, lp, b)
+        # The block's rows, then its columns; `M` is lower triangular.
+        @inbounds for j in 1:n, p in 1:b
+            s = zero(T)
+            for q in 1:p
+                s += mb[p, q] * P[B[q], j]
+            end
+            rows[p, j] = s
+        end
+        @inbounds for j in 1:n, p in 1:b
+            P[B[p], j] = rows[p, j]
+        end
+        @inbounds for i in 1:n, p in 1:b
+            s = zero(T)
+            for q in 1:p
+                s += P[i, B[q]] * mb[p, q]
+            end
+            rows[p, i] = s
+        end
+        @inbounds for i in 1:n, p in 1:b
+            P[i, B[p]] = rows[p, i]
+        end
+        o += b
+    end
+    return true
+end
+
+"""
+    _ctsem_semidefinite(X, scratch, k)
+
+Whether the leading `k` by `k` block of `X` is a covariance, to rounding: a
+Cholesky elimination in `scratch` that passes a zero pivot -- a state the noise
+does not reach -- and fails a negative one beyond a tolerance relative to the
+largest diagonal. `X` is left as it was.
+
+Value-only comparisons, as everywhere in this engine, so a gradient takes the
+branch its primal took.
+"""
+function _ctsem_semidefinite(X, L, k::Int)
+    scale = zero(eltype(L))
+    @inbounds for i in 1:k
+        isfinite(X[i, i]) || return false
+        scale = max(scale, abs(X[i, i]))
+    end
+    tol = 1e-8 * scale
+    @inbounds for j in 1:k, i in 1:k
+        L[i, j] = X[i, j]
+    end
+    @inbounds for j in 1:k
+        s = L[j, j]
+        for p in 1:(j - 1)
+            s -= L[j, p] * L[j, p]
+        end
+        if s > tol
+            u = sqrt(s)
+            L[j, j] = u
+            for i in (j + 1):k
+                v = L[i, j]
+                for p in 1:(j - 1)
+                    v -= L[i, p] * L[j, p]
+                end
+                L[i, j] = v / u
+            end
+        elseif s < -tol
+            return false
+        else
+            for i in j:k
+                L[i, j] = zero(eltype(L))
+            end
+        end
+    end
+    return true
+end
+
+"""
+    _ctsem_t0_factor!(dest, ws, pars, all_params, stationary=false)
+
+The factor `M` with `M M'` the initial covariance the filter carries, written
+to `dest`.
+
+Which is not a factor of `sdcovsqrt2cov(T0VAR)` whenever the model has a
+population block. `_apply_population_block!` above drops the carrier states'
+rows and columns of that covariance and writes the population one over them,
+and T0VAR's own carrier entries are *zero* -- the augmentation puts a random
+effect's spread in RAWPOPVAR, not in T0VAR. So a factor built from T0VAR alone
+gives every carrier state a variance of zero, and every subject starts at the
+population mean.
+
+Nothing failed when it did. The state-explicit pass and the particle filter
+both built their factor that way, so for an `intoverpop='augmented'` model the
+joint density did not depend on the carrier innovations at all -- their
+gradient was exactly the prior's. `intoverstates=false` is the route for
+fitting by *sampling*, the joint mode being degenerate, so what that cost was a
+sampler that carried no individual differences and wandered in one flat
+direction per subject per effect. The particle filter reported the likelihood
+of a model it had not been given, while its own docstring said those
+coordinates rode along.
+
+This is the factor twin of `_place_population_block!`, and it lives beside it
+for the reason that function's docstring gives about its own two callers: the
+filter and the summary once built the initial covariance their own ways, and
+that is how they came to disagree about what a fit had estimated. Three ways
+was one too many.
+
+With no population block this is exactly `_ctsem_sdcor_factor!` and nothing
+changes -- deliberately, so a model with no random effects keeps the
+seed-for-seed generation it already had. With one, the covariance is built the
+way the filter builds it and then factored, `_ctsem_lower_chol!` being the
+semi-definite factorisation a carrier state with no diffusion of its own needs.
+
+`stationary` places the stationary block the same way, by `_ctsem_stationary!`,
+and writes the stationary mean over `pars.T0MEANS`, which is what both callers
+read the initial mean from; the caller runs the predict group first. A system
+with no stationary distribution leaves `dest` NaN, which both callers' density
+turns into an invalid point. `elements`, the model's single stationary
+elements (`CTSEMStationaryElements`), are placed the same way when it has any.
+"""
+@inline function _ctsem_t0_factor!(dest, ws, pars, all_params,
+        stationary::Bool=false,
+        elements::CTSEMStationaryElements=_CTSEM_NO_STATIONARY_ELEMENTS)
+    onelements = _stationary_elements_on(elements)
+    if isempty(ws.sp.population_indices) && !stationary && !onelements
+        return _ctsem_sdcor_factor!(dest, pars.T0VAR, ws.bufferQ, ws.state_dim)
+    end
+    n = ws.state_dim
+    ContinuousTimeSEM.sdcovsqrt2cov!(ws.bufferQ, pars.T0VAR, ws.sp.covmatcode,
+        ws.state_dim)
+    @inbounds for j in 1:n, i in 1:n
+        dest[i, j] = ws.bufferQ.out[i, j]
+    end
+    _copy_lower_to_upper!(dest, ws.state_dim)
+    _place_population_block!(dest, all_params, ws.sp.population_indices,
+        ws.sp.population_range, ws.sp.population_covmatcode, ws.sp.population_scale,
+        ws.population_buffer)
+    if stationary && !_ctsem_stationary!(dest, pars.T0MEANS, ws, pars)
+        fill!(dest, eltype(dest)(NaN))
+        return dest
+    end
+    if onelements && !(_ctsem_stationary_elements_mean!(pars.T0MEANS, ws, pars,
+            elements) && _ctsem_stationary_elements_cov!(dest, ws, pars, elements))
+        fill!(dest, eltype(dest)(NaN))
+        return dest
+    end
+    _ctsem_lower_chol!(dest, n)
+    # `_ctsem_lower_chol!` writes only the lower triangle, and both callers
+    # multiply by the whole matrix. Left alone, the upper triangle still holds
+    # the covariance this was built from and would be read as part of the
+    # factor.
+    @inbounds for j in 2:n, i in 1:(j - 1)
+        dest[i, j] = zero(eltype(dest))
+    end
+    return dest
+end
+
+"""
+    _extended_kalman_filter_continuous!(ws, params, data, timesteps, sp, tdpreds,
+                                        tipreds, subject, max_timestep, trace,
+                                        generate)
+
+Evaluate the continuous-time EKF log-likelihood using a preallocated workspace.
+
+`params` contains the free parameter values, `sp` describes how to materialize
+them, `data` is arranged as variables by time, and `timesteps` gives the time
+for each column.
+"""
+function _extended_kalman_filter_continuous!(
+    ws::ContinuousEKFWorkspace{T},
+    params::AbstractVector{T},
+    data::Matrix,
+    timesteps::Vector,
+    sp,
+    tdpreds::AbstractMatrix=zeros(eltype(params), 0, size(data, 2)),
+    tipreds::AbstractVector=eltype(params)[],
+    subject::Integer=1,
+    max_timestep=Inf,
+    trace=nothing,
+    generate=nothing,
+    # `nothing`, or a `CTSEMSubstepRecorder` (substep_mesh.jl) measuring how
+    # nonlinear each prediction step actually was. Every hook has a `::Nothing`
+    # method, so the ordinary paths compile to what they were.
+    substep_recorder=nothing,
+    # The rows' iteration plan (`ContinuousEKFObjective.relin`), and `nothing`
+    # or a vector the plan these rows want is written into (`ctsem_relin_plan`).
+    relin::Vector{Int}=_CTSEM_NO_RELIN,
+    relin_learn=nothing,
+)::T where {T}
+    # Materialize transformed/free/fixed values into the full parameter vector.
+    _materialize_subject_values!(ws.subject_values, params, sp, tipreds)
+    _materialize_all_params!(ws.all_params, ws.subject_values, sp)
+    # `trace` is the adjoint tape (see adjoint_ekf.jl) or `nothing`. Every
+    # `_record_*!`/`_begin_predict!` call below has a `::Nothing` method, so the
+    # ordinary primal and ForwardDiff paths compile to exactly the code they
+    # did before this hook existed. Keeping the recording inline in the one
+    # real loop -- rather than maintaining a parallel traced copy of it -- is
+    # what stops the reverse pass silently drifting away from the forward one.
+    _record_subject_values!(trace, ws.subject_values)
+    ws.growth.max = 0.0
+    ws.growth.steps = 0
+
+    # Populate ComponentArray storage from transformed parameters.
+    pars = ws.pars
+    all_params = getdata(pars)
+    all_params .= ws.all_params
+
+    # Initial prior:
+    #   x_{1|0} = T0MEANS
+    #   P_{1|0} = T0VAR
+    # with the latent processes' block replaced by their stationary moments
+    # below when the model asks for that.
+    ContinuousTimeSEM.sdcovsqrt2cov!(ws.bufferQ, pars.T0VAR, ws.sp.covmatcode, ws.state_dim)
+    copyto!(ws.P_predict.data, ws.bufferQ.out)
+    _copy_lower_to_upper!(ws.P_predict.data, ws.state_dim)
+    _apply_population_block!(ws, all_params)
+    copyto!(ws.state, pars.T0MEANS)
+    _hybrid_inactive!(ws.hyb, sp.hybrid, _ekf_has_categorical(ws))
+    _ekf_gaussian_call(ws, _hybrid_start!, _ctsem_noop, ws.hyb, sp.hybrid, data,
+        ws.state_dim, ws.manifest_dim)
+    # Split rather than handed a result that is `nothing` or the view: a union
+    # of the two is not a bits union, so it was boxed on every traced subject
+    # pass.
+    if isempty(ws.sp.population_indices)
+        _record_init!(trace, pars, ws.state_dim, nothing)
+    else
+        _record_init!(trace, pars, ws.state_dim,
+            _population_raw_block(ws, all_params))
+    end
+
+    # Each row follows one contract: prediction, TD impulse, measurement, and
+    # the three transform groups run in that order. The first row has no
+    # prediction interval, but it runs all three groups anyway, because a group
+    # supplies *values* as well as a prediction: PARS is in the predict group
+    # and an update-group cell -- LAMBDA, MANIFESTMEANS, MANIFESTVAR, Jy -- may
+    # be written by a transform that reads one. Skipping the group here left
+    # that read pointing at a parameter slot nothing had written, which cost
+    # 11.5 log units against stan at one occasion per subject, where every row
+    # is a row 1. The buffer is now filled with `UNSET_PARAMETER` rather than
+    # zero, so a fourth instance of this shape announces itself instead of
+    # quietly reading a plausible number.
+    #
+    # One context serves all three, as it did for the last two. Its interval is
+    # zero, which is the only thing about it a predict-group transform could
+    # object to, and none can: generate_complex_transform_string substitutes
+    # only state, PARS and the model matrices, so no transform expression can
+    # reference ctx.dt or ctx.time at all.
+    first_context = CTSEMRowContext(ws.state, pars, view(tdpreds, :, 1), tipreds,
+        timesteps[1], zero(eltype(params)), Int(subject), 1)
+    if sp.stationary || _stationary_elements_on(sp.stationary_elements)
+        # The predict group once more ahead of the ordinary one, so a DRIFT,
+        # CINT or DIFFUSION cell written by a transform holds its value when the
+        # stationary moments read it. Those cells read no state (R refuses
+        # stationarity when they do), so the placeholder T0MEANS state they see
+        # here does not matter; the ordinary run below then sees the stationary
+        # state, which a state-dependent PARS cell read by the measurement does
+        # need. Recorded like any group, so the reverse pass meets the two runs
+        # and the stationary step between them in the order they happened.
+        _record_group!(trace, 1, ws.predict_param_indices, all_params, first_context)
+        apply_complex_transforms_at_indices!(all_params, ws.predict_param_indices,
+            sp.predict_transforms, first_context)
+        if sp.stationary
+            _ctsem_stationary!(ws.P_predict.data, ws.state, ws, pars) ||
+                return _invalid_ekf_loglikelihood(ws)
+            _record_stationary!(trace, ws, pars)
+        else
+            se = sp.stationary_elements
+            (_ctsem_stationary_elements_mean!(ws.state, ws, pars, se) &&
+                _ctsem_stationary_elements_cov!(ws.P_predict.data, ws, pars, se)) ||
+                return _invalid_ekf_loglikelihood(ws)
+            _record_stationary_elements!(trace, ws, pars)
+        end
+    end
+    _record_group!(trace, 1, ws.predict_param_indices, all_params, first_context)
+    apply_complex_transforms_at_indices!(all_params, ws.predict_param_indices, sp.predict_transforms, first_context)
+    _record_group!(trace, 2, ws.td_param_indices, all_params, first_context)
+    apply_complex_transforms_at_indices!(all_params, ws.td_param_indices, sp.td_transforms, first_context)
+    _record_td!(trace, ws, pars, first_context.tdpreds, ws.state_dim)
+    _apply_td_impulse!(ws, pars, first_context.tdpreds)
+    update_context = CTSEMRowContext(ws.state, pars, first_context.tdpreds, tipreds,
+        timesteps[1], zero(eltype(params)), Int(subject), 1)
+    _record_group!(trace, 3, ws.update_param_indices, all_params, update_context)
+    apply_complex_transforms_at_indices!(all_params, ws.update_param_indices, sp.update_transforms, update_context)
+    # After the update-group transform, not before it: a MANIFESTVAR cell owned by
+    # a transform (an indvarying, state-dependent or tdpred-dependent cell) is
+    # written nowhere else, so building the covariance first read the parameter
+    # buffer before anything had filled that slot. Every later row already
+    # runs transform, covariance, record in this order.
+    ContinuousTimeSEM.sdcovsqrt2cov!(ws.bufferΘ, pars.MANIFESTVAR, ws.sp.covmatcode, ws.manifest_dim)
+    _record_theta!(trace, pars, ws.manifest_dim)
+    log2π_const = log(2π)
+    _record_row_prior!(trace, ws, pars, 1)
+    # The context only where the update iterates: passed to a linear model's
+    # update, it had to be built at every row, 4-6 per cent of its gradient.
+    ll = ws.relinearise ?
+        _ekf_update_observed!(ws, pars, data, 1, log2π_const, trace, generate,
+            update_context, _ctsem_relin_steps(relin, 1), relin_learn) :
+        _ekf_update_observed!(ws, pars, data, 1, log2π_const, trace, generate)
+    ll === nothing && return _invalid_ekf_loglikelihood(ws)
+    generate === nothing || (generate.llrow[generate.offset+1] = ll)
+    _record_row_update!(trace, ws, pars, sp, update_context, 1, ll)
+
+    # Main EKF loop for t >= 2:
+    #   (1) predict from t-1 to t using Δt
+    #   (2) update with observation y_t
+    #   (3) accumulate log p(y_t | y_{1:t-1})
+    prev_timestep = timesteps[1]
+    nsteps = min(length(timesteps), size(data, 2))
+    # The diffusion covariance once for the pass when nothing writes DIFFUSION
+    # per row (`diffusion_static`), as MANIFESTVAR's above; each prediction
+    # rebuilt it from `pars.DIFFUSION` otherwise.
+    if ws.diffusion_static && nsteps >= 2
+        ContinuousTimeSEM.sdcovsqrt2cov!(ws.bufferQ, pars.DIFFUSION, ws.sp.covmatcode, ws.state_dim)
+        copyto!(ws.diffusion_cov, ws.bufferQ.out)
+    end
+    # Nonlinear dynamics are moment-matched (`_ekf_moment_cells!`), except when
+    # generating, which simulates the states, and beside the filter's own
+    # integrated deviations, which need a linear model.
+    moment_on = ws.moment && _CTSEM_MOMENT_PREDICT[] && generate === nothing &&
+        !(ws.hyb.active && ws.hyb.q > 0)
+    @inbounds for t_idx in 2:nsteps
+        curr_timestep = timesteps[t_idx]
+        Δt = curr_timestep - prev_timestep
+
+        # Match Stan's nonlinear integration contract: re-materialize the
+        # local affine model at each bounded substep before prediction.
+        n_substeps = _ctsem_substeps(Δt, max_timestep, t_idx)
+        substep_dt = Δt / n_substeps
+        @inbounds for substep in 1:n_substeps
+            substep_time = prev_timestep + substep * substep_dt
+            predict_context = CTSEMRowContext(ws.state, pars, view(tdpreds, :, t_idx), tipreds,
+                substep_time, substep_dt, Int(subject), t_idx)
+            _record_group!(trace, 1, ws.predict_param_indices, all_params, predict_context)
+            apply_complex_transforms_at_indices!(all_params, ws.predict_param_indices, sp.predict_transforms, predict_context)
+            ws.moment_now[] = moment_on &&
+                _ekf_moment_cells!(ws, pars, sp, all_params, predict_context, trace)
+            predict_snapshot = _begin_predict!(trace, ws, ws.state_dim)
+            _begin_substep!(substep_recorder, ws)
+            if ws.diffusion_static
+                _ekf_predict_step!(ws, pars, substep_dt, ws.diffusion_cov)
+            else
+                _ekf_predict_step!(ws, pars, substep_dt)
+            end
+            _track_growth!(ws.growth, ws.discrete_ca.eJAx, ws.state_dim, subject)
+            _record_substep_defect!(substep_recorder, ws, pars, sp, all_params, substep_dt,
+                t_idx, predict_context)
+            _record_predict!(trace, ws, pars, predict_snapshot, substep_dt, ws.state_dim)
+            ws.moment_now[] = false
+            _record_transition!(trace, ws, pars, t_idx, substep, n_substeps, Δt)
+            # The next bounded step begins from this step's predicted covariance.
+            copyto!(ws.P_update.data, ws.P_predict.data)
+        end
+
+        td_context = CTSEMRowContext(ws.state, pars, view(tdpreds, :, t_idx), tipreds,
+            curr_timestep, Δt, Int(subject), t_idx)
+        _record_group!(trace, 2, ws.td_param_indices, all_params, td_context)
+        apply_complex_transforms_at_indices!(all_params, ws.td_param_indices, sp.td_transforms, td_context)
+        _record_td!(trace, ws, pars, td_context.tdpreds, ws.state_dim)
+        _apply_td_impulse!(ws, pars, td_context.tdpreds)
+        _record_td_transition!(trace, pars, t_idx, size(tdpreds, 1))
+
+        measurement_context = CTSEMRowContext(ws.state, pars, td_context.tdpreds, tipreds,
+            curr_timestep, Δt, Int(subject), t_idx)
+        _record_group!(trace, 3, ws.update_param_indices, all_params, measurement_context)
+        apply_complex_transforms_at_indices!(all_params, ws.update_param_indices, sp.update_transforms, measurement_context)
+        # Row 1's manifest covariance stands when nothing writes MANIFESTVAR
+        # per row (`manifestvar_static`): rebuilding it, and taping it for the
+        # reverse to compare, was the whole manifest-by-manifest matrix every
+        # row, against an update that reads only the observed block of it.
+        if !ws.manifestvar_static
+            ContinuousTimeSEM.sdcovsqrt2cov!(ws.bufferΘ, pars.MANIFESTVAR, ws.sp.covmatcode, ws.manifest_dim)
+            _record_theta!(trace, pars, ws.manifest_dim)
+        end
+        _record_row_prior!(trace, ws, pars, t_idx)
+        row_ll = ws.relinearise ?
+            _ekf_update_observed!(ws, pars, data, t_idx, log2π_const, trace, generate,
+                measurement_context, _ctsem_relin_steps(relin, t_idx), relin_learn) :
+            _ekf_update_observed!(ws, pars, data, t_idx, log2π_const, trace, generate)
+        row_ll === nothing && return _invalid_ekf_loglikelihood(ws)
+        generate === nothing || (generate.llrow[generate.offset+t_idx] = row_ll)
+        _record_row_update!(trace, ws, pars, sp, measurement_context, t_idx, row_ll)
+        ll += row_ll
+
+        prev_timestep = curr_timestep
+    end
+    # The integrated deviations' closing term (`CTSEMHybrid`).
+    ws.hyb.active && (ll += _ekf_gaussian_call(ws, _hybrid_marginal!, _ekf_hybrid_refused,
+        ws.hyb, sp.hybrid, params, trace))
+    return ll
+end
+
+"""
+    _extended_kalman_filter_continuous(params, data, timesteps, sp)
+
+Evaluate the continuous-time EKF log-likelihood with a freshly allocated
+workspace.
+"""
+function _extended_kalman_filter_continuous(params, data::Matrix, timesteps::Vector, sp)
+    _validate_continuous_ekf_inputs(timesteps, data)
+    ws = _init_continuous_ekf_workspace(eltype(params), sp)
+    return _extended_kalman_filter_continuous!(ws, params, data, timesteps, sp)
+end
+
+"""
+    extended_kalman_log_likelihood_continuous(values, params, timesteps, data)
+
+Return the continuous-time extended Kalman filter log-likelihood.
+
+`values` contains free parameter values and `params` contains the parameter
+metadata produced by `ekf_from_data_frame`.
+"""
+function extended_kalman_log_likelihood_continuous(values::Vector, params::EKFParameters, timesteps::Vector, data::Matrix)
+    return _extended_kalman_filter_continuous(values, data, timesteps, params)
+end
+
+"""
+    grad_log_likelihood_ekf_continuous(values, params, timesteps, data)
+
+Return the ForwardDiff gradient of the continuous-time EKF log-likelihood with
+respect to `values`.
+"""
+function grad_log_likelihood_ekf_continuous(values::Vector, params::EKFParameters, timesteps::Vector, data::Matrix)
+    workspace = ContinuousEKFGradientWorkspace(values, params, timesteps, data)
+    return grad_log_likelihood_ekf_continuous!(workspace.result, values, workspace)
+end
+
+"""
+    grad_log_likelihood_ekf_continuous!(result, values, workspace)
+
+Write the ForwardDiff gradient of the continuous-time EKF log-likelihood into
+`result` using a reusable `ContinuousEKFGradientWorkspace`.
+"""
+function grad_log_likelihood_ekf_continuous!(
+    result::AbstractVector,
+    values::AbstractVector,
+    workspace::ContinuousEKFGradientWorkspace,
+)
+    _check_gradient_workspace_args(result, values)
+    ForwardDiff.gradient!(result, workspace.objective, values, workspace.cfg)
+    return result
+end
+
+"""
+    grad_log_likelihood_ekf_continuous!(values, workspace)
+
+Write the gradient into the reusable result buffer stored by `workspace`.
+"""
+function grad_log_likelihood_ekf_continuous!(
+    values::AbstractVector,
+    workspace::ContinuousEKFGradientWorkspace,
+)
+    return grad_log_likelihood_ekf_continuous!(workspace.result, values, workspace)
+end
+
+"""
+    res_and_grad_likelihood_ekf_continuous(values, params, timesteps, data)
+
+Return the continuous-time EKF log-likelihood and its gradient.
+
+The result is a named tuple `(value = ..., gradient = ...)`.
+"""
+function res_and_grad_likelihood_ekf_continuous(values::Vector, params::EKFParameters, timesteps::Vector, data::Matrix)
+    workspace = ContinuousEKFGradientWorkspace(values, params, timesteps, data)
+    return res_and_grad_likelihood_ekf_continuous!(workspace, values)
+end
+
+"""
+    res_and_grad_likelihood_ekf_continuous!(workspace, values)
+
+Return the continuous-time EKF log-likelihood and gradient using reusable
+ForwardDiff and EKF workspaces.
+"""
+function res_and_grad_likelihood_ekf_continuous!(
+    workspace::ContinuousEKFGradientWorkspace,
+    values::AbstractVector,
+)
+    _check_gradient_workspace_args(workspace.result, values)
+    ForwardDiff.gradient!(
+        workspace.diff_result,
+        workspace.objective,
+        values,
+        workspace.cfg,
+    )
+    return (
+        value = DiffResults.value(workspace.diff_result),
+        gradient = DiffResults.gradient(workspace.diff_result),
+    )
+end

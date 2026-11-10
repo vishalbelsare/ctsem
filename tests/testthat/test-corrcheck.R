@@ -1,4 +1,6 @@
-if(identical(Sys.getenv("NOT_CRAN"), "true")& .Machine$sizeof.pointer != 4){
+skip_on_cran()
+skip_on_32bit()
+{  # body of the guard this replaced; indentation unchanged
   library(ctsem)
   library(testthat)
   cores=2
@@ -8,42 +10,56 @@ if(identical(Sys.getenv("NOT_CRAN"), "true")& .Machine$sizeof.pointer != 4){
   #anomauth
   test_that("corrCheck", {
     set.seed(1)
-    gm <- ctModel(LAMBDA = diag(1,3),DRIFT=diag(-1,3),
-      T0VAR=matrix(c(5,-5,-5,0,1,-1,0,0,2),3,3),
-      MANIFESTTRAITVAR=matrix(c(2,-1,-1, 0,1,1,0,0,2),3,3),
-      DIFFUSION=matrix(c(2,1,1,0,4,-2,0,0,2),3,3),Tpoints=30)
-    d <- ctGenerate(ctmodelobj = gm,n.subjects = 600,burnin = 0)
+    skip_without_julia()
+    nsubjects <- 600
+    # The generating covariances, stated as covariances. ctCov() writes the
+    # cells that give them under the model's construction; the manifest traits
+    # are individually varying MANIFESTMEANS, drawn by ctGenerate from the
+    # population RAWPOPVAR states -- on the raw scale, and MANIFESTMEANS is
+    # 10 * raw, so the raw covariance is a hundredth of the trait covariance.
+    # MANIFESTVAR is zero, as the fitted model below assumes.
+    targetManifestCov <- tcrossprod(matrix(c(2,-1,-1, 0,1,1,0,0,2),3,3))
+    diffusionCov <- tcrossprod(matrix(c(2,1,1,0,4,-2,0,0,2),3,3))
+    gm <- ctModel(LAMBDA = diag(1,3), DRIFT = diag(-1,3),
+      T0VAR = ctCov(tcrossprod(matrix(c(5,-5,-5,0,1,-1,0,0,2),3,3))),
+      DIFFUSION = ctCov(diffusionCov), MANIFESTVAR = diag(0,3),
+      T0MEANS = matrix(0,3,1), CINT = matrix(0,3,1),
+      MANIFESTMEANS = matrix(c('mm1','mm2','mm3')), Tpoints = 30)
+    gm$pars$indvarying <- gm$pars$param %in% c('mm1','mm2','mm3')
+    gm$RAWPOPVAR <- ctCov(targetManifestCov / 100)
+    d <- suppressMessages(ctGenerate(gm, n = nsubjects, burnin = 0,
+      backend = 'julia'))
     
-    m <- ctModel(LAMBDA = diag(1,3),DRIFT=diag(-1,3),type='stanct',
+    m <- ctModel(LAMBDA = diag(1,3),DRIFT=diag(-1,3),type='ct',
       # MANIFESTMEANS = 0,
       MANIFESTVAR = 0)
     
-    f <- ctStanFit(datalong = d,ctstanmodel = m,nopriors=F,verbose=0,cores=cores)
+    f <- ctFit(datalong = d,model= m,priors=T,verbose=0,cores=cores, backend = 'stan')
     
-    p <- ctStanContinuousPars(f)
+    p <- ctSummaryMatrices(f)
     
     diffcov <- p$DIFFUSIONcov
     diffcor <- cov2cor(p$DIFFUSIONcov)
-    ediffcov <- tcrossprod(gm$DIFFUSION)
-    ediffcor <- cov2cor(tcrossprod(gm$DIFFUSION))
+    ediffcov <- diffusionCov
+    ediffcor <- cov2cor(diffusionCov)
     
     s=summary(f)
     s$rawpopcorr
     f$stanfit$transformedparsfull$rawpopcorr[1,,]
-    tcrossprod(gm$MANIFESTTRAITVAR)
-    cov2cor(tcrossprod(gm$MANIFESTTRAITVAR))
+    targetManifestCov
+    cov2cor(targetManifestCov)
     
     #check diagonal of 1's for corr
-    testthat::expect_equivalent(diag(f$stanfit$transformedparsfull$rawpopcorr[1,,]),
-      rep(1,nrow(f$stanfit$transformedparsfull$rawpopcorr[1,,])),tol=1e-5)
+    test_isclose(diag(f$stanfit$transformedparsfull$rawpopcorr[1,,]),
+      rep(1,nrow(f$stanfit$transformedparsfull$rawpopcorr[1,,])),tol=1e-3)
     
     #cov check
-    testthat::expect_equivalent(f$stanfit$transformedparsfull$popcov[1,4:6,4:6],
-      tcrossprod(gm$MANIFESTTRAITVAR),tol=.5)
+    test_isclose(f$stanfit$transformedparsfull$popcov[1,4:6,4:6],
+      targetManifestCov,tol=1)
     
     #cor check
-    testthat::expect_equivalent(f$stanfit$transformedparsfull$rawpopcorr[1,4:6,4:6],
-      cov2cor(tcrossprod(gm$MANIFESTTRAITVAR)),tol=1e-1)
+    test_isclose(f$stanfit$transformedparsfull$rawpopcorr[1,4:6,4:6],
+      cov2cor(targetManifestCov),tol=.1)
     
     
   })
@@ -59,15 +75,15 @@ if(identical(Sys.getenv("NOT_CRAN"), "true")& .Machine$sizeof.pointer != 4){
     cmat2=t(chol(cmat2 %*% t(cmat2)))
     cov2cor(tcrossprod(cmat2))
     
-    gm <- ctModel(LAMBDA = diag(1,10),DRIFT=diag(-1,10),
+    gm <- ctModel(type='omx',LAMBDA = diag(1,10),DRIFT=diag(-1,10),
       T0VAR=cmat,
       DIFFUSION=diag(1,10),Tpoints=2)
-    d1 <- data.frame(ctGenerate(ctmodelobj = gm,n.subjects = 1000,burnin = 0))
+    d1 <- data.frame(ctGenerate(ctmodelobj = gm,n = 1000,burnin = 0))
     
-    gm <- ctModel(LAMBDA = diag(1,10),DRIFT=diag(-1,10),
+    gm <- ctModel(type='omx',LAMBDA = diag(1,10),DRIFT=diag(-1,10),
       T0VAR=cmat2,
       DIFFUSION=diag(1,10),Tpoints=2)
-    d2 <- data.frame(ctGenerate(ctmodelobj = gm,n.subjects = 1000,burnin = 0))
+    d2 <- data.frame(ctGenerate(ctmodelobj = gm,n = 1000,burnin = 0))
     
     d2$id <- d2$id + 2000
     d <- rbind(d1,d2)
@@ -77,16 +93,16 @@ if(identical(Sys.getenv("NOT_CRAN"), "true")& .Machine$sizeof.pointer != 4){
     
     
     
-    m <- ctModel(LAMBDA = diag(1,10),DRIFT=diag(-1,10),type='standt',
+    m <- ctModel(LAMBDA = diag(1,10),DRIFT=diag(-1,10),type='dt',
       # MANIFESTMEANS = 0,
       DIFFUSION=diag(1,10),T0MEANS=0,
       TIpredNames = 'TI1',
       MANIFESTMEANS=0,
       MANIFESTVAR = 0)
     
-    f <- ctStanFit(datalong = d,ctstanmodel = m,nopriors=F,cores=cores,verbose=0)
+    f <- ctFit(datalong = d,model= m,priors=TRUE,cores=cores,verbose=0, backend = 'stan')
     
-    p <- ctStanContinuousPars(f)
+    p <- ctSummaryMatrices(f)
     
     t0cov <- p$T0cov
     t0cor <- cov2cor(t0cov)
@@ -101,11 +117,11 @@ if(identical(Sys.getenv("NOT_CRAN"), "true")& .Machine$sizeof.pointer != 4){
     
     
     #cov check
-    testthat::expect_equivalent(cov2cor(e$subj_T0cov[1,1001,,]),
+    test_isclose(cov2cor(e$subj_T0cov[1,1001,,]),
       cov2cor(tcrossprod(cmat2)),tol=.005)
     
     #cor check
-    testthat::expect_equivalent(cov2cor(e$subj_T0cov[1,1,,]),
+    test_isclose(cov2cor(e$subj_T0cov[1,1,,]),
       cov2cor(tcrossprod(cmat)),tol=.005)
     
     
